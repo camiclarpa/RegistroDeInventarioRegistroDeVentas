@@ -38,48 +38,72 @@ export class PrismaCustomerRepository implements ICustomerRepository {
   }
 
   async findById(id: string): Promise<Customer | null> {
-    const record = await this.prisma.customers.findUnique({ where: { id } });
+    const record = await this.prisma.customers.findUnique({
+      where: { id }
+    });
     return record ? this.toDomain(record) : null;
   }
 
   async findByEmail(email: string): Promise<Customer | null> {
-    const record = await this.prisma.customers.findUnique({ where: { email } });
+    const record = await this.prisma.customers.findFirst({
+      where: { email }
+    });
     return record ? this.toDomain(record) : null;
   }
 
   async findByPhone(phone: string): Promise<Customer | null> {
-    const record = await this.prisma.customers.findUnique({ where: { phone } });
+    const record = await this.prisma.customers.findUnique({
+      where: { phone }
+    });
     return record ? this.toDomain(record) : null;
   }
 
   async findByIdentification(identification: string): Promise<Customer | null> {
-    const record = await this.prisma.customers.findUnique({ where: { identificationNumber: identification } });
+    const record = await this.prisma.customers.findUnique({
+      where: { identificationNumber: identification }
+    });
     return record ? this.toDomain(record) : null;
   }
 
   async findAll(page: number, limit: number, search?: string): Promise<{ items: Customer[]; total: number }> {
     const skip = (page - 1) * limit;
-    const where = search ? {
-      OR: [
-        { name: { contains: search, mode: 'insensitive' } },
-        { email: { contains: search, mode: 'insensitive' } },
-        { phone: { contains: search, mode: 'insensitive' } }
-      ]
-    } : {};
+    let where: any = {};
+    
+    if (search) {
+      where = {
+        OR: [
+          { name: { contains: search, mode: 'insensitive' as const } },
+          { email: { contains: search, mode: 'insensitive' as const } },
+          { phone: { contains: search, mode: 'insensitive' as const } }
+        ]
+      };
+    }
 
     const [items, total] = await Promise.all([
-      this.prisma.customers.findMany({ where, skip, take: limit, orderBy: { createdAt: 'desc' } }),
+      this.prisma.customers.findMany({
+        where,
+        skip,
+        take: limit,
+        orderBy: { createdAt: 'desc' }
+      }),
       this.prisma.customers.count({ where })
     ]);
+    
     return { items: items.map(this.toDomain), total };
   }
 
   async updateLoyaltyPoints(id: string, points: number): Promise<void> {
-    await this.prisma.customers.update({ where: { id }, data: { loyaltyPoints: points, updatedAt: new Date() } });
+    await this.prisma.customers.update({
+      where: { id },
+      data: { loyaltyPoints: points, updatedAt: new Date() }
+    });
   }
 
   async updateTotalSpent(id: string, amount: number): Promise<void> {
-    await this.prisma.customers.update({ where: { id }, data: { totalSpent: amount, updatedAt: new Date() } });
+    await this.prisma.customers.update({
+      where: { id },
+      data: { totalSpent: amount, updatedAt: new Date() }
+    });
   }
 
   private toDomain(record: any): Customer {

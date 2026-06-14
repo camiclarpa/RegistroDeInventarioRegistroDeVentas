@@ -1,0 +1,50 @@
+import { Prisma } from '@prisma/client';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+export interface QuoteItem { productId?: string; description: string; qty: number; unitPrice: number; discount?: number; }
+
+function calcTotals(items: QuoteItem[], globalDiscount = 0) {
+  const subtotal = items.reduce((s, i) => { const lineDiscount = i.discount ?? 0; return s + i.qty * i.unitPrice * (1 - lineDiscount / 100); }, 0);
+  const total = subtotal * (1 - globalDiscount / 100);
+  return { subtotal, total };
+}
+
+export async function createQuote(data: { customerId: string; items: QuoteItem[]; discount?: number; expiresAt?: Date; createdById: string; }) {
+  const { subtotal, total } = calcTotals(data.items, data.discount);
+  const quote = await prisma.quotes.create({ data: { customerId: data.customerId, items: data.items as unknown as Prisma.InputJsonValue, subtotal, discount: data.discount ?? 0, total, status: 'DRAFT', expiresAt: data.expiresAt, createdById: data.createdById } });
+  logger.info(`[quoteService] Cotización ${quote.id} creada — $${total}`);
+  return quote;
+}
+
+export async function getQuoteById(id: string) {
+  return prisma.quotes.findUnique({ where: { id }, include: { customers: { select: { id: true, name: true, phone: true, email: true } }, deliveries: { orderBy: { createdAt: 'desc' } } } });
+}
+
+export async function listQuotes(params: { customerId?: string; status?: string; page: number; limit: number; }) {
+  const { customerId, status, page, limit } = params;
+  const skip = (page - 1) * limit;
+  const where: any = { ...(customerId && { customerId }), ...(status && { status }) };
+  const [items, total] = await prisma.$transaction([
+    prisma.quotes.findMany({ where, skip, take: limit, orderBy: { createdAt: 'desc' }, include: { customers: { select: { id: true, name: true, phone: true } } } }),
+    prisma.quotes.count({ where }),
+  ]);
+  return { data: items, meta: { total, page, limit, totalPages: Math.ceil(total / limit) } };
+}
+
+export async function updateQuoteStatus(id: string, status: string) {
+  return prisma.quotes.update({ where: { id }, data: { status } });
+}
+
+export async function recordDelivery(data: { quoteId: string; channel: string; link?: string; attemptedBy: string; }) {
+  const delivery = await prisma.quote_deliveries.create({ data: { quoteId: data.quoteId, channel: data.channel, status: 'SENT', link: data.link, sentAt: new Date(), attemptedBy: data.attemptedBy } });
+  await prisma.quotes.update({ where: { id: data.quoteId }, data: { status: 'SENT' } });
+  return delivery;
+}
+
+export async function buildWhatsAppLink(quoteId: string, phone: string) {
+  const quote = await getQuoteById(quoteId);
+  if (!quote) throw new Error('Cotización no encontrada');
+  const text = encodeURIComponent(`Hola ${quote.customers?.name}, le compartimos su cotización #${quoteId.slice(-6).toUpperCase()} por $${Number(quote.total).toLocaleString('es-CO')}. Válida hasta ${quote.expiresAt?.toLocaleDateString('es-CO') ?? 'sin vencimiento'}.`);
+  return `https://wa.me/${phone.replace(/\D/g, '')}?text=${text}`;
+}

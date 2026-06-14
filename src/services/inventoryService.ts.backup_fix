@@ -1,0 +1,95 @@
+// TODO: Este archivo está siendo refactorizado
+// Versión temporal para poder compilar el resto del código
+
+import { Prisma } from '@prisma/client';
+import { prisma } from '../config/prisma';
+
+export async function createBrand(data: any) {
+  return prisma.brands.create({ data: data as any });
+}
+
+export async function getOrCreateGenericBrand(): Promise<string> {
+  const existing = await prisma.brands.findFirst({ where: { name: 'Genérico' } });
+  if (existing) return existing.id;
+  const created = await prisma.brands.create({ data: { name: 'Genérico', isActive: true } as any });
+  return created.id;
+}
+
+export async function getBrands(query: any) {
+  return prisma.brands.findMany({ where: query });
+}
+
+export async function getBrandById(id: string) {
+  return prisma.brands.findUnique({ where: { id } });
+}
+
+export async function updateBrand(id: string, data: any) {
+  return prisma.brands.update({ where: { id }, data });
+}
+
+export async function deleteBrand(id: string) {
+  return prisma.brands.delete({ where: { id } });
+}
+
+export async function createCategory(data: any) {
+  return prisma.categories.create({ data: data as any });
+}
+
+export async function getCategories(query: any) {
+  return prisma.categories.findMany({ where: query });
+}
+
+export async function getCategoryById(idOrSlug: string) {
+  return prisma.categories.findUnique({ where: { id: idOrSlug } });
+}
+
+export async function updateCategory(id: string, data: any) {
+  return prisma.categories.update({ where: { id }, data });
+}
+
+export async function deleteCategory(id: string) {
+  return prisma.categories.delete({ where: { id } });
+}
+
+export async function createProduct(data: any, userId?: string) {
+  return prisma.products.create({ data: data as any });
+}
+
+export async function getAllProducts(query: any) {
+  return prisma.products.findMany({ where: query });
+}
+
+export async function getProductById(identifier: string) {
+  return prisma.products.findUnique({ where: { id: identifier } });
+}
+
+export async function updateProduct(id: string, data: any, userId?: string) {
+  return prisma.products.update({ where: { id }, data });
+}
+
+export async function deleteProduct(id: string) {
+  return prisma.products.delete({ where: { id } });
+}
+
+export async function adjustStock(productId: string, quantity: number, reason: string, userId?: string) {
+  return prisma.products.update({
+    where: { id: productId },
+    data: { stockQuantity: { increment: quantity } },
+  });
+}
+
+export async function getInventoryStats() {
+  return {
+    totalProducts: await prisma.products.count(),
+    totalBrands: await prisma.brands.count(),
+    totalCategories: await prisma.categories.count(),
+  };
+}
+
+export async function cleanupOrphanCategories(): Promise<number> {
+  return 0;
+}
+
+export async function getCategoriesStats() {
+  return {};
+}

@@ -1,0 +1,102 @@
+import * as fs from 'fs';
+import { Request, Response } from 'express';
+import { z } from 'zod';
+import { logger } from '../config/logger';
+import * as communicationService from '../services/communicationService';
+import * as ticketService        from '../services/ticketService';
+import * as quoteService         from '../services/quoteService';
+import * as workshopService      from '../services/workshopService';
+import * as campaignService      from '../services/campaignService';
+import * as analyticsService     from '../services/crmAnalyticsService';
+import { generateQuotePdf }      from '../services/quotePdfService';
+
+function getParam(req: Request, key: string): string {
+  const val = req.params[key];
+  return Array.isArray(val) ? val[0] : String(val ?? '');
+}
+function getUserId(req: Request): string {
+  return (req as any).user?.id ?? 'system';
+}
+function fail(res: Response, err: unknown, ctx: string) {
+  const msg = err instanceof Error ? err.message : 'Error interno';
+  logger.error(`[crmExtCtrl] ${ctx}:`, err);
+  if (msg.includes('no encontrad')) return res.status(404).json({ error: msg });
+  return res.status(500).json({ error: msg });
+}
+
+// Schemas (Validaciones)
+const commSchema = z.object({ customerId: z.string().min(1), channel: z.enum(['WHATSAPP', 'EMAIL', 'CALL', 'IN_PERSON', 'SMS']), message: z.string().min(1).max(2000), direction: z.enum(['INBOUND', 'OUTBOUND']).default('OUTBOUND') });
+const ticketSchema = z.object({ customerId: z.string().min(1), subject: z.string().min(3).max(200), description: z.string().min(5).max(2000), priority: z.enum(['LOW', 'MEDIUM', 'HIGH', 'URGENT']).default('MEDIUM'), assignedTo: z.string().optional() });
+const ticketUpdateSchema = z.object({ status: z.string().optional(), priority: z.string().optional(), assignedTo: z.string().optional(), resolution: z.string().optional() });
+const quoteItemSchema = z.object({ productId: z.string().optional(), description: z.string().min(1), qty: z.number().int().positive(), unitPrice: z.number().positive(), discount: z.number().min(0).max(100).default(0) });
+const quoteSchema = z.object({ customerId: z.string().min(1), items: z.array(quoteItemSchema).min(1), discount: z.number().min(0).max(100).default(0), expiresAt: z.string().datetime({ offset: true }).optional() });
+const workshopSchema = z.object({ customerId: z.string().min(1), motorcycleId: z.string().optional(), kmReal: z.number().int().min(0).optional(), services: z.array(z.string()).min(1), technician: z.string().optional(), totalCost: z.number().min(0), notes: z.string().optional(), nextServiceKm: z.number().int().min(0).optional(), nextServiceDate: z.string().datetime({ offset: true }).optional() });
+const campaignSchema = z.object({ segment: z.enum(['VIP', 'LOYAL', 'AT_RISK', 'DORMANT', 'CHURNED', 'NEW', 'REGULAR']), channel: z.string().min(2), message: z.string().min(5).max(2000), limit: z.number().int().min(1).max(500).default(200) });
+
+// --- Rutas ---
+export async function postCommunication(req: Request, res: Response) {
+  try { const data = commSchema.parse(req.body); const comm = await communicationService.createCommunication({ ...data, sentByUserId: getUserId(req) }); return res.status(201).json(comm); } catch (err) { if (err instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: err.issues }); return fail(res, err, 'postCommunication'); }
+}
+export async function listCommunications(req: Request, res: Response) {
+  try { const page = Math.max(1, parseInt(String(req.query['page'] ?? '1'))); const limit = Math.min(100, parseInt(String(req.query['limit'] ?? '20'))); const result = await communicationService.listCommunications({ customerId: req.query['customerId'] as string | undefined, channel: req.query['channel'] as string | undefined, status: req.query['status'] as string | undefined, page, limit }); return res.json(result); } catch (err) { return fail(res, err, 'listCommunications'); }
+}
+export async function patchCommRead(req: Request, res: Response) {
+  try { const comm = await communicationService.markCommunicationRead(getParam(req, 'id')); return res.json(comm); } catch (err) { return fail(res, err, 'patchCommRead'); }
+}
+
+export async function postTicket(req: Request, res: Response) {
+  try { const data = ticketSchema.parse(req.body); const ticket = await ticketService.createTicket(data); return res.status(201).json(ticket); } catch (err) { if (err instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: err.issues }); return fail(res, err, 'postTicket'); }
+}
+export async function listTickets(req: Request, res: Response) {
+  try { const page = Math.max(1, parseInt(String(req.query['page'] ?? '1'))); const limit = Math.min(100, parseInt(String(req.query['limit'] ?? '20'))); const result = await ticketService.listTickets({ customerId: req.query['customerId'] as string | undefined, status: req.query['status'] as string | undefined, priority: req.query['priority'] as string | undefined, page, limit }); return res.json(result); } catch (err) { return fail(res, err, 'listTickets'); }
+}
+export async function patchTicket(req: Request, res: Response) {
+  try { const data = ticketUpdateSchema.parse(req.body); const ticket = await ticketService.updateTicket(getParam(req, 'id'), data); return res.json(ticket); } catch (err) { if (err instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: err.issues }); return fail(res, err, 'patchTicket'); }
+}
+
+export async function postQuote(req: Request, res: Response) {
+  try { const data = quoteSchema.parse(req.body); const quote = await quoteService.createQuote({ ...data, expiresAt: data.expiresAt ? new Date(data.expiresAt) : undefined, createdById: getUserId(req) }); return res.status(201).json(quote); } catch (err) { if (err instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: err.issues }); return fail(res, err, 'postQuote'); }
+}
+export async function listQuotes(req: Request, res: Response) {
+  try { const page = Math.max(1, parseInt(String(req.query['page'] ?? '1'))); const limit = Math.min(100, parseInt(String(req.query['limit'] ?? '20'))); const result = await quoteService.listQuotes({ customerId: req.query['customerId'] as string | undefined, status: req.query['status'] as string | undefined, page, limit }); return res.json(result); } catch (err) { return fail(res, err, 'listQuotes'); }
+}
+export async function getQuoteDetail(req: Request, res: Response) {
+  try { const quote = await quoteService.getQuoteById(getParam(req, 'id')); if (!quote) return res.status(404).json({ error: 'Cotización no encontrada' }); return res.json(quote); } catch (err) { return fail(res, err, 'getQuoteDetail'); }
+}
+export async function patchQuoteStatus(req: Request, res: Response) {
+  try { const { status } = req.body as { status: string }; const quote = await quoteService.updateQuoteStatus(getParam(req, 'id'), status); return res.json(quote); } catch (err) { return fail(res, err, 'patchQuoteStatus'); }
+}
+export async function postQuoteDelivery(req: Request, res: Response) {
+  try { const { channel, link } = req.body as { channel: string; link?: string }; const delivery = await quoteService.recordDelivery({ quoteId: getParam(req, 'id'), channel, link, attemptedBy: getUserId(req) }); return res.status(201).json(delivery); } catch (err) { return fail(res, err, 'postQuoteDelivery'); }
+}
+export async function getQuoteWhatsApp(req: Request, res: Response) {
+  try { const phone = String(req.query['phone'] ?? ''); if (!phone) return res.status(400).json({ error: 'phone requerido' }); const link = await quoteService.buildWhatsAppLink(getParam(req, 'id'), phone); return res.json({ link }); } catch (err) { return fail(res, err, 'getQuoteWhatsApp'); }
+}
+export async function getQuotePdf(req: Request, res: Response) {
+  try {
+    const quote = await quoteService.getQuoteById(getParam(req, 'id'));
+    if (!quote) return res.status(404).json({ error: 'Cotización no encontrada' });
+    const items = (quote.items as unknown as Array<{ description: string; qty: number; unitPrice: number; discount: number; subtotal: number; }>).map(i => ({ description: i.description, qty: i.qty, unitPrice: i.unitPrice, discount: i.discount ?? 0, subtotal: i.qty * i.unitPrice * (1 - (i.discount ?? 0) / 100) }));
+    const filePath = await generateQuotePdf({ quoteId: quote.id, customerName: quote.customer.name, customerPhone: quote.customer.phone ?? undefined, customerEmail: quote.customer.email ?? undefined, items, subtotal: Number(quote.subtotal), discount: Number(quote.discount), total: Number(quote.total), expiresAt: quote.expiresAt ?? undefined, createdAt: quote.createdAt });
+    res.setHeader('Content-Type', 'application/pdf'); res.setHeader('Content-Disposition', `attachment; filename="cotizacion-${quote.id.slice(-8)}.pdf"`);
+    const stream = fs.createReadStream(filePath); stream.pipe(res); stream.on('close', () => { try { fs.unlinkSync(filePath); } catch { /* ignore */ } }); return;
+  } catch (err) { return fail(res, err, 'getQuotePdf'); }
+}
+
+export async function postWorkshopVisit(req: Request, res: Response) {
+  try { const data = workshopSchema.parse(req.body); const visit = await workshopService.createWorkshopVisit({ ...data, nextServiceDate: data.nextServiceDate ? new Date(data.nextServiceDate) : undefined }); return res.status(201).json(visit); } catch (err) { if (err instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: err.issues }); return fail(res, err, 'postWorkshopVisit'); }
+}
+export async function listWorkshopVisits(req: Request, res: Response) {
+  try { const page = Math.max(1, parseInt(String(req.query['page'] ?? '1'))); const limit = Math.min(100, parseInt(String(req.query['limit'] ?? '20'))); const result = await workshopService.listWorkshopVisits({ customerId: req.query['customerId'] as string | undefined, motorcycleId: req.query['motorcycleId'] as string | undefined, page, limit }); return res.json(result); } catch (err) { return fail(res, err, 'listWorkshopVisits'); }
+}
+
+export async function postCampaign(req: Request, res: Response) {
+  try { const data = campaignSchema.parse(req.body); const result = await campaignService.launchCampaign({ ...data, sentByUserId: getUserId(req) }); return res.status(201).json({ success: true, ...result }); } catch (err) { if (err instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: err.issues }); return fail(res, err, 'postCampaign'); }
+}
+
+export async function getCrmKpis(req: Request, res: Response) {
+  try { const kpis = await analyticsService.getCrmKpis(); return res.json(kpis); } catch (err) { return fail(res, err, 'getCrmKpis'); }
+}
+export async function refreshCustomerRfm(req: Request, res: Response) {
+  try { const result = await analyticsService.refreshCustomerRfm(getParam(req, 'id')); return res.json(result); } catch (err) { return fail(res, err, 'refreshCustomerRfm'); }
+}

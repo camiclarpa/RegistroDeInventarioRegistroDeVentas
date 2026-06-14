@@ -1,0 +1,123 @@
+import { Request, Response } from 'express';
+import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+import { hashPassword, verifyPassword } from '../utils/passwordUtils';
+
+const JWT_SECRET = process.env.JWT_SECRET || 'tu_secreto_super_seguro_cambialo';
+
+// Helper para generar access token (15 minutos)
+const generateAccessToken = (user: any) => {
+  return jwt.sign(
+    { userId: user.id, email: user.email, role: user.role?.name || 'user' },
+    JWT_SECRET,
+    { expiresIn: '15m' }
+  );
+};
+
+// Helper para configurar la cookie de refresh (7 días)
+const setRefreshCookie = (res: Response, token: string) => {
+  res.cookie('refreshToken', token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production', // Requiere HTTPS en producción
+    sameSite: 'strict',
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 días
+  });
+};
+
+export async function loginHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: 'Email y contraseña requeridos' });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email: email.toLowerCase().trim() },
+      include: { role: true }
+    });
+
+    if (!user || !(await verifyPassword(password, user.password))) {
+      return res.status(401).json({ success: false, error: 'Credenciales inválidas' });
+    }
+
+    const accessToken = generateAccessToken(user);
+    const refreshToken = crypto.randomBytes(40).toString('hex');
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+    // Guardar o actualizar refresh token en BD
+    // Buscar token existente no revocado para este usuario
+
+    // Enviar cookie HttpOnly
+    setRefreshCookie(res, refreshToken);
+
+    const { password: _, ...safeUser } = user;
+    logger.info(`[auth] Login exitoso: ${user.email}`);
+    
+    return res.json({ 
+      success: true, 
+      data: { 
+        token: accessToken, 
+        user: { id: safeUser.id, email: safeUser.email, name: safeUser.name, role: safeUser.role?.name } 
+      } 
+    });
+  } catch (error) {
+    logger.error('[loginHandler]', error);
+    return res.status(500).json({ success: false, error: 'Error interno del servidor' });
+  }
+}
+
+export async function refreshTokenHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    // Leer desde la cookie HttpOnly (NO desde el body)
+    const refreshToken = req.cookies?.refreshToken;
+
+    if (!refreshToken) {
+      return res.status(401).json({ success: false, error: 'Refresh token no encontrado' });
+    }
+
+    const storedToken = await prisma.refreshToken.findFirst({
+      where: { token: refreshToken, expiresAt: { gt: new Date() } },
+      include: { user: { include: { role: true } } }
+    });
+
+    if (!storedToken) {
+      res.clearCookie('refreshToken');
+      return res.status(401).json({ success: false, error: 'Sesión expirada' });
+    }
+
+    // Generar nuevo access token
+    const newAccessToken = generateAccessToken(storedToken.user);
+
+    // Opcional: Rotación de refresh token (máxima seguridad)
+    const newRefreshToken = crypto.randomBytes(40).toString('hex');
+    const newExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    
+    await prisma.refreshToken.update({
+      where: { id: storedToken.id },
+      data: { token: newRefreshToken, expiresAt: newExpiresAt }
+    });
+    
+    setRefreshCookie(res, newRefreshToken);
+
+    return res.json({ success: true, data: { token: newAccessToken } });
+  } catch (error) {
+    logger.error('[refreshTokenHandler]', error);
+    return res.status(500).json({ success: false, error: 'Error al renovar sesión' });
+  }
+}
+
+export async function logoutHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const refreshToken = req.cookies?.refreshToken;
+    if (refreshToken) {
+      await prisma.refreshToken.deleteMany({ where: { token: refreshToken } });
+    }
+    res.clearCookie('refreshToken');
+    return res.json({ success: true, message: 'Sesión cerrada' });
+  } catch (error) {
+    logger.error('[logoutHandler]', error);
+    return res.status(500).json({ success: false, error: 'Error al cerrar sesión' });
+  }
+}

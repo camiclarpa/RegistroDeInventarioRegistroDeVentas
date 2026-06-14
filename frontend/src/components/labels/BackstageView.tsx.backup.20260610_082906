@@ -1,0 +1,1420 @@
+import React, { useState } from 'react';
+import {
+  Home, FilePlus, FolderOpen, Share2, Info, Save, FileDown,
+  Printer, FileOutput, X, User, Settings, Search, Star,
+  Clock, Heart, FileText, Package, Barcode, QrCode,
+  ShoppingCart, TrendingUp, Calendar, Download, Upload,
+  ChevronRight, Plus, Filter, Grid3X3, List, Eye,
+  Tag, Layers, Image as ImageIcon, FileSpreadsheet,
+  CheckCircle2, AlertCircle, Sparkles, Zap, Target,
+  BarChart3, History, Archive, Copy, Trash2, Edit3,
+  ChevronLeft, MoreVertical, Pin, DownloadCloud, UploadCloud,
+  Users, Lock, Globe, Mail, MessageCircle, Send,
+  FileCheck, FileX, RefreshCw, ArrowRight, ArrowLeft,
+  Maximize2, Minimize2, ZoomIn, ZoomOut, RotateCcw,
+  Palette, Type, Bold, Italic, Underline, AlignLeft,
+  AlignCenter, AlignRight, AlignJustify, Strikethrough,
+  Subscript, Superscript, Highlighter, Eraser,
+  Scissors, Clipboard, ClipboardCopy, ClipboardPaste,
+  Undo2, Redo2, SaveAll, FolderPlus, FolderSync,
+  Cloud, CloudOff, Wifi, WifiOff, Battery, BatteryCharging,
+  Bell, BellRing, Shield, ShieldCheck, Key, Fingerprint,
+  CreditCard, DollarSign, TrendingDown, Activity,
+  Cpu, HardDrive, Database, Server,
+  Code, Terminal, Bug, Wrench, Hammer,
+  BookOpen, HelpCircle, Lightbulb,
+  Award, Trophy, Flame,
+  Rocket, Crown, Gem, Diamond,
+  LogOut, Moon, Sun, Monitor, Smartphone,
+  MonitorCheck, SmartphoneCheck, BellOff, Volume2, VolumeX,
+  Languages, Translate, Globe2, MapPin, Building2,
+  Phone, AtSign, Link as LinkIcon, ExternalLink,
+  Check, XCircle, AlertTriangle, Info as InfoIcon
+} from 'lucide-react';
+
+interface Template {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  author: string;
+  createdAt: string;
+  modifiedAt: string;
+  usageCount: number;
+  isFavorite: boolean;
+  isShared: boolean;
+  thumbnail?: string;
+  tags: string[];
+  version: string;
+  size: string;
+}
+
+interface RecentFile {
+  id: string;
+  name: string;
+  path: string;
+  modifiedAt: string;
+  size: string;
+  type: 'template' | 'label' | 'batch';
+  icon: any;
+  isFavorite: boolean;
+  lastOpened: string;
+  openCount: number;
+}
+
+export const BackstageView: React.FC<{ onClose: () => void }> = ({ onClose }) => {
+  const [activeSection, setActiveSection] = useState('inicio');
+  const [activeTab, setActiveTab] = useState<'recientes' | 'favoritos' | 'compartidos'>('recientes');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');
+  const [sortBy, setSortBy] = useState<'name' | 'date' | 'size'>('date');
+  const [filterCategory, setFilterCategory] = useState<string>('all');
+  const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
+
+  // Datos de usuario
+  const [userData, setUserData] = useState({
+    name: 'Administrador',
+    email: 'admin@clavijomotos.com',
+    company: 'Clavijos Motos S.A.S.',
+    role: 'Administrador',
+    phone: '+57 300 123 4567',
+    avatar: null,
+    lastLogin: 'Hoy a las 12:43 AM',
+    memberSince: 'Enero 2024',
+    totalLabels: 1245,
+    totalPrints: 892,
+    storageUsed: '2.4 GB',
+    storageTotal: '10 GB'
+  });
+
+  // Preferencias de la aplicación
+  const [appSettings, setAppSettings] = useState({
+    theme: 'light',
+    language: 'es',
+    timezone: 'America/Bogota',
+    dateFormat: 'DD/MM/YYYY',
+    timeFormat: '24h',
+    notifications: true,
+    emailNotifications: true,
+    autoSave: true,
+    autoSaveInterval: 5,
+    defaultPrinter: 'Zebra ZD220',
+    defaultPaperSize: '50mm x 25mm',
+    defaultOrientation: 'horizontal',
+    defaultQuality: '300 DPI',
+    showGrid: true,
+    snapToGrid: true,
+    gridSize: 10
+  });
+
+  // Datos simulados
+  const recentFiles: RecentFile[] = [
+    { id: '1', name: 'Etiqueta Motoled Pulsar', path: 'Plantillas/Motos', modifiedAt: 'Hoy a las 10:30 AM', size: '245 KB', type: 'template', icon: Tag, isFavorite: true, lastOpened: 'Hace 2 horas', openCount: 15 },
+    { id: '2', name: 'Lote Compra #1234', path: 'Lotes/2026', modifiedAt: 'Ayer a las 3:45 PM', size: '1.2 MB', type: 'batch', icon: ShoppingCart, isFavorite: false, lastOpened: 'Ayer', openCount: 8 },
+    { id: '3', name: 'Etiqueta Cadenas 428H', path: 'Plantillas/Cadenas', modifiedAt: 'Lun a las 9:15 AM', size: '180 KB', type: 'template', icon: Tag, isFavorite: true, lastOpened: 'Hace 3 días', openCount: 23 },
+    { id: '4', name: 'Inventario General', path: 'Reportes', modifiedAt: '28 May 2026', size: '3.5 MB', type: 'label', icon: Package, isFavorite: false, lastOpened: 'Hace 1 semana', openCount: 5 },
+    { id: '5', name: 'Etiquetas Honda XR150', path: 'Plantillas/Honda', modifiedAt: '16 May 2026', size: '320 KB', type: 'template', icon: Tag, isFavorite: true, lastOpened: 'Hace 2 semanas', openCount: 42 },
+  ];
+
+  const templates = [
+    { id: '1', name: 'Libro en blanco', description: 'Etiqueta vacía para diseñar desde cero', icon: FilePlus, color: 'bg-white border-2 border-gray-200', category: 'Básicas', difficulty: 'Fácil' },
+    { id: '2', name: 'Etiqueta de Producto', description: 'Con SKU, nombre, precio y barcode', icon: Tag, color: 'bg-blue-50 border-2 border-blue-200', category: 'Productos', difficulty: 'Fácil' },
+    { id: '3', name: 'Etiqueta con QR', description: 'Incluye código QR dinámico', icon: QrCode, color: 'bg-purple-50 border-2 border-purple-200', category: 'Avanzadas', difficulty: 'Medio' },
+    { id: '4', name: 'Etiqueta de Lote', description: 'Para compras masivas', icon: ShoppingCart, color: 'bg-green-50 border-2 border-green-200', category: 'Lotes', difficulty: 'Fácil' },
+    { id: '5', name: 'Etiqueta Premium', description: 'Con logo y diseño profesional', icon: Sparkles, color: 'bg-amber-50 border-2 border-amber-200', category: 'Premium', difficulty: 'Avanzado' },
+    { id: '6', name: 'Etiqueta Minimalista', description: 'Diseño limpio y moderno', icon: Zap, color: 'bg-gray-50 border-2 border-gray-200', category: 'Diseño', difficulty: 'Fácil' },
+    { id: '7', name: 'Etiqueta con Código de Barras', description: 'EAN-13, Code-128, UPC', icon: Barcode, color: 'bg-indigo-50 border-2 border-indigo-200', category: 'Productos', difficulty: 'Fácil' },
+    { id: '8', name: 'Etiqueta Multi-Producto', description: 'Varios productos en una hoja', icon: Layers, color: 'bg-pink-50 border-2 border-pink-200', category: 'Lotes', difficulty: 'Medio' },
+  ];
+
+  const sigcFeatures = [
+    { id: '1', name: 'Desde Inventario', description: 'Generar etiquetas de productos existentes', icon: Package, color: 'bg-orange-500', stats: '730 productos disponibles', action: 'Seleccionar productos' },
+    { id: '2', name: 'Desde Compra', description: 'Etiquetas automáticas de lote de compra', icon: ShoppingCart, color: 'bg-blue-500', stats: '156 lotes procesados', action: 'Ver lotes' },
+    { id: '3', name: 'Importar CSV/Excel', description: 'Cargar productos desde archivo', icon: FileSpreadsheet, color: 'bg-green-500', stats: 'Formatos soportados', action: 'Subir archivo' },
+    { id: '4', name: 'Generación Masiva', description: 'Múltiples etiquetas de una vez', icon: Layers, color: 'bg-purple-500', stats: 'Hasta 1000 etiquetas', action: 'Configurar lote' },
+  ];
+
+  const categories = ['Todas', 'Básicas', 'Productos', 'Avanzadas', 'Lotes', 'Premium', 'Diseño'];
+
+  const sidebarItems = [
+    { id: 'inicio', label: 'Inicio', icon: Home, description: 'Vista general' },
+    { id: 'nuevo', label: 'Nuevo', icon: FilePlus, description: 'Crear etiqueta' },
+    { id: 'abrir', label: 'Abrir', icon: FolderOpen, description: 'Abrir existente' },
+    { id: 'compartir', label: 'Compartir', icon: Share2, description: 'Colaborar' },
+    { id: 'informacion', label: 'Información', icon: Info, description: 'Detalles' },
+    { id: 'guardar', label: 'Guardar', icon: Save, description: 'Guardar cambios' },
+    { id: 'guardar-como', label: 'Guardar como', icon: FileDown, description: 'Guardar copia' },
+    { id: 'imprimir', label: 'Imprimir', icon: Printer, description: 'Imprimir etiqueta' },
+    { id: 'exportar', label: 'Exportar', icon: FileOutput, description: 'Exportar archivo' },
+    { id: 'cerrar', label: 'Cerrar', icon: X, description: 'Cerrar archivo' },
+  ];
+
+  const bottomItems = [
+    { id: 'cuenta', label: 'Cuenta', icon: User, description: 'Administrador' },
+    { id: 'opciones', label: 'Opciones', icon: Settings, description: 'Configuración' },
+  ];
+
+  // Funciones de guardado
+  const handleSaveSettings = () => {
+    alert('✅ Configuración guardada correctamente');
+  };
+
+  const handleLogout = () => {
+    if (window.confirm('¿Deseas cerrar sesión?')) {
+      alert('Sesión cerrada');
+      window.location.href = '/login';
+    }
+  };
+
+  const handleUpdateProfile = () => {
+    alert('✅ Perfil actualizado correctamente');
+  };
+
+  const handleChangePassword = () => {
+    alert('🔐 Contraseña cambiada correctamente');
+  };
+
+  const handleResetSettings = () => {
+    if (window.confirm('¿Restaurar configuración predeterminada?')) {
+      setAppSettings({
+        theme: 'light',
+        language: 'es',
+        timezone: 'America/Bogota',
+        dateFormat: 'DD/MM/YYYY',
+        timeFormat: '24h',
+        notifications: true,
+        emailNotifications: true,
+        autoSave: true,
+        autoSaveInterval: 5,
+        defaultPrinter: 'Zebra ZD220',
+        defaultPaperSize: '50mm x 25mm',
+        defaultOrientation: 'horizontal',
+        defaultQuality: '300 DPI',
+        showGrid: true,
+        snapToGrid: true,
+        gridSize: 10
+      });
+      alert('✅ Configuración restaurada');
+    }
+  };
+
+  const renderContent = () => {
+    switch (activeSection) {
+      case 'inicio':
+        return (
+          <div className="space-y-8">
+            {/* Saludo mejorado */}
+            <div className="flex items-center justify-between">
+              <div>
+                <h1 className="text-4xl font-bold text-gray-800">Buenos días</h1>
+                <p className="text-gray-500 mt-2 text-lg">¿Qué etiqueta deseas crear hoy?</p>
+                <div className="flex items-center gap-4 mt-3">
+                  <span className="text-sm text-gray-600 flex items-center gap-1">
+                    <Calendar className="w-4 h-4" />
+                    Miércoles, 10 de junio 2026
+                  </span>
+                  <span className="text-sm text-gray-600 flex items-center gap-1">
+                    <Clock className="w-4 h-4" />
+                    12:43 AM
+                  </span>
+                </div>
+              </div>
+              <div className="flex items-center gap-3">
+                <button className="p-2 hover:bg-gray-100 rounded-lg transition">
+                  <Bell className="w-5 h-5 text-gray-600" />
+                </button>
+                <button className="p-2 hover:bg-gray-100 rounded-lg transition">
+                  <Settings className="w-5 h-5 text-gray-600" />
+                </button>
+              </div>
+            </div>
+
+            {/* Sección Nueva mejorada */}
+            <div>
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-2xl font-bold text-gray-800 flex items-center gap-3">
+                  <Sparkles className="w-6 h-6 text-blue-600" />
+                  Nueva
+                </h2>
+                <button className="text-sm text-blue-600 hover:text-blue-700 flex items-center gap-1 font-medium">
+                  Más plantillas <ChevronRight className="w-4 h-4" />
+                </button>
+              </div>
+              
+              <div className="grid grid-cols-4 gap-5">
+                {templates.map(template => (
+                  <button
+                    key={template.id}
+                    className={`${template.color} rounded-xl p-5 hover:shadow-2xl transition-all duration-300 hover:scale-105 text-left group relative overflow-hidden`}
+                  >
+                    <div className="absolute top-3 right-3 opacity-0 group-hover:opacity-100 transition">
+                      <MoreVertical className="w-4 h-4 text-gray-400" />
+                    </div>
+                    <div className="aspect-square bg-white rounded-lg mb-4 flex items-center justify-center shadow-sm group-hover:shadow-md transition relative">
+                      <template.icon className="w-16 h-16 text-gray-400 group-hover:scale-110 transition" />
+                      <div className="absolute bottom-2 right-2">
+                        <span className={`text-xs px-2 py-1 rounded-full ${
+                          template.difficulty === 'Fácil' ? 'bg-green-100 text-green-700' :
+                          template.difficulty === 'Medio' ? 'bg-yellow-100 text-yellow-700' :
+                          'bg-red-100 text-red-700'
+                        }`}>
+                          {template.difficulty}
+                        </span>
+                      </div>
+                    </div>
+                    <p className="text-base font-bold text-gray-800">{template.name}</p>
+                    <p className="text-sm text-gray-500 mt-2 line-clamp-2">{template.description}</p>
+                    <div className="mt-3 flex items-center justify-between">
+                      <span className="text-xs text-gray-400">{template.category}</span>
+                      <ArrowRight className="w-4 h-4 text-gray-400 opacity-0 group-hover:opacity-100 transition" />
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Funcionalidades únicas SIGC-Motos mejoradas */}
+            <div>
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-2xl font-bold text-gray-800 flex items-center gap-3">
+                  <Zap className="w-6 h-6 text-orange-600" />
+                  Funciones SIGC-Motos
+                </h2>
+                <span className="text-xs bg-gradient-to-r from-orange-500 to-red-500 text-white px-3 py-1.5 rounded-full font-bold flex items-center gap-1">
+                  <Crown className="w-3 h-3" />
+                  Exclusivo
+                </span>
+              </div>
+              
+              <div className="grid grid-cols-4 gap-5">
+                {sigcFeatures.map(feature => (
+                  <button
+                    key={feature.id}
+                    className="bg-white border-2 border-gray-200 rounded-xl p-6 hover:shadow-2xl transition-all duration-300 hover:border-orange-300 text-left group relative overflow-hidden"
+                  >
+                    <div className={`w-14 h-14 ${feature.color} rounded-xl flex items-center justify-center mb-4 group-hover:scale-110 transition shadow-lg`}>
+                      <feature.icon className="w-7 h-7 text-white" />
+                    </div>
+                    <p className="text-lg font-bold text-gray-800">{feature.name}</p>
+                    <p className="text-sm text-gray-500 mt-2">{feature.description}</p>
+                    <div className="mt-4 pt-4 border-t border-gray-100">
+                      <p className="text-xs text-gray-400 mb-2">{feature.stats}</p>
+                      <button className="text-sm text-orange-600 font-semibold flex items-center gap-1 group-hover:gap-2 transition-all">
+                        {feature.action} <ArrowRight className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Archivos Recientes mejorados */}
+            <div>
+              <div className="flex items-center justify-between mb-6">
+                <div className="flex gap-3">
+                  <button 
+                    onClick={() => setActiveTab('recientes')}
+                    className={`px-5 py-2.5 rounded-full text-sm font-semibold transition flex items-center gap-2 ${activeTab === 'recientes' ? 'bg-green-600 text-white shadow-lg' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
+                  >
+                    <Clock className="w-4 h-4" />
+                    Recientes
+                  </button>
+                  <button 
+                    onClick={() => setActiveTab('favoritos')}
+                    className={`px-5 py-2.5 rounded-full text-sm font-semibold transition flex items-center gap-2 ${activeTab === 'favoritos' ? 'bg-green-600 text-white shadow-lg' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
+                  >
+                    <Star className="w-4 h-4" />
+                    Favoritos
+                  </button>
+                  <button 
+                    onClick={() => setActiveTab('compartidos')}
+                    className={`px-5 py-2.5 rounded-full text-sm font-semibold transition flex items-center gap-2 ${activeTab === 'compartidos' ? 'bg-green-600 text-white shadow-lg' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
+                  >
+                    <Share2 className="w-4 h-4" />
+                    Compartidos conmigo
+                  </button>
+                </div>
+                
+                <div className="flex items-center gap-3">
+                  <button 
+                    onClick={() => setShowAdvancedFilters(!showAdvancedFilters)}
+                    className={`p-2 rounded-lg transition ${showAdvancedFilters ? 'bg-blue-100 text-blue-600' : 'hover:bg-gray-100'}`}
+                  >
+                    <Filter className="w-4 h-4" />
+                  </button>
+                  <button 
+                    onClick={() => setViewMode(viewMode === 'list' ? 'grid' : 'list')}
+                    className="p-2 hover:bg-gray-100 rounded-lg transition"
+                  >
+                    {viewMode === 'list' ? <Grid3X3 className="w-4 h-4" /> : <List className="w-4 h-4" />}
+                  </button>
+                  <div className="relative">
+                    <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+                    <input
+                      type="text"
+                      placeholder="Buscar un archivo"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      className="pl-9 pr-4 py-2.5 bg-gray-100 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-green-500 w-72"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {showAdvancedFilters && (
+                <div className="bg-white rounded-lg border border-gray-200 p-4 mb-4 flex items-center gap-4">
+                  <div>
+                    <label className="text-xs text-gray-500 block mb-1">Categoría</label>
+                    <select value={filterCategory} onChange={(e) => setFilterCategory(e.target.value)} className="px-3 py-1.5 border border-gray-300 rounded text-sm">
+                      {categories.map(cat => <option key={cat} value={cat.toLowerCase()}>{cat}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-500 block mb-1">Ordenar por</label>
+                    <select value={sortBy} onChange={(e) => setSortBy(e.target.value as any)} className="px-3 py-1.5 border border-gray-300 rounded text-sm">
+                      <option value="date">Fecha</option>
+                      <option value="name">Nombre</option>
+                      <option value="size">Tamaño</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-500 block mb-1">Tipo</label>
+                    <select className="px-3 py-1.5 border border-gray-300 rounded text-sm">
+                      <option>Todos</option>
+                      <option>Plantillas</option>
+                      <option>Etiquetas</option>
+                      <option>Lotes</option>
+                    </select>
+                  </div>
+                </div>
+              )}
+
+              {/* Lista de archivos mejorada */}
+              <div className="bg-white rounded-xl border border-gray-200 overflow-hidden shadow-sm">
+                <div className="grid grid-cols-12 gap-4 px-6 py-4 bg-gray-50 border-b border-gray-200 text-xs font-bold text-gray-600 uppercase tracking-wide">
+                  <div className="col-span-5">Nombre</div>
+                  <div className="col-span-3">Ubicación</div>
+                  <div className="col-span-2">Modificado</div>
+                  <div className="col-span-2">Tamaño</div>
+                </div>
+                
+                {recentFiles.map(file => (
+                  <div key={file.id} className="grid grid-cols-12 gap-4 px-6 py-4 border-b border-gray-100 hover:bg-gray-50 cursor-pointer transition group">
+                    <div className="col-span-5 flex items-center gap-4">
+                      <div className="w-10 h-10 bg-gradient-to-br from-green-400 to-green-600 rounded-lg flex items-center justify-center shadow-sm group-hover:shadow-md transition">
+                        <file.icon className="w-5 h-5 text-white" />
+                      </div>
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <p className="text-sm font-semibold text-gray-800">{file.name}</p>
+                          {file.isFavorite && <Star className="w-3 h-3 text-yellow-500 fill-yellow-500" />}
+                        </div>
+                        <p className="text-xs text-gray-500 mt-0.5">{file.path} • Abierto {file.openCount} veces</p>
+                      </div>
+                    </div>
+                    <div className="col-span-3 flex items-center text-sm text-gray-600">
+                      {file.path}
+                    </div>
+                    <div className="col-span-2 flex items-center text-sm text-gray-600">
+                      <div>
+                        <p>{file.modifiedAt}</p>
+                        <p className="text-xs text-gray-400">{file.lastOpened}</p>
+                      </div>
+                    </div>
+                    <div className="col-span-2 flex items-center justify-between">
+                      <span className="text-sm text-gray-600">{file.size}</span>
+                      <button className="opacity-0 group-hover:opacity-100 p-1 hover:bg-gray-200 rounded transition">
+                        <MoreVertical className="w-4 h-4 text-gray-400" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              
+              <div className="flex justify-between items-center mt-6">
+                <p className="text-sm text-gray-500">Mostrando {recentFiles.length} de {recentFiles.length} archivos</p>
+                <button className="text-sm text-green-600 hover:text-green-700 flex items-center gap-1 font-semibold">
+                  Ver más archivos <ChevronRight className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'nuevo':
+        return (
+          <div className="space-y-8">
+            <div>
+              <h1 className="text-4xl font-bold text-gray-800 mb-2">Nueva Etiqueta</h1>
+              <p className="text-gray-500 text-lg">Selecciona una plantilla o comienza desde cero</p>
+            </div>
+
+            {/* Búsqueda y filtros */}
+            <div className="flex items-center gap-4">
+              <div className="relative flex-1">
+                <Search className="w-5 h-5 absolute left-4 top-1/2 -translate-y-1/2 text-gray-400" />
+                <input type="text" placeholder="Buscar plantillas..." className="w-full pl-12 pr-4 py-3 bg-white border border-gray-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500" />
+              </div>
+              <select className="px-4 py-3 bg-white border border-gray-200 rounded-xl text-sm">
+                <option>Todas las categorías</option>
+                {categories.slice(1).map(cat => <option key={cat}>{cat}</option>)}
+              </select>
+            </div>
+
+            {/* Plantillas en grid grande */}
+            <div className="grid grid-cols-3 gap-6">
+              {templates.map(template => (
+                <button
+                  key={template.id}
+                  className={`${template.color} rounded-2xl p-8 hover:shadow-2xl transition-all duration-300 hover:scale-105 text-left group`}
+                >
+                  <div className="aspect-video bg-white rounded-xl mb-6 flex items-center justify-center shadow-sm group-hover:shadow-lg transition">
+                    <template.icon className="w-20 h-20 text-gray-400 group-hover:scale-110 transition" />
+                  </div>
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <p className="text-xl font-bold text-gray-800">{template.name}</p>
+                      <p className="text-sm text-gray-500 mt-2">{template.description}</p>
+                    </div>
+                    <span className={`text-xs px-3 py-1 rounded-full ${
+                      template.difficulty === 'Fácil' ? 'bg-green-100 text-green-700' :
+                      template.difficulty === 'Medio' ? 'bg-yellow-100 text-yellow-700' :
+                      'bg-red-100 text-red-700'
+                    }`}>
+                      {template.difficulty}
+                    </span>
+                  </div>
+                  <div className="mt-4 pt-4 border-t border-gray-200 flex items-center justify-between">
+                    <span className="text-sm text-gray-400">{template.category}</span>
+                    <button className="text-sm text-blue-600 font-semibold flex items-center gap-1">
+                      Usar plantilla <ArrowRight className="w-4 h-4" />
+                    </button>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        );
+
+      case 'abrir':
+        return (
+          <div className="space-y-8">
+            <div>
+              <h1 className="text-4xl font-bold text-gray-800 mb-2">Abrir Etiqueta</h1>
+              <p className="text-gray-500 text-lg">Selecciona la ubicación del archivo</p>
+            </div>
+
+            <div className="grid grid-cols-3 gap-6">
+              <button className="bg-white border-2 border-gray-200 rounded-2xl p-8 hover:shadow-2xl transition text-left group hover:border-blue-300">
+                <FolderOpen className="w-16 h-16 text-blue-600 mb-4 group-hover:scale-110 transition" />
+                <p className="text-xl font-bold text-gray-800">Este equipo</p>
+                <p className="text-sm text-gray-500 mt-2">Buscar en tu computadora</p>
+                <div className="mt-4 pt-4 border-t border-gray-100">
+                  <p className="text-xs text-gray-400">Última vez: Hace 2 horas</p>
+                </div>
+              </button>
+              
+              <button className="bg-white border-2 border-gray-200 rounded-2xl p-8 hover:shadow-2xl transition text-left group hover:border-green-300">
+                <Cloud className="w-16 h-16 text-green-600 mb-4 group-hover:scale-110 transition" />
+                <p className="text-xl font-bold text-gray-800">SIGC-Motos Cloud</p>
+                <p className="text-sm text-gray-500 mt-2">Plantillas en la nube</p>
+                <div className="mt-4 pt-4 border-t border-gray-100">
+                  <p className="text-xs text-gray-400">24 plantillas disponibles</p>
+                </div>
+              </button>
+              
+              <button className="bg-white border-2 border-gray-200 rounded-2xl p-8 hover:shadow-2xl transition text-left group hover:border-purple-300">
+                <History className="w-16 h-16 text-purple-600 mb-4 group-hover:scale-110 transition" />
+                <p className="text-xl font-bold text-gray-800">Recientes</p>
+                <p className="text-sm text-gray-500 mt-2">Últimas etiquetas abiertas</p>
+                <div className="mt-4 pt-4 border-t border-gray-100">
+                  <p className="text-xs text-gray-400">5 archivos recientes</p>
+                </div>
+              </button>
+            </div>
+
+            {/* Lista de archivos recientes */}
+            <div>
+              <h2 className="text-2xl font-bold text-gray-800 mb-4">Archivos recientes</h2>
+              <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+                {recentFiles.map(file => (
+                  <div key={file.id} className="flex items-center gap-4 px-6 py-4 border-b border-gray-100 hover:bg-gray-50 cursor-pointer transition">
+                    <div className="w-12 h-12 bg-gradient-to-br from-green-400 to-green-600 rounded-lg flex items-center justify-center">
+                      <file.icon className="w-6 h-6 text-white" />
+                    </div>
+                    <div className="flex-1">
+                      <p className="font-semibold text-gray-800">{file.name}</p>
+                      <p className="text-sm text-gray-500">{file.path} • {file.size}</p>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-sm text-gray-600">{file.modifiedAt}</p>
+                      <p className="text-xs text-gray-400">{file.lastOpened}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'compartir':
+        return (
+          <div className="space-y-8">
+            <div>
+              <h1 className="text-4xl font-bold text-gray-800 mb-2">Compartir Etiqueta</h1>
+              <p className="text-gray-500 text-lg">Colabora con tu equipo</p>
+            </div>
+
+            <div className="bg-white rounded-2xl border border-gray-200 p-8">
+              <div className="mb-6">
+                <label className="text-sm text-gray-500 block mb-2">Enlace de compartir</label>
+                <div className="flex gap-3">
+                  <input 
+                    type="text" 
+                    readOnly 
+                    value="https://motos.quantacloud.co/labels/shared/abc123xyz"
+                    className="flex-1 px-4 py-3 bg-gray-50 border border-gray-300 rounded-xl text-sm"
+                  />
+                  <button className="px-6 py-3 bg-blue-600 text-white rounded-xl font-semibold hover:bg-blue-700 transition flex items-center gap-2">
+                    <Copy className="w-5 h-5" />
+                    Copiar
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-4">
+                <button className="p-6 border-2 border-gray-200 rounded-xl hover:border-green-300 hover:bg-green-50 transition text-center">
+                  <Mail className="w-12 h-12 text-green-600 mx-auto mb-3" />
+                  <p className="font-semibold text-gray-800">Email</p>
+                  <p className="text-sm text-gray-500 mt-1">Enviar por correo</p>
+                </button>
+                <button className="p-6 border-2 border-gray-200 rounded-xl hover:border-blue-300 hover:bg-blue-50 transition text-center">
+                  <MessageCircle className="w-12 h-12 text-blue-600 mx-auto mb-3" />
+                  <p className="font-semibold text-gray-800">WhatsApp</p>
+                  <p className="text-sm text-gray-500 mt-1">Compartir por WhatsApp</p>
+                </button>
+                <button className="p-6 border-2 border-gray-200 rounded-xl hover:border-purple-300 hover:bg-purple-50 transition text-center">
+                  <Share2 className="w-12 h-12 text-purple-600 mx-auto mb-3" />
+                  <p className="font-semibold text-gray-800">Enlace</p>
+                  <p className="text-sm text-gray-500 mt-1">Copiar enlace</p>
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'informacion':
+        return (
+          <div className="space-y-8">
+            <div>
+              <h1 className="text-4xl font-bold text-gray-800 mb-2">Información</h1>
+              <p className="text-gray-500 text-lg">Detalles y propiedades de la etiqueta</p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-6">
+              <div className="bg-white rounded-2xl border border-gray-200 p-8">
+                <h2 className="text-2xl font-bold mb-6 flex items-center gap-2">
+                  <FileText className="w-6 h-6 text-blue-600" />
+                  Propiedades
+                </h2>
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Título</label>
+                    <input type="text" defaultValue="Etiqueta Motoled Pulsar" className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500" />
+                  </div>
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Autor</label>
+                    <input type="text" defaultValue="Administrador" className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500" />
+                  </div>
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Categoría</label>
+                    <input type="text" defaultValue="Motos" className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500" />
+                  </div>
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Versión</label>
+                    <input type="text" defaultValue="1.0" className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500" />
+                  </div>
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Etiquetas</label>
+                    <input type="text" defaultValue="motos, pulsar, motoled" className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500" />
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-6">
+                <div className="bg-white rounded-2xl border border-gray-200 p-8">
+                  <h2 className="text-2xl font-bold mb-6 flex items-center gap-2">
+                    <BarChart3 className="w-6 h-6 text-green-600" />
+                    Estadísticas SIGC-Motos
+                  </h2>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="text-center p-6 bg-gradient-to-br from-blue-50 to-blue-100 rounded-xl">
+                      <Package className="w-10 h-10 text-blue-600 mx-auto mb-3" />
+                      <p className="text-3xl font-bold text-blue-600">730</p>
+                      <p className="text-sm text-gray-600 mt-1">Productos</p>
+                    </div>
+                    <div className="text-center p-6 bg-gradient-to-br from-green-50 to-green-100 rounded-xl">
+                      <Tag className="w-10 h-10 text-green-600 mx-auto mb-3" />
+                      <p className="text-3xl font-bold text-green-600">1,245</p>
+                      <p className="text-sm text-gray-600 mt-1">Etiquetas</p>
+                    </div>
+                    <div className="text-center p-6 bg-gradient-to-br from-purple-50 to-purple-100 rounded-xl">
+                      <Printer className="w-10 h-10 text-purple-600 mx-auto mb-3" />
+                      <p className="text-3xl font-bold text-purple-600">892</p>
+                      <p className="text-sm text-gray-600 mt-1">Impresiones</p>
+                    </div>
+                    <div className="text-center p-6 bg-gradient-to-br from-orange-50 to-orange-100 rounded-xl">
+                      <ShoppingCart className="w-10 h-10 text-orange-600 mx-auto mb-3" />
+                      <p className="text-3xl font-bold text-orange-600">156</p>
+                      <p className="text-sm text-gray-600 mt-1">Lotes</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-2xl border border-gray-200 p-8">
+                  <h2 className="text-2xl font-bold mb-4 flex items-center gap-2">
+                    <History className="w-6 h-6 text-purple-600" />
+                    Historial de versiones
+                  </h2>
+                  <div className="space-y-3">
+                    {[
+                      { version: '1.0', date: 'Hoy 10:30 AM', author: 'Admin', changes: 'Creación inicial' },
+                      { version: '0.9', date: 'Ayer 3:45 PM', author: 'Admin', changes: 'Ajuste de tamaño' },
+                      { version: '0.8', date: 'Lun 9:15 AM', author: 'Admin', changes: 'Agregar barcode' },
+                    ].map(v => (
+                      <div key={v.version} className="flex items-center gap-4 p-3 bg-gray-50 rounded-lg">
+                        <div className="w-10 h-10 bg-purple-100 rounded-lg flex items-center justify-center">
+                          <span className="text-sm font-bold text-purple-600">v{v.version}</span>
+                        </div>
+                        <div className="flex-1">
+                          <p className="text-sm font-semibold">{v.changes}</p>
+                          <p className="text-xs text-gray-500">{v.author} • {v.date}</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'guardar':
+        return (
+          <div className="space-y-8">
+            <div>
+              <h1 className="text-4xl font-bold text-gray-800 mb-2">Guardar</h1>
+              <p className="text-gray-500 text-lg">Guardar cambios en la etiqueta actual</p>
+            </div>
+
+            <div className="bg-white rounded-2xl border border-gray-200 p-8">
+              <div className="flex items-center gap-4 mb-6">
+                <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center">
+                  <CheckCircle2 className="w-8 h-8 text-green-600" />
+                </div>
+                <div>
+                  <h2 className="text-2xl font-bold text-gray-800">Etiqueta guardada</h2>
+                  <p className="text-gray-500">Última guarda: Hoy a las 12:43 PM</p>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <div className="p-4 bg-gray-50 rounded-xl">
+                  <p className="text-sm text-gray-600">Nombre del archivo:</p>
+                  <p className="text-lg font-semibold text-gray-800">Etiqueta_Motoled_Pulsar_v1.0</p>
+                </div>
+                <div className="p-4 bg-gray-50 rounded-xl">
+                  <p className="text-sm text-gray-600">Ubicación:</p>
+                  <p className="text-lg font-semibold text-gray-800">Plantillas/Motos</p>
+                </div>
+                <div className="p-4 bg-gray-50 rounded-xl">
+                  <p className="text-sm text-gray-600">Tamaño:</p>
+                  <p className="text-lg font-semibold text-gray-800">245 KB</p>
+                </div>
+              </div>
+
+              <div className="mt-6 flex gap-3">
+                <button className="flex-1 py-3 bg-blue-600 text-white rounded-xl font-semibold hover:bg-blue-700 transition">
+                  Guardar cambios
+                </button>
+                <button className="flex-1 py-3 border-2 border-gray-300 rounded-xl font-semibold hover:bg-gray-50 transition">
+                  Guardar como copia
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'guardar-como':
+        return (
+          <div className="space-y-8">
+            <div>
+              <h1 className="text-4xl font-bold text-gray-800 mb-2">Guardar como</h1>
+              <p className="text-gray-500 text-lg">Guardar una copia con otro nombre</p>
+            </div>
+
+            <div className="bg-white rounded-2xl border border-gray-200 p-8 max-w-2xl">
+              <div className="space-y-6">
+                <div>
+                  <label className="text-sm text-gray-500 block mb-2">Nombre del archivo</label>
+                  <input type="text" defaultValue="Etiqueta_Motoled_Pulsar_Copia" className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500" />
+                </div>
+                <div>
+                  <label className="text-sm text-gray-500 block mb-2">Ubicación</label>
+                  <select className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500">
+                    <option>Plantillas/Motos</option>
+                    <option>Plantillas/Cadenas</option>
+                    <option>Plantillas/Honda</option>
+                    <option>Plantillas/Yamaha</option>
+                    <option>Plantillas/Suzuki</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-sm text-gray-500 block mb-2">Formato</label>
+                  <select className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500">
+                    <option>Plantilla SIGC (.sigc)</option>
+                    <option>JSON (.json)</option>
+                    <option>XML (.xml)</option>
+                  </select>
+                </div>
+
+                <div className="pt-6 flex gap-3">
+                  <button className="flex-1 py-3 bg-green-600 text-white rounded-xl font-semibold hover:bg-green-700 transition flex items-center justify-center gap-2">
+                    <Save className="w-5 h-5" />
+                    Guardar copia
+                  </button>
+                  <button className="flex-1 py-3 border-2 border-gray-300 rounded-xl font-semibold hover:bg-gray-50 transition">
+                    Cancelar
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'imprimir':
+        return (
+          <div className="space-y-8">
+            <div>
+              <h1 className="text-4xl font-bold text-gray-800 mb-2">Imprimir Etiqueta</h1>
+              <p className="text-gray-500 text-lg">Configura y envía a imprimir</p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-6">
+              <div className="bg-white rounded-2xl border border-gray-200 p-8">
+                <h2 className="text-2xl font-bold mb-6 flex items-center gap-2">
+                  <Printer className="w-6 h-6 text-blue-600" />
+                  Configuración
+                </h2>
+                <div className="space-y-5">
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Impresora</label>
+                    <select className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500">
+                      <option>Zebra ZD220 (Térmica)</option>
+                      <option>Epson TM-T20 (Térmica)</option>
+                      <option>HP LaserJet (Láser)</option>
+                      <option>Brother QL-800 (Etiquetas)</option>
+                    </select>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-sm text-gray-500 block mb-2">Copias</label>
+                      <input type="number" defaultValue={1} className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500" />
+                    </div>
+                    <div>
+                      <label className="text-sm text-gray-500 block mb-2">Páginas</label>
+                      <input type="text" defaultValue="Todas" className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500" />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Tamaño de papel</label>
+                    <select className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500">
+                      <option>50mm x 25mm (Etiqueta pequeña)</option>
+                      <option>100mm x 50mm (Etiqueta mediana)</option>
+                      <option>150mm x 100mm (Etiqueta grande)</option>
+                      <option>A4 (Carta)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Orientación</label>
+                    <div className="flex gap-3">
+                      <button className="flex-1 py-3 border-2 border-blue-500 bg-blue-50 rounded-xl font-semibold text-blue-600">Horizontal</button>
+                      <button className="flex-1 py-3 border-2 border-gray-200 rounded-xl font-semibold text-gray-600 hover:border-gray-300">Vertical</button>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Calidad</label>
+                    <select className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500">
+                      <option>Alta (300 DPI)</option>
+                      <option>Media (150 DPI)</option>
+                      <option>Baja (72 DPI)</option>
+                    </select>
+                  </div>
+                </div>
+                
+                <button className="w-full mt-8 bg-gradient-to-r from-green-600 to-green-700 text-white py-4 rounded-xl font-bold text-lg hover:from-green-700 hover:to-green-800 transition shadow-lg flex items-center justify-center gap-3">
+                  <Printer className="w-6 h-6" />
+                  Imprimir ahora
+                </button>
+              </div>
+              
+              <div className="space-y-6">
+                <div className="bg-gradient-to-br from-gray-100 to-gray-200 rounded-2xl border-2 border-dashed border-gray-300 p-12 flex items-center justify-center min-h-[400px]">
+                  <div className="text-center">
+                    <Eye className="w-20 h-20 text-gray-400 mx-auto mb-4" />
+                    <p className="text-gray-500 text-lg font-semibold">Vista previa de impresión</p>
+                    <p className="text-gray-400 text-sm mt-2">La etiqueta aparecerá aquí</p>
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-2xl border border-gray-200 p-6">
+                  <h3 className="font-bold text-lg mb-4">Resumen de impresión</h3>
+                  <div className="space-y-3 text-sm">
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">Impresora:</span>
+                      <span className="font-semibold">Zebra ZD220</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">Copias:</span>
+                      <span className="font-semibold">1</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">Tamaño:</span>
+                      <span className="font-semibold">50mm x 25mm</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">Calidad:</span>
+                      <span className="font-semibold">300 DPI</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'exportar':
+        return (
+          <div className="space-y-8">
+            <div>
+              <h1 className="text-4xl font-bold text-gray-800 mb-2">Exportar Etiqueta</h1>
+              <p className="text-gray-500 text-lg">Selecciona el formato de exportación</p>
+            </div>
+
+            <div className="grid grid-cols-3 gap-6">
+              {[
+                { name: 'PNG', desc: 'Imagen con transparencia', icon: ImageIcon, color: 'from-green-500 to-green-600', quality: 'Alta calidad', size: '~250 KB' },
+                { name: 'JPG', desc: 'Imagen comprimida', icon: ImageIcon, color: 'from-blue-500 to-blue-600', quality: 'Calidad media', size: '~180 KB' },
+                { name: 'PDF', desc: 'Documento imprimible', icon: FileText, color: 'from-red-500 to-red-600', quality: 'Vectorial', size: '~320 KB' },
+                { name: 'SVG', desc: 'Gráfico vectorial', icon: FileText, color: 'from-purple-500 to-purple-600', quality: 'Escalable', size: '~95 KB' },
+                { name: 'TIFF', desc: 'Alta calidad impresión', icon: ImageIcon, color: 'from-orange-500 to-orange-600', quality: 'Profesional', size: '~1.2 MB' },
+                { name: 'CSV', desc: 'Datos de productos', icon: FileSpreadsheet, color: 'from-emerald-500 to-emerald-600', quality: 'Datos', size: '~45 KB' },
+              ].map(format => (
+                <button key={format.name} className="bg-white border-2 border-gray-200 rounded-2xl p-8 hover:shadow-2xl transition text-left group hover:border-green-300">
+                  <div className={`w-20 h-20 bg-gradient-to-br ${format.color} rounded-2xl flex items-center justify-center mb-6 group-hover:scale-110 transition shadow-lg`}>
+                    <format.icon className="w-10 h-10 text-white" />
+                  </div>
+                  <p className="text-2xl font-bold text-gray-800">{format.name}</p>
+                  <p className="text-sm text-gray-500 mt-2">{format.desc}</p>
+                  <div className="mt-4 pt-4 border-t border-gray-100 flex items-center justify-between">
+                    <span className="text-xs text-gray-400">{format.quality}</span>
+                    <span className="text-xs text-gray-400">{format.size}</span>
+                  </div>
+                </button>
+              ))}
+            </div>
+
+            <div className="bg-white rounded-2xl border border-gray-200 p-8">
+              <h2 className="text-2xl font-bold mb-6">Opciones de exportación</h2>
+              <div className="grid grid-cols-2 gap-6">
+                <div>
+                  <label className="text-sm text-gray-500 block mb-2">Resolución</label>
+                  <select className="w-full px-4 py-3 border border-gray-300 rounded-xl">
+                    <option>300 DPI (Alta)</option>
+                    <option>150 DPI (Media)</option>
+                    <option>72 DPI (Baja)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-sm text-gray-500 block mb-2">Calidad</label>
+                  <select className="w-full px-4 py-3 border border-gray-300 rounded-xl">
+                    <option>Máxima (100%)</option>
+                    <option>Alta (90%)</option>
+                    <option>Media (70%)</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'cerrar':
+        return (
+          <div className="space-y-8">
+            <div>
+              <h1 className="text-4xl font-bold text-gray-800 mb-2">Cerrar</h1>
+              <p className="text-gray-500 text-lg">Cerrar archivo actual</p>
+            </div>
+
+            <div className="bg-white rounded-2xl border border-gray-200 p-8 max-w-2xl">
+              <div className="flex items-center gap-4 mb-6">
+                <div className="w-16 h-16 bg-orange-100 rounded-full flex items-center justify-center">
+                  <AlertTriangle className="w-8 h-8 text-orange-600" />
+                </div>
+                <div>
+                  <h2 className="text-2xl font-bold text-gray-800">¿Cerrar archivo?</h2>
+                  <p className="text-gray-500">Asegúrate de guardar los cambios antes de cerrar</p>
+                </div>
+              </div>
+
+              <div className="space-y-4 mb-6">
+                <div className="p-4 bg-yellow-50 border border-yellow-200 rounded-xl flex items-start gap-3">
+                  <AlertCircle className="w-5 h-5 text-yellow-600 flex-shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-sm font-semibold text-yellow-800">Cambios sin guardar</p>
+                    <p className="text-sm text-yellow-600 mt-1">Tienes cambios sin guardar en la etiqueta actual</p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex gap-3">
+                <button className="flex-1 py-3 bg-blue-600 text-white rounded-xl font-semibold hover:bg-blue-700 transition flex items-center justify-center gap-2">
+                  <Save className="w-5 h-5" />
+                  Guardar y cerrar
+                </button>
+                <button className="flex-1 py-3 border-2 border-gray-300 rounded-xl font-semibold hover:bg-gray-50 transition">
+                  Cerrar sin guardar
+                </button>
+                <button className="flex-1 py-3 bg-gray-100 text-gray-700 rounded-xl font-semibold hover:bg-gray-200 transition">
+                  Cancelar
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'cuenta':
+        return (
+          <div className="space-y-8">
+            <div>
+              <h1 className="text-4xl font-bold text-gray-800 mb-2">Mi Cuenta</h1>
+              <p className="text-gray-500 text-lg">Gestiona tu perfil y configuración</p>
+            </div>
+
+            <div className="grid grid-cols-3 gap-6">
+              {/* Perfil de usuario */}
+              <div className="col-span-2 bg-white rounded-2xl border border-gray-200 p-8">
+                <h2 className="text-2xl font-bold mb-6 flex items-center gap-2">
+                  <User className="w-6 h-6 text-blue-600" />
+                  Información del perfil
+                </h2>
+                
+                <div className="flex items-center gap-6 mb-8">
+                  <div className="w-24 h-24 bg-gradient-to-br from-blue-500 to-blue-700 rounded-full flex items-center justify-center text-white text-3xl font-bold">
+                    {userData.name.charAt(0)}
+                  </div>
+                  <div>
+                    <h3 className="text-2xl font-bold text-gray-800">{userData.name}</h3>
+                    <p className="text-gray-500">{userData.role}</p>
+                    <p className="text-sm text-gray-400 mt-1">Miembro desde {userData.memberSince}</p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4 mb-6">
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Nombre completo</label>
+                    <input 
+                      type="text" 
+                      defaultValue={userData.name}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Email</label>
+                    <input 
+                      type="email" 
+                      defaultValue={userData.email}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Empresa</label>
+                    <input 
+                      type="text" 
+                      defaultValue={userData.company}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Teléfono</label>
+                    <input 
+                      type="tel" 
+                      defaultValue={userData.phone}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex gap-3">
+                  <button 
+                    onClick={handleUpdateProfile}
+                    className="flex-1 py-3 bg-blue-600 text-white rounded-xl font-semibold hover:bg-blue-700 transition"
+                  >
+                    Actualizar perfil
+                  </button>
+                  <button 
+                    onClick={handleChangePassword}
+                    className="flex-1 py-3 border-2 border-gray-300 rounded-xl font-semibold hover:bg-gray-50 transition"
+                  >
+                    Cambiar contraseña
+                  </button>
+                </div>
+              </div>
+
+              {/* Estadísticas de uso */}
+              <div className="space-y-6">
+                <div className="bg-white rounded-2xl border border-gray-200 p-6">
+                  <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+                    <Activity className="w-5 h-5 text-green-600" />
+                    Estadísticas
+                  </h3>
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                      <div className="flex items-center gap-3">
+                        <Tag className="w-5 h-5 text-blue-600" />
+                        <span className="text-sm text-gray-600">Etiquetas creadas</span>
+                      </div>
+                      <span className="font-bold text-gray-800">{userData.totalLabels}</span>
+                    </div>
+                    <div className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                      <div className="flex items-center gap-3">
+                        <Printer className="w-5 h-5 text-purple-600" />
+                        <span className="text-sm text-gray-600">Impresiones</span>
+                      </div>
+                      <span className="font-bold text-gray-800">{userData.totalPrints}</span>
+                    </div>
+                    <div className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                      <div className="flex items-center gap-3">
+                        <HardDrive className="w-5 h-5 text-orange-600" />
+                        <span className="text-sm text-gray-600">Almacenamiento</span>
+                      </div>
+                      <span className="font-bold text-gray-800">{userData.storageUsed} / {userData.storageTotal}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-2xl border border-gray-200 p-6">
+                  <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+                    <Clock className="w-5 h-5 text-blue-600" />
+                    Actividad reciente
+                  </h3>
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-3 text-sm">
+                      <div className="w-2 h-2 bg-green-500 rounded-full"></div>
+                      <span className="text-gray-600">Último acceso:</span>
+                      <span className="font-semibold text-gray-800">{userData.lastLogin}</span>
+                    </div>
+                    <div className="flex items-center gap-3 text-sm">
+                      <div className="w-2 h-2 bg-blue-500 rounded-full"></div>
+                      <span className="text-gray-600">Miembro desde:</span>
+                      <span className="font-semibold text-gray-800">{userData.memberSince}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <button 
+                  onClick={handleLogout}
+                  className="w-full py-3 bg-red-600 text-white rounded-xl font-semibold hover:bg-red-700 transition flex items-center justify-center gap-2"
+                >
+                  <LogOut className="w-5 h-5" />
+                  Cerrar sesión
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'opciones':
+        return (
+          <div className="space-y-8">
+            <div>
+              <h1 className="text-4xl font-bold text-gray-800 mb-2">Opciones</h1>
+              <p className="text-gray-500 text-lg">Configuración de la aplicación</p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-6">
+              {/* Apariencia */}
+              <div className="bg-white rounded-2xl border border-gray-200 p-8">
+                <h2 className="text-2xl font-bold mb-6 flex items-center gap-2">
+                  <Palette className="w-6 h-6 text-purple-600" />
+                  Apariencia
+                </h2>
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Tema</label>
+                    <div className="grid grid-cols-3 gap-3">
+                      <button 
+                        onClick={() => setAppSettings({...appSettings, theme: 'light'})}
+                        className={`p-4 border-2 rounded-xl flex flex-col items-center gap-2 transition ${appSettings.theme === 'light' ? 'border-blue-500 bg-blue-50' : 'border-gray-200 hover:border-gray-300'}`}
+                      >
+                        <Sun className="w-6 h-6" />
+                        <span className="text-sm font-semibold">Claro</span>
+                      </button>
+                      <button 
+                        onClick={() => setAppSettings({...appSettings, theme: 'dark'})}
+                        className={`p-4 border-2 rounded-xl flex flex-col items-center gap-2 transition ${appSettings.theme === 'dark' ? 'border-blue-500 bg-blue-50' : 'border-gray-200 hover:border-gray-300'}`}
+                      >
+                        <Moon className="w-6 h-6" />
+                        <span className="text-sm font-semibold">Oscuro</span>
+                      </button>
+                      <button 
+                        onClick={() => setAppSettings({...appSettings, theme: 'system'})}
+                        className={`p-4 border-2 rounded-xl flex flex-col items-center gap-2 transition ${appSettings.theme === 'system' ? 'border-blue-500 bg-blue-50' : 'border-gray-200 hover:border-gray-300'}`}
+                      >
+                        <Monitor className="w-6 h-6" />
+                        <span className="text-sm font-semibold">Sistema</span>
+                      </button>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Idioma</label>
+                    <select 
+                      value={appSettings.language}
+                      onChange={(e) => setAppSettings({...appSettings, language: e.target.value})}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500"
+                    >
+                      <option value="es">Español</option>
+                      <option value="en">English</option>
+                      <option value="pt">Português</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              {/* Impresión */}
+              <div className="bg-white rounded-2xl border border-gray-200 p-8">
+                <h2 className="text-2xl font-bold mb-6 flex items-center gap-2">
+                  <Printer className="w-6 h-6 text-blue-600" />
+                  Impresión
+                </h2>
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Impresora predeterminada</label>
+                    <select 
+                      value={appSettings.defaultPrinter}
+                      onChange={(e) => setAppSettings({...appSettings, defaultPrinter: e.target.value})}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500"
+                    >
+                      <option>Zebra ZD220 (Térmica)</option>
+                      <option>Epson TM-T20 (Térmica)</option>
+                      <option>HP LaserJet (Láser)</option>
+                      <option>Brother QL-800 (Etiquetas)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Tamaño de papel</label>
+                    <select 
+                      value={appSettings.defaultPaperSize}
+                      onChange={(e) => setAppSettings({...appSettings, defaultPaperSize: e.target.value})}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500"
+                    >
+                      <option>50mm x 25mm (Etiqueta pequeña)</option>
+                      <option>100mm x 50mm (Etiqueta mediana)</option>
+                      <option>150mm x 100mm (Etiqueta grande)</option>
+                      <option>A4 (Carta)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Calidad</label>
+                    <select 
+                      value={appSettings.defaultQuality}
+                      onChange={(e) => setAppSettings({...appSettings, defaultQuality: e.target.value})}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500"
+                    >
+                      <option>300 DPI (Alta)</option>
+                      <option>150 DPI (Media)</option>
+                      <option>72 DPI (Baja)</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              {/* Editor */}
+              <div className="bg-white rounded-2xl border border-gray-200 p-8">
+                <h2 className="text-2xl font-bold mb-6 flex items-center gap-2">
+                  <Edit3 className="w-6 h-6 text-green-600" />
+                  Editor
+                </h2>
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="font-semibold text-gray-800">Mostrar cuadrícula</p>
+                      <p className="text-sm text-gray-500">Mostrar líneas de guía</p>
+                    </div>
+                    <button 
+                      onClick={() => setAppSettings({...appSettings, showGrid: !appSettings.showGrid})}
+                      className={`w-12 h-6 rounded-full transition ${appSettings.showGrid ? 'bg-green-600' : 'bg-gray-300'}`}
+                    >
+                      <div className={`w-5 h-5 bg-white rounded-full shadow-md transform transition ${appSettings.showGrid ? 'translate-x-6' : 'translate-x-0.5'}`}></div>
+                    </button>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="font-semibold text-gray-800">Ajustar a cuadrícula</p>
+                      <p className="text-sm text-gray-500">Alinear elementos automáticamente</p>
+                    </div>
+                    <button 
+                      onClick={() => setAppSettings({...appSettings, snapToGrid: !appSettings.snapToGrid})}
+                      className={`w-12 h-6 rounded-full transition ${appSettings.snapToGrid ? 'bg-green-600' : 'bg-gray-300'}`}
+                    >
+                      <div className={`w-5 h-5 bg-white rounded-full shadow-md transform transition ${appSettings.snapToGrid ? 'translate-x-6' : 'translate-x-0.5'}`}></div>
+                    </button>
+                  </div>
+                  <div>
+                    <label className="text-sm text-gray-500 block mb-2">Tamaño de cuadrícula</label>
+                    <input 
+                      type="number"
+                      value={appSettings.gridSize}
+                      onChange={(e) => setAppSettings({...appSettings, gridSize: Number(e.target.value)})}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Guardado automático */}
+              <div className="bg-white rounded-2xl border border-gray-200 p-8">
+                <h2 className="text-2xl font-bold mb-6 flex items-center gap-2">
+                  <Save className="w-6 h-6 text-orange-600" />
+                  Guardado
+                </h2>
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="font-semibold text-gray-800">Guardado automático</p>
+                      <p className="text-sm text-gray-500">Guardar cambios automáticamente</p>
+                    </div>
+                    <button 
+                      onClick={() => setAppSettings({...appSettings, autoSave: !appSettings.autoSave})}
+                      className={`w-12 h-6 rounded-full transition ${appSettings.autoSave ? 'bg-green-600' : 'bg-gray-300'}`}
+                    >
+                      <div className={`w-5 h-5 bg-white rounded-full shadow-md transform transition ${appSettings.autoSave ? 'translate-x-6' : 'translate-x-0.5'}`}></div>
+                    </button>
+                  </div>
+                  {appSettings.autoSave && (
+                    <div>
+                      <label className="text-sm text-gray-500 block mb-2">Intervalo (minutos)</label>
+                      <input 
+                        type="number"
+                        value={appSettings.autoSaveInterval}
+                        onChange={(e) => setAppSettings({...appSettings, autoSaveInterval: Number(e.target.value)})}
+                        className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500"
+                      />
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Botones de acción */}
+            <div className="flex gap-4">
+              <button 
+                onClick={handleSaveSettings}
+                className="flex-1 py-4 bg-green-600 text-white rounded-xl font-bold text-lg hover:bg-green-700 transition flex items-center justify-center gap-2"
+              >
+                <Check className="w-6 h-6" />
+                Guardar configuración
+              </button>
+              <button 
+                onClick={handleResetSettings}
+                className="flex-1 py-4 border-2 border-gray-300 rounded-xl font-bold text-lg hover:bg-gray-50 transition flex items-center justify-center gap-2"
+              >
+                <RotateCcw className="w-6 h-6" />
+                Restaurar predeterminados
+              </button>
+            </div>
+          </div>
+        );
+
+      default:
+        return (
+          <div className="flex items-center justify-center h-96">
+            <div className="text-center">
+              <Settings className="w-20 h-20 text-gray-300 mx-auto mb-4" />
+              <p className="text-gray-500 text-xl font-semibold">Sección en desarrollo</p>
+              <p className="text-gray-400 mt-2">Próximamente disponible</p>
+            </div>
+          </div>
+        );
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-gray-50 z-50 flex">
+      {/* Sidebar izquierdo */}
+      <div className="w-72 bg-gradient-to-b from-gray-900 to-gray-800 border-r border-gray-700 flex flex-col">
+        {/* Botón volver */}
+        <button 
+          onClick={onClose}
+          className="p-5 hover:bg-gray-800 transition flex items-center gap-3 text-gray-300 hover:text-white border-b border-gray-700"
+        >
+          <ChevronLeft className="w-5 h-5" />
+          <span className="text-base font-semibold">Volver</span>
+        </button>
+
+        {/* Items principales */}
+        <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
+          {sidebarItems.map(item => (
+            <button
+              key={item.id}
+              onClick={() => setActiveSection(item.id)}
+              className={`w-full px-4 py-3.5 flex items-center gap-3 rounded-xl transition text-left ${
+                activeSection === item.id 
+                  ? 'bg-green-600 text-white shadow-lg' 
+                  : 'text-gray-300 hover:bg-gray-800 hover:text-white'
+              }`}
+            >
+              <item.icon className="w-5 h-5 flex-shrink-0" />
+              <div className="flex-1">
+                <span className="text-sm font-semibold block">{item.label}</span>
+                <span className={`text-xs block ${activeSection === item.id ? 'text-green-100' : 'text-gray-500'}`}>
+                  {item.description}
+                </span>
+              </div>
+            </button>
+          ))}
+        </nav>
+
+        {/* Items inferiores */}
+        <div className="px-3 pb-4 space-y-1 border-t border-gray-700 pt-4">
+          {bottomItems.map(item => (
+            <button
+              key={item.id}
+              onClick={() => setActiveSection(item.id)}
+              className={`w-full px-4 py-3.5 flex items-center gap-3 rounded-xl transition text-left ${
+                activeSection === item.id 
+                  ? 'bg-green-600 text-white shadow-lg' 
+                  : 'text-gray-300 hover:bg-gray-800 hover:text-white'
+              }`}
+            >
+              <item.icon className="w-5 h-5 flex-shrink-0" />
+              <div className="flex-1">
+                <span className="text-sm font-semibold block">{item.label}</span>
+                <span className={`text-xs block ${activeSection === item.id ? 'text-green-100' : 'text-gray-500'}`}>
+                  {item.description}
+                </span>
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Contenido principal */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-7xl mx-auto p-10">
+          {renderContent()}
+        </div>
+      </div>
+    </div>
+  );
+};

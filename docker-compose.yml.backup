@@ -1,0 +1,42 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: sigc_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sigc_user
+      POSTGRES_PASSWORD: m74MQi6c009
+      POSTGRES_DB: sigc_motos
+    volumes:
+      - sigh_motos_pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sigc_user -d sigc_motos"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    container_name: sigc_app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://sigc_user:m74MQi6c009@db:5432/sigc_motos?schema=public
+      NODE_ENV: production
+      PORT: 3000
+      JWT_SECRET: ${JWT_SECRET}
+      REDIS_URL: redis://${REDIS_IP}:6379
+    ports:
+      - "3001:3000"
+    volumes:
+      - sigh_motos_uploads:/app/uploads
+
+volumes:
+  sigh_motos_pgdata:
+    external: true
+  sigh_motos_uploads:
+    external: true

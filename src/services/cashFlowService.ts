@@ -1,0 +1,328 @@
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+function toNum(v: unknown): number {
+  return parseFloat(String(v ?? 0)) || 0;
+}
+
+function startOfDay(date: Date): Date {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0);
+}
+
+function endOfDay(date: Date): Date {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 59, 999);
+}
+
+function addDays(date: Date, days: number): Date {
+  const d = new Date(date);
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+export interface CashFlowDay {
+  date: string;
+  dayLabel: string;
+  openingBalance: number;
+  expectedInflows: number;
+  expectedOutflows: number;
+  netFlow: number;
+  closingBalance: number;
+  isAlert: boolean;
+}
+
+export interface CashFlowProjection {
+  currentBalance: number;
+  projectionDays: number;
+  days: CashFlowDay[];
+  alertDays: number;
+  lowestBalance: number;
+  lowestBalanceDay: string;
+}
+
+export async function getCashFlowProjection(days = 7): Promise<CashFlowProjection> {
+  const today = new Date();
+
+  const openRegister = await prisma.cash_registers.findFirst({
+    where: { status: 'OPEN' },
+    select: { openingBalance: true },
+    orderBy: { openedAt: 'desc' },
+  });
+
+  const todaySalesAgg = await prisma.sales.aggregate({
+    where: {
+      status: 'COMPLETED',
+      createdAt: { gte: startOfDay(today), lte: endOfDay(today) },
+    },
+    _sum: { totalAmount: true },
+  });
+
+  const todayExpensesAgg = await prisma.financial_transactions.aggregate({
+    where: {
+      type: 'EXPENSE',
+      timestamp: { gte: startOfDay(today), lte: endOfDay(today) },
+    },
+    _sum: { amount: true },
+  });
+
+  const currentBalance = toNum(openRegister?.openingBalance ?? 0) +
+    toNum(todaySalesAgg._sum.totalAmount) -
+    toNum(todayExpensesAgg._sum.amount);
+
+  const upcomingReceivables = await prisma.accounts_receivable.findMany({
+    where: {
+      status: { in: ['PENDING', 'PARTIALLY_PAID', 'OVERDUE'] },
+      dueDate: { gte: startOfDay(today), lte: endOfDay(addDays(today, days)) },
+    },
+    select: { dueDate: true, remainingBalance: true },
+  });
+
+  const upcomingPayables = await prisma.accounts_payable.findMany({
+    where: {
+      status: { in: ['PENDING', 'PARTIALLY_PAID'] },
+      dueDate: { gte: startOfDay(today), lte: endOfDay(addDays(today, days)) },
+    },
+    select: { dueDate: true, remainingBalance: true },
+  });
+
+  const DAY_NAMES = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
+  let runningBalance = currentBalance;
+  let lowestBalance = currentBalance;
+  let lowestDay = today.toISOString().split('T')[0]!;
+  let alertDays = 0;
+  const projection: CashFlowDay[] = [];
+
+  for (let i = 1; i <= days; i++) {
+    const projDate = addDays(today, i);
+    const dateStr = projDate.toISOString().split('T')[0]!;
+    const dayLabel = `${DAY_NAMES[projDate.getDay()]} ${projDate.getDate()}`;
+    const dayStart = startOfDay(projDate);
+    const dayEnd = endOfDay(projDate);
+
+    const dayInflows = upcomingReceivables
+      .filter(r => r.dueDate && r.dueDate >= dayStart && r.dueDate <= dayEnd)
+      .reduce((s, r) => s + toNum(r.remainingBalance), 0);
+    const dayOutflows = upcomingPayables
+      .filter(p => p.dueDate && p.dueDate >= dayStart && p.dueDate <= dayEnd)
+      .reduce((s, p) => s + toNum(p.remainingBalance), 0);
+
+    const opening = runningBalance;
+    const closing = opening + dayInflows - dayOutflows;
+    runningBalance = closing;
+
+    if (closing < lowestBalance) {
+      lowestBalance = closing;
+      lowestDay = dateStr;
+    }
+
+    const isAlert = closing < 0;
+    if (isAlert) alertDays++;
+
+    projection.push({
+      date: dateStr,
+      dayLabel,
+      openingBalance: parseFloat(opening.toFixed(2)),
+      expectedInflows: parseFloat(dayInflows.toFixed(2)),
+      expectedOutflows: parseFloat(dayOutflows.toFixed(2)),
+      netFlow: parseFloat((dayInflows - dayOutflows).toFixed(2)),
+      closingBalance: parseFloat(closing.toFixed(2)),
+      isAlert,
+    });
+  }
+
+  return {
+    currentBalance: parseFloat(currentBalance.toFixed(2)),
+    projectionDays: days,
+    days: projection,
+    alertDays,
+    lowestBalance: parseFloat(lowestBalance.toFixed(2)),
+    lowestBalanceDay: lowestDay,
+  };
+}
+
+export interface OverdueReceivable {
+  id: string;
+  customerName: string;
+  customerPhone: string | null;
+  saleNumber: string;
+  totalDebt: number;
+  remainingBalance: number;
+  dueDate: Date | null;
+  daysOverdue: number;
+  urgency: 'CRITICAL' | 'WARNING' | 'INFO';
+}
+
+export async function getOverdueReceivables(): Promise<{ items: OverdueReceivable[]; totalOverdue: number; count: number; }> {
+  const today = new Date();
+
+  const overdue = await prisma.accounts_receivable.findMany({
+    where: {
+      status: { in: ['OVERDUE', 'PENDING', 'PARTIALLY_PAID'] },
+      OR: [
+        { dueDate: { lt: today } },
+        { dueDate: null, createdAt: { lt: addDays(today, -30) } },
+      ],
+    },
+    include: {
+      customers: { select: { name: true, phone: true } },
+      sales: { select: { saleNumber: true } },
+    },
+    orderBy: { dueDate: 'asc' },
+  });
+
+  let totalOverdue = 0;
+  const items: OverdueReceivable[] = overdue.map(r => {
+    const remaining = toNum(r.remainingBalance);
+    totalOverdue += remaining;
+    const daysOverdue = r.dueDate
+      ? Math.floor((today.getTime() - r.dueDate.getTime()) / 86_400_000)
+      : Math.floor((today.getTime() - (r.createdAt as Date).getTime()) / 86_400_000);
+    return {
+      id: r.id,
+      customerName: r.customers?.name || 'Desconocido',
+      customerPhone: r.customers?.phone || null,
+      saleNumber: r.sales?.saleNumber || '',
+      totalDebt: parseFloat(toNum(r.totalDebt).toFixed(2)),
+      remainingBalance: parseFloat(remaining.toFixed(2)),
+      dueDate: r.dueDate,
+      daysOverdue: Math.max(0, daysOverdue),
+      urgency: daysOverdue > 60 ? 'CRITICAL' : daysOverdue > 30 ? 'WARNING' : 'INFO',
+    };
+  });
+
+  return {
+    items,
+    totalOverdue: parseFloat(totalOverdue.toFixed(2)),
+    count: items.length,
+  };
+}
+
+export interface ExecutiveKPIs {
+  today: {
+    salesToday: number;
+    expensesToday: number;
+    transactionCount: number;
+    avgTicket: number;
+    rotationRatio: number;
+    openingBalance: number;
+    expectedBalance: number;
+  };
+  comparison: {
+    vsYesterday: number;
+    vsLastWeek: number;
+    vsMonthAvg: number;
+  };
+  month: {
+    totalSales: number;
+    totalExpenses: number;
+    transactionCount: number;
+    avgDailySales: number;
+    netProfit: number;
+  };
+  liquidity: {
+    autonomyDays: number;
+    cashRatio: number;
+  };
+}
+
+export async function getExecutiveKPIs(): Promise<ExecutiveKPIs> {
+  const now = new Date();
+  const today = startOfDay(now);
+  const todayEnd = endOfDay(now);
+  const yesterday = startOfDay(addDays(now, -1));
+  const yesterdayEnd = endOfDay(addDays(now, -1));
+  const weekAgo = startOfDay(addDays(now, -7));
+  const weekAgoEnd = endOfDay(addDays(now, -7));
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+  const monthEnd = endOfDay(now);
+
+  const [todaySales, todayExpenses, yesterdaySales, weekAgoSales, monthSales, monthExpenses, openRegister, monthSalesTx] = await Promise.all([
+    prisma.sales.aggregate({
+      where: { status: 'COMPLETED', createdAt: { gte: today, lte: todayEnd } },
+      _sum: { totalAmount: true },
+      _count: { id: true },
+    }),
+    prisma.financial_transactions.aggregate({
+      where: { type: 'EXPENSE', timestamp: { gte: today, lte: todayEnd } },
+      _sum: { amount: true },
+    }),
+    prisma.sales.aggregate({
+      where: { status: 'COMPLETED', createdAt: { gte: yesterday, lte: yesterdayEnd } },
+      _sum: { totalAmount: true },
+    }),
+    prisma.sales.aggregate({
+      where: { status: 'COMPLETED', createdAt: { gte: weekAgo, lte: weekAgoEnd } },
+      _sum: { totalAmount: true },
+    }),
+    prisma.sales.aggregate({
+      where: { status: 'COMPLETED', createdAt: { gte: monthStart, lte: monthEnd } },
+      _sum: { totalAmount: true },
+      _count: { id: true },
+    }),
+    prisma.financial_transactions.aggregate({
+      where: { type: 'EXPENSE', timestamp: { gte: monthStart, lte: monthEnd } },
+      _sum: { amount: true },
+    }),
+    prisma.cash_registers.findFirst({
+      where: { openedAt: { gte: today, lte: todayEnd } },
+      select: { openingBalance: true },
+      orderBy: { openedAt: 'desc' },
+    }),
+    prisma.$queryRaw<Array<{ count: bigint }>>`
+      SELECT COUNT(DISTINCT DATE("createdAt")) as count 
+      FROM "sales" 
+      WHERE "status" = 'COMPLETED' 
+      AND "createdAt" >= ${monthStart}::timestamp 
+      AND "createdAt" <= ${monthEnd}::timestamp
+    `,
+  ]);
+
+  const salesToday = toNum(todaySales._sum.totalAmount);
+  const expensesToday = toNum(todayExpenses._sum.amount);
+  const txCount = todaySales._count.id;
+  const openingBalance = toNum(openRegister?.openingBalance ?? 0);
+  const expectedBalance = openingBalance + salesToday - expensesToday;
+  const avgTicket = txCount > 0 ? salesToday / txCount : 0;
+  const rotationRatio = openingBalance > 0 ? salesToday / openingBalance : 0;
+  const salesYesterday = toNum(yesterdaySales._sum.totalAmount);
+  const salesWeekAgo = toNum(weekAgoSales._sum.totalAmount);
+  const vsYesterday = salesYesterday > 0 ? ((salesToday - salesYesterday) / salesYesterday) * 100 : 0;
+  const vsLastWeek = salesWeekAgo > 0 ? ((salesToday - salesWeekAgo) / salesWeekAgo) * 100 : 0;
+  const totalMonthSales = toNum(monthSales._sum.totalAmount);
+  const totalMonthExpenses = toNum(monthExpenses._sum.amount);
+  const daysWithSales = Number((monthSalesTx as Array<{ count: bigint }>)[0]?.count ?? 1n);
+  const avgDailySales = daysWithSales > 0 ? totalMonthSales / daysWithSales : 0;
+  const vsMonthAvg = avgDailySales > 0 ? ((salesToday - avgDailySales) / avgDailySales) * 100 : 0;
+  const netProfit = totalMonthSales - totalMonthExpenses;
+  const dailyExpAvg = daysWithSales > 0 ? totalMonthExpenses / daysWithSales : 1;
+  const autonomyDays = dailyExpAvg > 0 ? expectedBalance / dailyExpAvg : 999;
+  const cashRatio = totalMonthExpenses > 0 ? expectedBalance / totalMonthExpenses : 0;
+
+  return {
+    today: {
+      salesToday: parseFloat(salesToday.toFixed(2)),
+      expensesToday: parseFloat(expensesToday.toFixed(2)),
+      transactionCount: txCount,
+      avgTicket: parseFloat(avgTicket.toFixed(2)),
+      rotationRatio: parseFloat(rotationRatio.toFixed(2)),
+      openingBalance: parseFloat(openingBalance.toFixed(2)),
+      expectedBalance: parseFloat(expectedBalance.toFixed(2)),
+    },
+    comparison: {
+      vsYesterday: parseFloat(vsYesterday.toFixed(1)),
+      vsLastWeek: parseFloat(vsLastWeek.toFixed(1)),
+      vsMonthAvg: parseFloat(vsMonthAvg.toFixed(1)),
+    },
+    month: {
+      totalSales: parseFloat(totalMonthSales.toFixed(2)),
+      totalExpenses: parseFloat(totalMonthExpenses.toFixed(2)),
+      transactionCount: monthSales._count.id,
+      avgDailySales: parseFloat(avgDailySales.toFixed(2)),
+      netProfit: parseFloat(netProfit.toFixed(2)),
+    },
+    liquidity: {
+      autonomyDays: parseFloat(Math.min(autonomyDays, 999).toFixed(1)),
+      cashRatio: parseFloat(cashRatio.toFixed(2)),
+    },
+  };
+}
+

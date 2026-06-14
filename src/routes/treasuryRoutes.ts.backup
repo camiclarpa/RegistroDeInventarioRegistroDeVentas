@@ -1,0 +1,38 @@
+import { Router } from 'express';
+import { authorize } from '../middleware/authMiddleware';
+import * as treasuryController from '../controllers/treasuryController';
+const router = Router();
+router.post('/open', authorize('finance.write'), treasuryController.openCashRegister);
+router.post('/close', authorize('finance.write'), treasuryController.closeCashRegister);
+router.get('/shift', authorize('finance.read'), treasuryController.getActiveShift);
+router.get('/cash-register/current', authorize('finance.read'), treasuryController.getActiveShift);
+router.get('/cash-register', authorize('finance.read'), treasuryController.getCashRegisters);
+router.post('/cash-register/open', authorize('finance.write'), treasuryController.openCashRegisterAlias);
+router.post('/cash-register/:id/close', authorize('finance.write'), treasuryController.closeCashRegisterAlias);
+router.post('/expenses', authorize('finance.write'), treasuryController.registerExpense);
+router.get('/transactions', authorize('finance.read'), treasuryController.getTransactions);
+router.get('/cash-movements', authorize('finance.read'), treasuryController.getCashMovements);
+router.get('/global-summary', authorize('finance.read'), treasuryController.getGlobalSummary);
+router.get('/summary', authorize('finance.read'), treasuryController.getDailySummary);
+router.get('/daily-report', authorize('finance.read'), treasuryController.getDailyReport);
+router.get('/report', authorize('finance.read', 'users.read'), treasuryController.getDailyReport);
+router.post('/deposits', authorize('finance.write'), treasuryController.createDeposit);
+router.patch('/deposits/:id/status', authorize('finance.write'), treasuryController.updateDepositStatus);
+router.get('/deposits', authorize('finance.read'), treasuryController.getDeposits);
+router.post('/bank-transfers', authorize('finance.write'), treasuryController.createBankTransfer);
+router.get('/bank-transfers', authorize('finance.read'), treasuryController.getBankTransfers);
+router.get('/in-transit', authorize('finance.read'), treasuryController.getInTransitMoney);
+router.get('/daily-liquidity', authorize('finance.read'), treasuryController.getDailyLiquidity);
+router.get('/tax-summary', authorize('finance.read'), treasuryController.getTaxSummary);
+router.post('/withholdings', authorize('finance.write'), treasuryController.registerWithholding);
+router.get('/withholding-calc', authorize('finance.read'), treasuryController.calculateWithholding);
+router.post('/budgets', authorize('finance.write'), treasuryController.setBudget);
+router.get('/budgets', authorize('finance.read'), treasuryController.getBudgetVsActual);
+router.get('/budgets/alert', authorize('finance.read'), treasuryController.checkBudgetAlert);
+router.get('/cash-flow-projection', authorize('finance.read'), treasuryController.getCashFlowProjection);
+router.get('/overdue-receivables', authorize('finance.read'), treasuryController.getOverdueReceivables);
+router.get('/executive-kpis', authorize('finance.read'), treasuryController.getExecutiveKPIs);
+// Conteos de caja
+router.get('/cash-counts', authorize('treasury.read'), treasuryController.getCashCounts);
+
+export default router;

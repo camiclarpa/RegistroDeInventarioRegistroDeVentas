@@ -1,0 +1,324 @@
+// import * as userService from '../services/userService' // NO EXISTE
+/**
+ * securityController.ts — Módulo 7: Seguridad y Gobernanza
+ */
+
+import { Request, Response }   from 'express';
+import { exec }                from 'child_process';
+import { promisify }           from 'util';
+import { promises as fs }      from 'fs';
+import path                    from 'path';
+import { Prisma }              from '@prisma/client';
+import { ZodError, z }         from 'zod';
+import * as authService        from '../services/authService';
+import * as auditService       from '../services/auditService';
+import { prisma }              from '../config/prisma';
+import { hashPassword }        from '../utils/passwordUtils';
+import {
+  changePasswordSchema,
+  auditLogsQuerySchema,
+} from '../utils/validators';
+import { logger }              from '../config/logger';
+
+const execAsync = promisify(exec);
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const ok = (res: Response, data: unknown, status = 200) =>
+  res.status(status).json({ success: true, data });
+
+const fail = (res: Response, error: string, status = 400, details?: unknown) =>
+  res.status(status).json({ success: false, error, ...(details ? { details } : {}) });
+
+function extractParam(param: string | string[] | undefined): string {
+  if (Array.isArray(param)) return param[0] ?? '';
+  return param ?? '';
+}
+
+function handleError(res: Response, err: unknown, context: string): Response {
+  logger.error(`[securityController] ${context}`, { err });
+
+  if (err instanceof ZodError) {
+    return fail(res, 'Datos de entrada inválidos', 422, err.flatten());
+  }
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    if (err.code === 'P2002') return fail(res, 'Registro duplicado', 409);
+    if (err.code === 'P2025') return fail(res, 'Registro no encontrado', 404);
+  }
+  if (err instanceof Error) return fail(res, err.message, 400);
+  return fail(res, 'Error interno del servidor', 500);
+}
+
+// ─── POST /api/v1/security/change-password ────────────────────────────────────
+
+export async function changePassword(req: Request, res: Response): Promise<Response> {
+  try {
+    const data = changePasswordSchema.parse(req.body);
+    const ipAddress = req.ip ?? req.socket.remoteAddress;
+
+    await authService.changePassword(
+      req.user!.id,
+      data.oldPassword,
+      data.newPassword,
+      ipAddress,
+    );
+
+    return ok(res, { message: 'Contraseña actualizada correctamente' });
+  } catch (err) {
+    return handleError(res, err, 'changePassword');
+  }
+}
+
+// ─── PATCH /api/v1/security/users/:id/reactivate ─────────────────────────────
+
+export async function reactivateUser(req: Request, res: Response): Promise<Response> {
+  try {
+    const targetId  = extractParam(req.params['id']);
+    if (!targetId) return fail(res, 'ID de usuario requerido');
+
+    if (targetId === req.user!.id) {
+      return fail(res, 'Tu cuenta ya está activa', 400);
+    }
+
+    const ipAddress = req.ip ?? req.socket.remoteAddress;
+    const user = await authService.reactivateUser(targetId, req.user!.id, ipAddress);
+    return ok(res, { message: 'Usuario reactivado correctamente', user });
+  } catch (err) {
+    return handleError(res, err, 'reactivateUser');
+  }
+}
+
+// ─── GET /api/v1/security/audit-logs ─────────────────────────────────────────
+
+export async function getAuditLogsPaginated(req: Request, res: Response): Promise<Response> {
+  try {
+    const query = auditLogsQuerySchema.parse(req.query);
+
+    const logs = await auditService.getAuditLogsPaginated({
+      cursor:   query.cursor,
+      limit:    query.limit,
+      userId:   query.userId,
+      entity:   query.entity,
+      action:   query.action,
+      from:     query.from ? new Date(query.from) : undefined,
+      to:       query.to   ? new Date(query.to)   : undefined,
+    });
+
+    const nextCursor = logs.length === query.limit
+      ? logs[logs.length - 1]?.id
+      : undefined;
+
+    return ok(res, {
+      logs,
+      pagination: {
+        limit:      query.limit,
+        count:      logs.length,
+        nextCursor: nextCursor ?? null,
+        hasMore:    !!nextCursor,
+      },
+    });
+  } catch (err) {
+    return handleError(res, err, 'getAuditLogsPaginated');
+  }
+}
+
+// ─── POST /api/v1/security/users/:id/reset-password ──────────────────────────
+
+const resetPasswordSchema = z.object({
+  newPassword: z.string().min(8, 'La contraseña debe tener al menos 8 caracteres'),
+});
+
+export async function resetUserPassword(req: Request, res: Response): Promise<Response> {
+  try {
+    const targetId = extractParam(req.params['id']);
+    if (!targetId) return fail(res, 'ID de usuario requerido');
+
+    const { newPassword } = resetPasswordSchema.parse(req.body);
+    const ipAddress = req.ip ?? req.socket.remoteAddress;
+
+    const user = await prisma.users.findUnique({ where: { id: targetId }, select: { id: true, name: true, email: true } });
+    if (!user) return fail(res, 'Usuario no encontrado', 404);
+
+    const hashed = await hashPassword(newPassword);
+    await prisma.users.update({ where: { id: targetId }, data: { password: hashed } });
+
+    void auditService.logAction(req.user!.id, 'RESET_PASSWORD', 'User', targetId, {
+      targetUser: user.email,
+      resetBy: req.user!.id,
+    }, ipAddress);
+
+    return ok(res, { message: `Contraseña de ${user.name} actualizada correctamente` });
+  } catch (err) {
+    return handleError(res, err, 'resetUserPassword');
+  }
+}
+
+// ─── POST /api/v1/security/users — Crear usuario (ADMIN) ─────────────────────
+
+const createUserSchema = z.object({
+  name: z.string().min(2, 'El nombre debe tener al menos 2 caracteres'),
+  email: z.string().email('Email inválido'),
+  password: z.string().min(8, 'La contraseña debe tener al menos 8 caracteres'),
+  roleId: z.string().uuid('ID de rol inválido'),
+  isActive: z.boolean().optional().default(true),
+});
+
+/**
+ * Crea un nuevo usuario. Exclusivo de ADMIN.
+ * Body: { name, email, password, roleId, isActive? }
+ */
+
+// ─── POST /api/v1/security/backup ────────────────────────────────────────────
+
+export async function triggerBackup(req: Request, res: Response): Promise<Response> {
+  try {
+    const result = await createDatabaseBackup(
+      req.user!.id,
+      req.ip ?? req.socket.remoteAddress,
+    );
+    return ok(res, result, 201);
+  } catch (err) {
+    return handleError(res, err, 'triggerBackup');
+  }
+}
+
+// ─── Lógica de backup (interna) ───────────────────────────────────────────────
+
+function sanitizeShellArg(value: string, fieldName: string): string {
+  if (!value || typeof value !== 'string') {
+    throw new Error(`${fieldName} es requerido para el backup`);
+  }
+  if (!/^[a-zA-Z0-9._-]+$/.test(value)) {
+    throw new Error(`${fieldName} contiene caracteres no permitidos en el contexto de backup`);
+  }
+  return value;
+}
+
+async function createDatabaseBackup(userId: string, ipAddress?: string) {
+  const dbUrl = process.env['DATABASE_URL'];
+  if (!dbUrl) {
+    throw new Error('DATABASE_URL no está configurada — imposible ejecutar el backup');
+  }
+
+  let host: string, port: string, dbName: string, pgUser: string, pgPassword: string;
+  try {
+    const url    = new URL(dbUrl);
+    host         = sanitizeShellArg(url.hostname,             'host');
+    port         = sanitizeShellArg(url.port || '5432',       'port');
+    dbName       = sanitizeShellArg(url.pathname.slice(1),    'database');
+    pgUser       = sanitizeShellArg(decodeURIComponent(url.username), 'user');
+    pgPassword   = decodeURIComponent(url.password);
+  } catch (e) {
+    if (e instanceof Error && e.message.includes('no permitidos')) throw e;
+    throw new Error('DATABASE_URL tiene un formato inválido');
+  }
+
+  const backupDir = path.resolve(process.env['BACKUP_DIR'] ?? './backups');
+  await fs.mkdir(backupDir, { recursive: true });
+
+  const timestamp = new Date()
+    .toISOString()
+    .replace(/[:T]/g, '-')
+    .replace(/\..+$/, '');
+  const filename  = `sigcmotos-${timestamp}.sql.gz`;
+  const filepath  = path.join(backupDir, filename);
+
+  const cmd = [
+    'pg_dump',
+    `-h ${host}`,
+    `-p ${port}`,
+    `-U ${pgUser}`,
+    `-d ${dbName}`,
+    `| gzip -9 > "${filepath}"`,
+  ].join(' ');
+
+  logger.info(`[securityController] Iniciando backup → ${filename}`);
+
+  try {
+    await execAsync(cmd, {
+      env:     { ...process.env, PGPASSWORD: pgPassword },
+      timeout: 120_000,
+      shell:   process.platform === 'win32' ? 'cmd.exe' : '/bin/bash',
+    });
+  } catch (execErr) {
+    await fs.rm(filepath, { force: true });
+    throw new Error(
+      `pg_dump falló: ${execErr instanceof Error ? execErr.message : String(execErr)}`,
+    );
+  }
+
+  const stats = await fs.stat(filepath);
+
+  void auditService.logAction(userId, 'BACKUP_CREATED', 'System', null, {
+    filename,
+    filepath,
+    sizeBytes: stats.size,
+  }, ipAddress);
+
+  logger.info(`[securityController] Backup completado: ${filename} (${(stats.size / 1024).toFixed(1)} KB)`);
+
+  return {
+    filename,
+    sizeBytes:  stats.size,
+    sizeKB:     parseFloat((stats.size / 1024).toFixed(1)),
+    filepath:   filepath.replace(/\\/g, '/'),
+    createdAt:  new Date().toISOString(),
+  };
+}
+
+// ─── GET /api/v1/security/users — Listar usuarios (para ADMIN) ───────────────
+
+export async function listUsers(_req: Request, res: Response): Promise<Response> {
+  try {
+    const users = await prisma.users.findMany({
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        roleId: true,
+        isActive: true,
+        createdAt: true,
+        role: {
+          select: {
+            id: true,
+            name: true
+          }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    return res.json({ success: true, data: users });
+  } catch (err) {
+    logger.error('[securityController] listUsers', err);
+    return res.status(500).json({ success: false, error: 'Error al listar usuarios' });
+  }
+}
+
+/**
+ * Crear nuevo usuario (desde módulo de seguridad)
+ */
+
+/**
+ * Crear nuevo usuario (desde módulo de seguridad)
+ * POST /api/v1/security/users
+ */
+export async function createUser(req: Request, res: Response) {
+  try {
+    const { name, email, role, password } = req.body;
+    
+    if (!name || !email || !role || !password) {
+      return res.status(400).json({ success: false, error: 'Todos los campos son requeridos' });
+    }
+    
+    // Reemplazado con Prisma directo
+    const existing = await prisma.users.findUnique({ where: { email } });
+    if (existing) return res.status(409).json({ success: false, error: "Email ya existe" });
+    const hashedPassword = await hashPassword(password);
+    const user = await prisma.users.create({ data: { name, email, password: hashedPassword, roleId: role, isActive: true } as any, select: { id: true, name: true, email: true, roleId: true, isActive: true, createdAt: true } });
+    return res.status(201).json({ success: true, data: user });
+  } catch (err: any) {
+    console.error('[securityController] createUser error:', err);
+    const message = err?.message || 'Error al crear el usuario';
+    return res.status(400).json({ success: false, error: message });
+  }
+}

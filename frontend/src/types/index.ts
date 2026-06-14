@@ -1,0 +1,733 @@
+// ── Auth ──────────────────────────────────────────────────────────────────────
+export type UserRole = 'ADMIN' | 'SELLER' | 'WAREHOUSE'
+
+export interface User {
+  id: string
+  name: string
+  email: string
+  role: UserRole
+  permissions?: string[]
+  isActive: boolean
+  paymentTerms?: string;
+  createdAt: string
+  updatedAt: string
+}
+
+export interface AuthState {
+  user: User | null
+  token: string | null
+}
+
+export interface LoginCredentials {
+  email: string
+  password: string
+}
+
+export interface LoginResponse {
+  token: string
+  refreshToken?: string
+  user: User
+}
+
+// ── Product / Inventory ───────────────────────────────────────────────────────
+export interface Category {
+  id: string
+  name: string
+  description?: string
+  marginPercentage?: number
+}
+
+export interface Brand {
+  id: string
+  name: string
+}
+
+export interface Product {
+  id: string
+  sku: string
+  barcode?: string
+  name: string
+  description?: string
+  categoryId: string
+  category?: Category
+  brandId?: string
+  brand?: Brand
+  costPrice: number
+  salePrice: number
+  taxRate: number
+  stock: number
+  minStock: number
+  binLocation?: string
+  locationBin?: string  // alias for binLocation
+  imageUrl?: string
+  isActive: boolean
+  paymentTerms?: string;
+  createdAt: string
+  updatedAt: string
+}
+
+export type MovementType = 'ENTRY' | 'EXIT' | 'ADJUSTMENT' | 'RETURN'
+
+export interface InventoryMovement {
+  id: string
+  productId: string
+  product?: Product
+  type: MovementType
+  quantity: number
+  previousStock: number
+  newStock: number
+  reason: string
+  createdBy?: string
+  createdAt: string
+}
+
+export interface ProductAuditLog {
+  id: string
+  productId: string
+  userId?: string
+  userName: string
+  userEmail: string
+  fieldName: string
+  oldValue?: string | null
+  newValue?: string | null
+  changeType: string
+  reason?: string | null
+  ipAddress?: string | null
+  createdAt: string
+}
+
+// ── Customer ──────────────────────────────────────────────────────────────────
+export interface Customer {
+  id: string
+  name: string
+  documentType?: string
+  documentNumber?: string
+  identificationNumber?: string
+  phone?: string
+  email?: string
+  address?: string
+  createdAt: string
+}
+
+// ── POS / Sales ───────────────────────────────────────────────────────────────
+export type PaymentMethod = 'CASH' | 'CARD' | 'TRANSFER' | 'MIXED' | 'CREDIT'
+export type SaleStatus = 'COMPLETED' | 'CANCELLED' | 'PENDING'
+
+export interface CartItem {
+  productId: string
+  product: Product
+  quantity: number
+  unitPrice: number
+  discount: number
+  subtotal: number
+}
+
+export interface SaleItem {
+  id?: string
+  productId: string
+  productNameSnapshot?: string
+  skuSnapshot?: string
+  product?: Product
+  quantity: number
+  unitPrice: number | string
+  discountPerItem?: number | string
+  lineTotal?: number | string
+  subtotal?: number
+  taxAmount?: number
+}
+
+export interface Sale {
+  id: string
+  saleNumber: string
+  customerId?: string
+  customer?: Customer
+  customerName?: string
+  customerIdentification?: string
+  items: SaleItem[]
+  subtotal: number | string
+  discountAmount?: number | string
+  taxAmount?: number | string
+  totalAmount?: number | string
+  discountTotal?: number
+  taxTotal?: number
+  total?: number
+  paymentMethod: string
+  status: SaleStatus
+  notes?: string
+  invoiceId?: string
+  cashier?: { id: string; name: string }
+  cashReceived?: number
+  changeAmount?: number
+  createdAt: string
+}
+
+export interface CreateSalePayload {
+  customerId?: string
+  customerName?: string
+  customerIdentification?: string
+  items: { productId: string; quantity: number; unitPrice: number; discountPerItem?: number }[]
+  paymentMethod: PaymentMethod
+  discountAmount?: number
+  notes?: string
+  cashReceived?: number
+  changeAmount?: number
+}
+
+// ── Invoice ───────────────────────────────────────────────────────────────────
+export type InvoiceStatus = 'EMITIDA' | 'ANULADA' | 'ENVIADA_DIAN'
+
+export interface Invoice {
+  id: string
+  invoiceNumber: string
+  saleId?: string
+  sale?: Sale
+  customerId?: string
+  customerName?: string
+  customer?: Customer
+  items: SaleItem[]
+  subtotal: number
+  taxTotal: number
+  total: number
+  status: InvoiceStatus
+  cufe?: string
+  qrData?: string
+  resolution?: string
+  xmlUrl?: string
+  cancelReason?: string
+  issuedAt: string
+  createdAt: string
+}
+
+// ── Purchase / Suppliers ──────────────────────────────────────────────────────
+export interface Supplier {
+  id: string
+  name: string
+  nit?: string
+  contactName?: string
+  phone?: string
+  email?: string
+  address?: string
+  isActive: boolean
+  paymentTerms?: string;
+  createdAt: string
+}
+
+export type PurchaseOrderStatus = 'PENDING' | 'RECEIVED' | 'CANCELLED' | 'PARTIALLY_RECEIVED'
+
+export interface PurchaseOrderItem {
+  productId: string
+  quantityOrdered?: number;
+  lineTotal?: number;
+  product?: Product
+  quantity: number
+  unitCost: number
+  receivedQty?: number
+  subtotal: number
+}
+
+export interface PurchaseOrder {
+  id: string
+  orderNumber: string
+  supplierId: string
+  supplier?: Supplier
+  items: PurchaseOrderItem[]
+  subtotal: number
+  totalAmount: number
+  total: number
+  status: PurchaseOrderStatus
+  expectedDate?: string
+  notes?: string
+  receivedAt?: string
+  createdBy?: string
+  createdAt: string
+}
+
+// ── Treasury / Cash Register ──────────────────────────────────────────────────
+export type CashRegisterStatus = 'OPEN' | 'CLOSED'
+
+export interface CashRegister {
+  id: string
+  openedAt: string
+  closedAt?: string
+  openingBalance: number
+  expectedBalance?: number
+  actualBalance?: number
+  difference?: number
+  status: CashRegisterStatus
+  openedBy?: string
+  closedBy?: string
+  notes?: string
+}
+
+export type TransactionType = 'INCOME' | 'EXPENSE'
+
+export interface TreasuryTransaction {
+  id: string
+  cashRegisterId: string
+  type: TransactionType
+  concept: string
+  amount: number
+  paymentMethod: PaymentMethod
+  receiptUrl?: string
+  createdBy?: string
+  createdAt: string
+}
+
+export interface CashMovement {
+  id: string
+  type: 'INGRESO' | 'EGRESO'
+  concept: string
+  amount: number
+  paymentMethod: string
+  timestamp: string
+  reference: string
+}
+
+export interface DailyTreasurySummary {
+  openingBalance: number
+  totalSales: number
+  totalExpenses: number
+  expectedBalance: number
+}
+
+// ── Reports ───────────────────────────────────────────────────────────────────
+export type AbcClass = 'A' | 'B' | 'C'
+
+export interface AbcProduct {
+  productId: string
+  productName: string
+  sku: string
+  category: string
+  brand: string
+  quantitySold: number
+  totalRevenue: number
+  cumulativePercentage: number
+  abcClass: AbcClass
+  lastSaleDate?: string
+}
+
+export interface AbcSummary {
+  totalProducts: number
+  totalUnitsSold: number
+  classA: number
+  classB: number
+  classC: number
+  period: { startDate: string; endDate: string }
+}
+
+export interface AbcResponse {
+  summary: AbcSummary
+  products: AbcProduct[]
+}
+
+export interface ValuationTopProduct {
+  productId: string
+  productName: string
+  sku: string
+  stockQuantity: number
+  costPriceAvg: number
+  salePriceBase: number
+  costValue: number
+  saleValue: number
+}
+
+export interface ValuationSummary {
+  costValue: number
+  potentialSaleValue: number
+  potentialMargin: number
+  marginPercentage: number
+  totalUnitsInStock: number
+  activeProductsWithStock: number
+}
+
+export interface ValuationCategoryItem {
+  category: string
+  productCount: number
+  totalUnits: number
+  costValue: number
+  saleValue: number
+  avgCost: number
+}
+
+export interface InventoryValuation {
+  summary: ValuationSummary
+  topByValue: ValuationTopProduct[]
+  byCategory: ValuationCategoryItem[]
+}
+
+export interface ProfitabilityGroupItem {
+  name: string
+  totalRevenue: number
+  totalCost: number
+  grossProfit: number
+  profitMarginPercentage: number
+  unitsSold: number
+}
+
+export interface ProfitabilityProductItem {
+  productId: string
+  productName: string
+  sku: string
+  totalRevenue: number
+  totalCost: number
+  grossProfit: number
+  profitMarginPercentage: number
+  unitsSold: number
+}
+
+export interface ProfitabilityData {
+  period: { startDate: string; endDate: string }
+  summary: {
+    totalRevenue: number
+    totalCost: number
+    grossProfit: number
+    profitMarginPercentage: number
+  }
+  byCategory: ProfitabilityGroupItem[]
+  byBrand: ProfitabilityGroupItem[]
+  byProduct: ProfitabilityProductItem[]
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+export interface DashboardKPIs {
+  salesToday: number
+  salesMonth: number
+  salesMonthTotal: number
+  expensesMonth: number
+  lowStockCount: number
+  pendingInvoices: number
+}
+
+export interface SalesTrendPoint {
+  date: string
+  total: number
+  count: number
+}
+
+export interface CategorySaleShare {
+  category: string
+  total: number
+  percentage: number
+}
+
+export interface DashboardData {
+  kpis: DashboardKPIs
+  salesTrend: SalesTrendPoint[]
+  categorySales: CategorySaleShare[]
+  recentSales: Sale[]
+  lowStockProducts: Product[]
+}
+
+// ── Audit / Security ──────────────────────────────────────────────────────────
+export interface AuditLog {
+  id: string
+  userId?: string
+  user?: User
+  action: string
+  resource: string
+  resourceId?: string
+  details?: string
+  ipAddress?: string
+  createdAt: string
+  // Aliases for legacy code compatibility
+  timestamp?: string
+  created_at?: string
+  resourceName?: string
+  target?: string
+  entity?: string
+  resource_type?: string
+  targetId?: string
+  entityId?: string
+  resource_id?: string
+}
+
+// ── Treasury: Banking & Liquidity ─────────────────────────────────────────────
+export type DepositStatus = 'PENDING' | 'IN_TRANSIT' | 'RECONCILED' | 'REJECTED'
+
+export interface BankDeposit {
+  id: string
+  cashRegisterId?: string
+  amount: number
+  bankName: string
+  accountNumber?: string
+  reference?: string
+  depositDate: string
+  notes?: string
+  status: DepositStatus
+  createdByUserId: string
+  createdBy?: { id: string; name: string }
+  approvedBy?: { id: string; name: string }
+  reconciledAt?: string
+  createdAt: string
+}
+
+export interface BankTransfer {
+  id: string
+  fromAccount: string
+  toAccount: string
+  amount: number
+  reference?: string
+  description: string
+  transferDate: string
+  createdBy?: { id: string; name: string }
+  createdAt: string
+}
+
+export interface InTransitItem {
+  saleId: string
+  saleNumber: string
+  amount: number
+  commission: number
+  netAmount: number
+  paymentMethod: string
+  saleDate: string
+  estimatedSettlementDate: string
+}
+
+export interface InTransitMoney {
+  items: InTransitItem[]
+  totalGross: number
+  totalCommission: number
+  totalNet: number
+}
+
+export interface LiquidityBreakdown {
+  paymentMethod: string
+  grossAmount: number
+  commission: number
+  netAmount: number
+  available: boolean
+}
+
+export interface DailyLiquidity {
+  cashOnHand: number
+  inTransitCard: number
+  inTransitTransfer: number
+  depositsToday: number
+  totalCommissions: number
+  availableToday: number
+  expectedTotal: number
+  breakdown: LiquidityBreakdown[]
+}
+
+// ── Treasury: Withholdings & Taxes ────────────────────────────────────────────
+export type WithholdingType = 'RETEFUENTE_35' | 'RETEFUENTE_10' | 'RETEIVA_15' | 'RETEICA_01'
+
+export interface WithholdingCalculation {
+  type: WithholdingType
+  label: string
+  percentage: number
+  baseAmount: number
+  withholdingAmount: number
+  netAmount: number
+}
+
+export interface WithholdingSummaryLine {
+  type: WithholdingType
+  label: string
+  totalWithheld: number
+  count: number
+}
+
+export interface MonthlyTaxSummary {
+  period: { month: number; year: number; label: string }
+  ivaCollected: number
+  ivaDeductible: number
+  ivaNetPayable: number
+  withholdings: WithholdingSummaryLine[]
+  totalWithheldAsAsset: number
+  reteiva: number
+  reteica: number
+  netObligations: number
+}
+
+// ── Treasury: Budget ──────────────────────────────────────────────────────────
+export type ExpenseCategory = 'OPERATIVO' | 'FINANCIERO' | 'IMPUESTO' | 'INVERSION' | 'VARIOS'
+
+export interface BudgetLineItem {
+  category: ExpenseCategory
+  categoryLabel: string
+  budgeted: number
+  actual: number
+  remaining: number
+  executionPct: number
+  isAlert: boolean
+  isOverBudget: boolean
+  projectedEOM: number
+}
+
+export interface BudgetVsActual {
+  period: { month: number; year: number; label: string }
+  lines: BudgetLineItem[]
+  totals: { budgeted: number; actual: number; remaining: number; executionPct: number }
+  alerts: BudgetLineItem[]
+}
+
+// ── Treasury: Cash Flow & KPIs ────────────────────────────────────────────────
+export interface CashFlowDay {
+  date: string
+  dayLabel: string
+  openingBalance: number
+  expectedInflows: number
+  expectedOutflows: number
+  netFlow: number
+  closingBalance: number
+  isAlert: boolean
+}
+
+export interface CashFlowProjection {
+  currentBalance: number
+  projectionDays: number
+  days: CashFlowDay[]
+  alertDays: number
+  lowestBalance: number
+  lowestBalanceDay: string
+}
+
+export interface OverdueReceivable {
+  id: string
+  customerName: string
+  customerPhone: string | null
+  saleNumber: string
+  totalDebt: number
+  remainingBalance: number
+  dueDate: string | null
+  daysOverdue: number
+  urgency: 'CRITICAL' | 'WARNING' | 'INFO'
+}
+
+export interface ExecutiveKPIs {
+  today: {
+    salesToday: number
+    expensesToday: number
+    transactionCount: number
+    avgTicket: number
+    rotationRatio: number
+    openingBalance: number
+    expectedBalance: number
+  }
+  comparison: {
+    vsYesterday: number
+    vsLastWeek: number
+    vsMonthAvg: number
+  }
+  month: {
+    totalSales: number
+    totalExpenses: number
+    transactionCount: number
+    avgDailySales: number
+    netProfit: number
+  }
+  liquidity: {
+    autonomyDays: number
+    cashRatio: number
+  }
+}
+
+// ── Treasury: Cash Count with Denominations ───────────────────────────────────
+export type CashCountType = 'OPENING' | 'CLOSING' | 'SURPRISE' | 'MIDDAY'
+
+export interface DenominationItem {
+  denom: number
+  qty: number
+  subtotal: number
+}
+
+export interface CashCount {
+  id: string
+  cashRegisterId: string
+  type: CashCountType
+  denominations: DenominationItem[]
+  totalCounted: number
+  systemExpected: number
+  difference: number
+  differenceStatus: 'CUADRADO' | 'SOBRANTE' | 'FALTANTE'
+  differencePercent: number
+  requiresApproval: boolean
+  isBlindCount: boolean
+  countedAt: string
+  countedBy: { id: string; name: string }
+  observations?: string
+}
+
+// ── Smart Import / Product Enrichment ─────────────────────────────────────────
+export interface EnrichedProduct {
+  id?: string
+  sku: string
+  skuInternal?: string
+  barcodeExternal?: string
+  name: string
+  description?: string
+  categoryId?: string
+  categoryName?: string
+  brandId?: string
+  brandName?: string
+  costPrice: number
+  salePrice: number
+  taxRate?: number
+  stock?: number
+  minStock?: number
+  imageUrl?: string
+  locationBin?: string
+  isActive?: boolean
+  source: 'manual' | 'import' | 'enrichment'
+  enrichmentScore?: number
+  dataQualityScore?: number
+  validationErrors?: string[]
+  errors?: string[]
+  warnings?: string[]
+  rowIndex?: number
+  inferredFields?: string[]
+  createdAt?: string
+  updatedAt?: string
+}
+
+export interface ValidationReport {
+  total: number
+  valid: number
+  invalid: number
+  validProducts: number
+  productsWithWarnings: number
+  productsWithErrors: number
+  qualityScore: number
+  errors: Array<{ row: number; field: string; message: string; product?: EnrichedProduct }>
+  warnings: Array<{ row: number; field: string; message: string; product?: EnrichedProduct }>
+  enrichedProducts: EnrichedProduct[]
+}
+
+export type RawImportProduct = Record<string, string | number | null>
+
+export interface ImportMappingConfig {
+  sku: string
+  name: string
+  costPrice?: string
+  salePrice?: string
+  stock?: string
+  [key: string]: string | undefined
+}
+
+export interface SmartTranslateResponse {
+  translated: EnrichedProduct[]
+  unmapped: RawImportProduct[]
+}
+
+// ── API Response Wrappers ─────────────────────────────────────────────────────
+export interface PaginatedResponse<T> {
+  data: T[]
+  total: number
+  page: number
+  limit: number
+  totalPages: number
+}
+
+export interface ApiResponse<T> {
+  success: boolean
+  data: T
+  message?: string
+}
+
+export interface ApiError {
+  message: string
+  errors?: Record<string, string[]>
+  statusCode?: number
+}

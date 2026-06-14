@@ -52,9 +52,9 @@ export default function Invoices() {
       setTotal(res.total)
       setTotalPages(res.totalPages)
     } catch { /* handled */ } finally { setLoading(false) }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [statusFilter, startDate, endDate]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => { load() }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { load() }, [statusFilter, startDate, endDate]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleFilter = () => { setPage(1); load(1, statusFilter, startDate, endDate) }
 
@@ -207,7 +207,7 @@ export default function Invoices() {
           )}
         </div>
         {!loading && invoices.length > 0 && (
-          <Pagination page={page} totalPages={totalPages} total={total} limit={LIMIT} onPageChange={(p) => { setPage(p); load(p) }} />
+          <Pagination page={page} totalPages={totalPages} total={total} limit={LIMIT} onPageChange={(p) => { setPage(p); load(p, statusFilter, startDate, endDate) }} />
         )}
       </Card>
 

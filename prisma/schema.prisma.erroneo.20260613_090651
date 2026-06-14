@@ -1,0 +1,339 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum SaleStatus {
+  COMPLETED
+  PENDING
+  CANCELLED
+}
+
+model Product {
+  id              String   @id @default(cuid())
+  skuInternal     String   @unique
+  barcodeExternal String?  @unique
+  nameCommercial  String   // Cambiado de "name" a "nameCommercial"
+  description     String?
+  descriptionTech String?   // NUEVO: para búsquedas técnicas
+  partNumberOEM   String?   // NUEVO: campo que el código espera
+  costPriceAvg    Decimal  @db.Decimal(10, 2) @default(0) // Cambiado de "costPrice"
+  salePriceBase   Decimal  @db.Decimal(10, 2) @default(0) // NUEVO: precio base de venta
+  stockQuantity   Int      @default(0) // Cambiado de "stock" a "stockQuantity"
+  minStockLevel   Int      @default(5) // Cambiado de "minStock"
+  maxStockLevel   Int?
+  locationBin     String?  // NUEVO: ubicación en bodega
+  brandId         String?
+  brand           Brand?   @relation(fields: [brandId], references: [id])
+  categoryId      String?
+  category        Category? @relation(fields: [categoryId], references: [id])
+  taxRate         Float    @default(0) // NUEVO: tasa de impuesto
+  warrantyDays    Int?     @default(0)
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  saleItems       SaleItem[]
+  purchaseItems   PurchaseOrderItem[]
+  inventoryMovements InventoryMovement[]
+  
+  @@map("products")
+}
+
+model Sale {
+  id              String    @id @default(cuid())
+  saleNumber      String    @unique // NUEVO: número de venta/factura
+  invoiceNumber   String?   @unique
+  customerId      String?
+  customer        Customer? @relation(fields: [customerId], references: [id])
+  userId          String?
+  user            User?     @relation(fields: [userId], references: [id])
+  cashRegisterId  String?
+  subtotal        Decimal   @db.Decimal(12, 2) @default(0) // NUEVO
+  discountAmount  Decimal   @db.Decimal(12, 2) @default(0) // NUEVO
+  taxAmount       Decimal   @db.Decimal(12, 2) @default(0)
+  totalAmount     Decimal   @db.Decimal(12, 2) @default(0) // NUEVO: total de la venta
+  paymentMethod   String?
+  status          SaleStatus @default(COMPLETED)
+  notes           String?
+  cashReceived    Decimal?  @db.Decimal(12, 2) // NUEVO: efectivo recibido
+  changeAmount    Decimal?  @db.Decimal(12, 2) // NUEVO: cambio a dar
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  
+  items           SaleItem[]
+  warranties      Warranty[]
+  accountReceivables AccountReceivable[]
+  
+  @@map("sales")
+}
+
+model SaleItem {
+  id              String   @id @default(cuid())
+  saleId          String
+  sale            Sale     @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  productId       String
+  product         Product  @relation(fields: [productId], references: [id])
+  quantity        Int
+  unitPrice       Decimal  @db.Decimal(10, 2)
+  discountPerItem Decimal  @db.Decimal(10, 2) @default(0) // NUEVO
+  lineTotal       Decimal  @db.Decimal(12, 2) // NUEVO: subtotal por línea
+  taxAmount       Decimal  @db.Decimal(12, 2) @default(0)
+  productNameSnapshot String? // NUEVO: snapshot del nombre del producto
+  skuSnapshot     String?  // NUEVO: snapshot del SKU
+  createdAt       DateTime @default(now())
+  
+  @@map("sale_items")
+}
+
+model Brand {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  products    Product[]
+  
+  @@map("brands")
+}
+
+model Category {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  parentId    String?
+  parent      Category? @relation("CategoryToParent", fields: [parentId], references: [id])
+  children    Category[] @relation("CategoryToParent")
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  products    Product[]
+  
+  @@map("categories")
+}
+
+model Customer {
+  id          String   @id @default(cuid())
+  name        String
+  email       String?
+  phone       String?
+  document    String?  @unique
+  address     String?
+  creditLimit Decimal  @db.Decimal(12, 2) @default(0)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  sales       Sale[]
+  accountReceivables AccountReceivable[]
+  
+  @@map("customers")
+}
+
+model User {
+  id          String   @id @default(cuid())
+  email       String   @unique
+  password    String
+  name        String
+  roleId      String?
+  role        Role?    @relation(fields: [roleId], references: [id])
+  isActive    Boolean  @default(true)
+  lastLogin   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  sales       Sale[]
+  
+  @@map("users")
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  users       User[]
+  rolePermissions RolePermission[]
+  
+  @@map("roles")
+}
+
+model Permission {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now())
+  
+  rolePermissions RolePermission[]
+  
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String
+  role         Role       @relation(fields: [roleId], references: [id])
+  permissionId String
+  permission   Permission @relation(fields: [permissionId], references: [id])
+  
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model RefreshToken {
+  id          String   @id @default(cuid())
+  token       String   @unique
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+  
+  @@map("refresh_tokens")
+}
+
+model AccountReceivable {
+  id              String   @id @default(cuid())
+  customerId      String
+  customer        Customer @relation(fields: [customerId], references: [id])
+  saleId          String?
+  sale            Sale?    @relation(fields: [saleId], references: [id])
+  originalAmount  Decimal  @db.Decimal(12, 2)
+  paidAmount      Decimal  @db.Decimal(12, 2) @default(0)
+  remainingBalance Decimal  @db.Decimal(12, 2) // NUEVO: calculado
+  dueDate         DateTime?
+  status          String   @default("PENDING")
+  notes           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  @@map("accounts_receivable")
+}
+
+model InventoryMovement {
+  id              String   @id @default(cuid())
+  productId       String
+  product         Product  @relation(fields: [productId], references: [id])
+  type            String   // INCOME, EXPENSE, ADJUSTMENT
+  quantity        Int
+  previousStock   Int
+  newStock        Int
+  unitCostAtMoment Decimal? @db.Decimal(10, 2) // NUEVO: costo al momento del movimiento
+  referenceId     String?
+  referenceType   String?
+  notes           String?
+  userId          String?
+  createdAt       DateTime @default(now())
+  
+  @@map("inventory_movements")
+}
+
+model PurchaseOrder {
+  id              String   @id @default(cuid())
+  orderNumber     String   @unique
+  supplierId      String
+  supplier        Supplier @relation(fields: [supplierId], references: [id])
+  userId          String?
+  user            User?    @relation(fields: [userId], references: [id])
+  status          String   @default("PENDING")
+  orderDate       DateTime @default(now())
+  expectedDate    DateTime?
+  receivedDate    DateTime?
+  taxAmount       Decimal  @db.Decimal(12, 2) @default(0)
+  totalAmount     Decimal  @db.Decimal(12, 2) @default(0)
+  notes           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  items           PurchaseOrderItem[]
+  
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderItem {
+  id              String   @id @default(cuid())
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  productId       String
+  product         Product  @relation(fields: [productId], references: [id])
+  quantityOrdered Int
+  quantityReceived Int      @default(0)
+  unitCost        Decimal  @db.Decimal(10, 2)
+  lineTotal       Decimal  @db.Decimal(12, 2)
+  createdAt       DateTime @default(now())
+  
+  @@map("purchase_order_items")
+}
+
+model Supplier {
+  id              String   @id @default(cuid())
+  name            String
+  contactPerson   String?
+  phone           String?
+  email           String?
+  address         String?
+  nit             String?  @unique
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  purchaseOrders  PurchaseOrder[]
+  
+  @@map("suppliers")
+}
+
+model Warranty {
+  id              String   @id @default(cuid())
+  saleItemId      String?
+  saleItem        SaleItem? @relation(fields: [saleItemId], references: [id])
+  productId       String
+  product         Product  @relation(fields: [productId], references: [id])
+  customerId      String
+  customer        Customer @relation(fields: [customerId], references: [id])
+  startDate       DateTime @default(now())
+  endDate         DateTime
+  status          String   @default("ACTIVE")
+  description     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  @@map("warranties")
+}
+
+// Modelo faltante para auditoría
+model AuditLog {
+  id              String   @id @default(cuid())
+  userId          String?
+  action          String
+  entity          String
+  entityId        String?
+  oldValues       Json?
+  newValues       Json?
+  ipAddress       String?
+  userAgent       String?
+  createdAt       DateTime @default(now())
+  
+  @@map("audit_logs")
+}
+
+// Modelo para comunicaciones
+model Communication {
+  id              String   @id @default(cuid())
+  customerId      String
+  customer        Customer @relation(fields: [customerId], references: [id])
+  type            String   // EMAIL, SMS, WHATSAPP, CALL
+  direction       String   // INBOUND, OUTBOUND
+  subject         String?
+  content         String?
+  status          String   @default("SENT")
+  sentAt          DateTime @default(now())
+  createdAt       DateTime @default(now())
+  
+  @@map("communications")
+}

@@ -1,0 +1,597 @@
+import crypto from 'crypto';
+import { Request, Response } from 'express';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+import { Prisma } from '@prisma/client';
+
+const ok = (res: Response, data: unknown, status = 200) =>
+  res.status(status).json({ success: true, data });
+
+const fail = (res: Response, error: string, status = 400) =>
+  res.status(status).json({ success: false, error });
+
+const getStr = (v: unknown): string | undefined => {
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v) && typeof v[0] === 'string') return v[0];
+  return undefined;
+};
+
+const getNum = (v: unknown, def = 0): number => {
+  const n = Number(getStr(v));
+  return isNaN(n) ? def : n;
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// PURCHASE ORDERS
+// ═══════════════════════════════════════════════════════════════════════
+
+export async function listPurchaseOrdersHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const page = getNum(req.query.page, 1);
+    const limit = getNum(req.query.limit, 20);
+    const status = getStr(req.query.status);
+    const supplierId = getStr(req.query.supplierId);
+
+    const where: Prisma.PurchaseOrderWhereInput = {};
+    if (status) where.status = status as any;
+    if (supplierId) where.supplierId = supplierId;
+
+    const [data, total] = await prisma.$transaction([
+      prisma.purchaseOrder.findMany({
+        where,
+        include: { 
+          supplier: { select: { id: true, name: true } }, 
+          items: { include: { product: { select: { id: true, nameCommercial: true, skuInternal: true } } } } 
+        },
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      prisma.purchaseOrder.count({ where }),
+    ]);
+
+    return ok(res, { data, total, totalPages: Math.ceil(total / limit) });
+  } catch (err) {
+    logger.error('[purchaseController] listPurchaseOrdersHandler', err);
+    return fail(res, 'Error al obtener órdenes de compra', 500);
+  }
+}
+
+export async function getPurchaseOrderByIdHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const id = getStr(req.params.id);
+    if (!id) return fail(res, 'ID requerido', 400);
+
+    const order = await prisma.purchaseOrder.findUnique({
+      where: { id },
+      include: { supplier: true, items: { include: { product: true } }, accountPayable: true }
+    });
+    if (!order) return fail(res, 'Orden no encontrada', 404);
+    return ok(res, order);
+  } catch (err) {
+    logger.error('[purchaseController] getPurchaseOrderByIdHandler', err);
+    return fail(res, 'Error al obtener orden', 500);
+  }
+}
+
+export async function createPurchaseOrderHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const { supplierId, items, expectedDate, notes } = req.body;
+    const userId = (req.user as any)?.id;
+
+    if (!supplierId || !items?.length) return fail(res, 'Proveedor y al menos un ítem son requeridos', 400);
+
+    const subtotal = items.reduce((s: number, i: any) => s + (Number(i.quantity) * Number(i.unitCost)), 0);
+    const taxAmount = subtotal * 0.19;
+    const totalAmount = subtotal + taxAmount;
+
+    const last = await prisma.purchaseOrder.findFirst({ orderBy: { createdAt: 'desc' } });
+    const num = last ? parseInt(last.orderNumber.split('-').pop() || '0') + 1 : 1;
+    const orderNumber = `OC-${new Date().getFullYear()}-${String(num).padStart(5, '0')}`;
+
+    const order = await prisma.purchaseOrder.create({
+      data: {
+        orderNumber: orderNumber,
+        supplierId: supplierId,
+        userId: userId,
+        status: 'PENDING',
+        subtotal: subtotal,
+        taxAmount: taxAmount,
+        totalAmount: totalAmount,
+        expectedDate: expectedDate ? new Date(expectedDate) : null,
+        notes: notes,
+        items: {
+          create: items.map((i: any) => {
+            const qty = Number(i.quantity);
+            const cost = Number(i.unitCost);
+            return {
+              productId: i.productId,
+              quantityOrdered: qty,
+              quantityReceived: 0,
+              unitCost: cost,
+              lineTotal: qty * cost,
+              productNameSnapshot: i.productName || i.name || (i.product && i.product.nameCommercial) || '',
+              skuSnapshot: i.sku || i.skuInternal || (i.product && i.product.skuInternal) || ''
+            };
+          })
+        }
+      },
+      include: { 
+        supplier: true, 
+        items: { include: { product: true } } 
+      }
+    });
+
+    return ok(res, order, 201);
+  } catch (err) {
+    logger.error('[purchaseController] createPurchaseOrderHandler', err);
+    return fail(res, 'Error al crear orden', 500);
+  }
+}
+
+export async function receivePurchaseOrderHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const id = getStr(req.params.id);
+    let { items } = req.body;
+    
+    if (!id) return fail(res, 'ID de orden requerido', 400);
+
+    const order: any = await prisma.purchaseOrder.findUnique({
+      where: { id: id },
+      include: { items: { include: { product: true } } }
+    });
+    
+    if (!order) return fail(res, 'Orden no encontrada', 404);
+    if (order.status !== 'PENDING') return fail(res, 'Solo órdenes pendientes pueden recibirse', 400);
+
+    // Si no se envían items o está vacío, recibir TODO lo pendiente automáticamente
+    if (!items || items.length === 0) {
+      items = (order.items || []).map((oi: any) => ({
+        purchaseOrderItemId: oi.id,
+        quantityReceived: oi.quantityOrdered - (oi.quantityReceived || 0)
+      }));
+    }
+
+    await prisma.$transaction(async (tx) => {
+      for (const item of items) {
+        const oi = (order.items as any[]).find((x: any) => x.id === item.purchaseOrderItemId);
+        if (oi) {
+          const qtyToReceive = Number(item.quantityReceived || oi.quantityOrdered);
+          
+          // Actualizar stock del producto
+          await tx.product.update({
+            where: { id: oi.productId },
+            data: { stockQuantity: { increment: qtyToReceive } }
+          });
+
+          // Actualizar cantidad recibida en el item de la orden
+          await tx.purchaseOrderItem.update({
+            where: { id: oi.id },
+            data: { quantityReceived: { increment: qtyToReceive } }
+          });
+        }
+      }
+
+      // Verificar si todos los items fueron recibidos completamente
+      const updatedItems = await tx.purchaseOrderItem.findMany({ where: { purchaseOrderId: id } });
+      const allReceived = updatedItems.every((i: any) => i.quantityReceived >= i.quantityOrdered);
+
+      await tx.purchaseOrder.update({
+        where: { id: id },
+        data: { 
+          status: allReceived ? 'RECEIVED' : 'PARTIALLY_RECEIVED',
+          receivedDate: allReceived ? new Date() : undefined
+        }
+      });
+    });
+
+    const updated = await prisma.purchaseOrder.findUnique({
+      where: { id: id },
+      include: { supplier: true, items: { include: { product: true } } }
+    });
+    
+    return ok(res, updated);
+  } catch (err: any) {
+    logger.error('[purchaseController] receivePurchaseOrderHandler', err);
+    return fail(res, err.message || 'Error al recibir orden', 500);
+  }
+}
+
+export async function cancelPurchaseOrderHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const id = getStr(req.params.id);
+    if (!id) return fail(res, 'ID requerido', 400);
+
+    const order = await prisma.purchaseOrder.findUnique({ where: { id: id } });
+    if (!order) return fail(res, 'Orden no encontrada', 404);
+    if (order.status !== 'PENDING') return fail(res, 'Solo órdenes pendientes pueden cancelarse', 400);
+
+    const updated = await prisma.purchaseOrder.update({
+      where: { id: id },
+      data: { status: 'CANCELLED' },
+      include: { supplier: true, items: { include: { product: true } } }
+    });
+    return ok(res, updated);
+  } catch (err) {
+    logger.error('[purchaseController] cancelPurchaseOrderHandler', err);
+    return fail(res, 'Error al cancelar orden', 500);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ENTRIES (Entradas de Almacén)
+// ═══════════════════════════════════════════════════════════════════════
+
+export async function registerEntryHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const purchaseOrderId = getStr(req.body.purchaseOrderId);
+    const { items, notes } = req.body;
+    const entryDateStr = getStr(req.body.entryDate);
+    const userId = (req.user as any)?.id;
+
+    if (!purchaseOrderId || !items?.length) return fail(res, 'Orden y al menos un ítem requeridos', 400);
+
+    const order: any = await prisma.purchaseOrder.findUnique({
+      where: { id: purchaseOrderId },
+      include: { items: { include: { product: true } }, supplier: true }
+    });
+    if (!order) return fail(res, 'Orden no encontrada', 404);
+    if (order.status !== 'RECEIVED') return fail(res, 'Solo órdenes recibidas pueden registrarse como entrada', 400);
+
+    const last = await prisma.inventoryMovement.findFirst({
+      where: { type: 'ENTRY' },
+      orderBy: { timestamp: 'desc' }
+    });
+    const num = last && last.referenceDoc ? parseInt(last.referenceDoc.split('-').pop() || '0') + 1 : 1;
+    const entryNumber = `ENT-${new Date(entryDateStr || Date.now()).getFullYear()}-${String(num).padStart(5, '0')}`;
+
+    const result = await prisma.$transaction(async (tx) => {
+      for (const item of items) {
+        const oi = (order.items as any[]).find((x) => x.id === item.purchaseOrderItemId);
+        if (!oi) continue;
+        
+        const product = oi.product;
+        const qty = Number(item.quantityReceived || oi.quantityOrdered);
+        const cost = Number(item.unitCost || oi.unitCost);
+
+        const currStock = product.stockQuantity;
+        const currWAC = product.costPriceAvg.toNumber();
+        const newWAC = currStock > 0 ? ((currWAC * currStock) + (cost * qty)) / (currStock + qty) : cost;
+
+        await tx.product.update({
+          where: { id: product.id },
+          data: { stockQuantity: { increment: qty }, costPriceAvg: newWAC }
+        });
+
+        await tx.inventoryMovement.create({
+          data: {
+            productId: product.id,
+            type: 'ENTRY',
+            quantity: qty,
+            unitCostAtMoment: cost,
+            referenceDoc: entryNumber,
+            reason: notes || `Entrada desde orden ${order.orderNumber}`,
+            performedByUserId: userId
+          }
+        });
+      }
+      return await tx.purchaseOrder.update({
+        where: { id: purchaseOrderId },
+        data: { notes: notes ? (order.notes || '') + '\n[ENTRADA] ' + notes : order.notes },
+        include: { supplier: true, items: { include: { product: true } } }
+      });
+    });
+
+    logger.info('[purchaseController] Entrada registrada', { entryNumber, purchaseOrderId });
+    return ok(res, { ...result, entryNumber: entryNumber }, 201);
+  } catch (err) {
+    logger.error('[purchaseController] registerEntryHandler', err);
+    return fail(res, err instanceof Error ? err.message : 'Error al registrar entrada', 500);
+  }
+}
+
+export async function getAllEntriesHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const page = getNum(req.query.page, 1);
+    const limit = getNum(req.query.limit, 20);
+    const startDate = getStr(req.query.startDate);
+    const endDate = getStr(req.query.endDate);
+
+    const where: Prisma.InventoryMovementWhereInput = { type: 'ENTRY' };
+    
+    if (startDate || endDate) {
+      where.timestamp = {} as any;
+      if (startDate) (where.timestamp as any).gte = new Date(startDate as string);
+      if (endDate) (where.timestamp as any).lte = new Date(endDate as string);
+    }
+
+    const [movements, total] = await prisma.$transaction([
+      prisma.inventoryMovement.findMany({
+        where: where,
+        orderBy: { timestamp: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit
+      }),
+      prisma.inventoryMovement.count({ where: where })
+    ]);
+
+    const productIds = [...new Set(movements.map((m: any) => m.productId))];
+    const products = productIds.length > 0
+      ? await prisma.product.findMany({
+          where: { id: { in: productIds } },
+          select: { id: true, nameCommercial: true, skuInternal: true, barcodeExternal: true }
+        })
+      : [];
+    const productMap = new Map(products.map(p => [p.id, p]));
+
+    const grouped = movements.reduce((acc: any, m: any) => {
+      const key = m.referenceDoc || 'SIN-REF';
+      if (!acc[key]) acc[key] = {
+        id: key,
+        entryNumber: key,
+        date: m.timestamp,
+        reason: m.reason,
+        totalItems: 0,
+        totalValue: 0,
+        items: []
+      };
+      const cost = m.unitCostAtMoment?.toNumber() || 0;
+      const prod = productMap.get(m.productId);
+      acc[key].totalItems += m.quantity;
+      acc[key].totalValue += cost * m.quantity;
+      acc[key].items.push({ product: prod, quantity: m.quantity, unitCost: cost, totalCost: cost * m.quantity });
+      return acc;
+    }, {});
+
+    const entries = Object.values(grouped);
+    return ok(res, {
+      data: entries.slice((page - 1) * limit, page * limit),
+      total: entries.length,
+      totalPages: Math.ceil(entries.length / limit)
+    });
+  } catch (err) {
+    logger.error('[purchaseController] getAllEntriesHandler', err);
+    return fail(res, 'Error al obtener entradas', 500);
+  }
+}
+
+export async function getEntryByIdHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const entryId = getStr(req.params.id);
+    if (!entryId) return fail(res, 'ID requerido', 400);
+
+    const whereClause: any = { type: 'ENTRY' };
+    if (entryId) whereClause.referenceDoc = { equals: entryId };
+
+    const movements = await prisma.inventoryMovement.findMany({
+      where: whereClause,
+      orderBy: { timestamp: 'asc' }
+    });
+
+    if (!movements.length) return fail(res, 'Entrada no encontrada', 404);
+
+    const productIds = [...new Set(movements.map(m => m.productId))];
+    const products = productIds.length > 0
+      ? await prisma.product.findMany({
+          where: { id: { in: productIds } },
+          select: { id: true, nameCommercial: true, skuInternal: true, barcodeExternal: true, costPriceAvg: true, stockQuantity: true }
+        })
+      : [];
+    const productMap = new Map(products.map(p => [p.id, p]));
+
+    const first = movements[0];
+    const entry = {
+      id: first.referenceDoc,
+      entryNumber: first.referenceDoc,
+      date: first.timestamp,
+      reason: first.reason,
+      totalItems: movements.reduce((s: number, m: any) => s + m.quantity, 0),
+      totalValue: movements.reduce((s: number, m: any) => {
+        const cost = m.unitCostAtMoment?.toNumber() || 0;
+        return s + (cost * m.quantity);
+      }, 0),
+      items: movements.map(m => {
+        const cost = m.unitCostAtMoment?.toNumber() || 0;
+        const prod = productMap.get(m.productId);
+        return {
+          product: prod ? {
+            id: prod.id,
+            name: prod.nameCommercial,
+            sku: prod.skuInternal,
+            barcode: prod.barcodeExternal,
+            currentWAC: prod.costPriceAvg?.toNumber(),
+            currentStock: prod.stockQuantity
+          } : null,
+          quantity: m.quantity,
+          unitCost: cost,
+          totalCost: cost * m.quantity,
+          wacAtEntry: cost
+        };
+      })
+    };
+    return ok(res, entry);
+  } catch (err) {
+    logger.error('[purchaseController] getEntryByIdHandler', err);
+    return fail(res, 'Error al obtener entrada', 500);
+  }
+}
+
+
+/**
+ * GET /api/v1/purchases/orders/:id/pdf
+ * Genera y descarga PDF de orden de compra
+ */
+
+export async function updatePurchaseOrderHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const id = req.params.id as string;
+    const { supplierId, items, expectedDate, notes } = req.body;
+    
+    // Verificar que la orden exista y esté en estado PENDING
+    const existing: any = await prisma.purchaseOrder.findUnique({
+      where: { id },
+      include: { items: true }
+    });
+    
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Orden no encontrada' });
+    }
+    
+    if (existing.status !== 'PENDING') {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Solo se pueden editar órdenes en estado PENDIENTE' 
+      });
+    }
+    
+    // Calcular nuevos totales
+    const newSubtotal = items?.reduce((sum: number, item: any) => 
+      sum + (item.quantityOrdered * item.unitCost), 0) || 0;
+    const newTotal = newSubtotal; // Sin impuestos por ahora
+    
+    // Actualizar orden
+    const updated = await prisma.purchaseOrder.update({
+      where: { id },
+      data: {
+        supplierId: supplierId || existing.supplierId,
+        expectedDate: expectedDate || existing.expectedDate,
+        notes: notes ?? existing.notes,
+        subtotalAmount: newTotal,
+        totalAmount: newTotal,
+        items: {
+          deleteMany: {},
+          create: items?.map((item: any) => ({
+            productId: item.productId,
+            quantity: item.quantityOrdered,
+            unitCost: item.unitCost,
+            subtotal: item.quantityOrdered * item.unitCost
+          })) || []
+        }
+      },
+      include: { items: true, supplier: true }
+    });
+    
+    return res.json({ success: true, data: updated });
+  } catch (err) {
+    logger.error('[purchaseController] updatePurchaseOrderHandler', err);
+    return res.status(500).json({ success: false, message: 'Error al actualizar orden' });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// HANDLER PDF - VERSIÓN LIMPIA Y ROBUSTA
+// ═══════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════
+// HANDLER PDF - VERSIÓN A PRUEBA DE BALAS (BUFFER)
+// ═══════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════
+// HANDLER PDF - VERSIÓN BLINDADA (Inmune a undefined/null)
+// ═══════════════════════════════════════════════════════════════════════
+export async function downloadPurchaseOrderPDFHandler(req: Request, res: Response): Promise<void> {
+  try {
+    const id = req.params.id as string;
+    if (!id) {
+      res.status(400).json({ success: false, message: 'ID requerido' });
+      return;
+    }
+
+    const order = await prisma.purchaseOrder.findUnique({
+      where: { id },
+      include: {
+        items: { include: { product: true } },
+        supplier: true
+      }
+    });
+
+    if (!order) {
+      res.status(404).json({ success: false, message: 'Orden no encontrada' });
+      return;
+    }
+
+    const PDFDocument = require('pdfkit');
+    const doc = new PDFDocument({ margin: 40, size: 'A4' });
+
+    const chunks: Buffer[] = [];
+    doc.on('data', (chunk: Buffer) => chunks.push(chunk));
+
+    const pdfPromise = new Promise<Buffer>((resolve, reject) => {
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', (err: Error) => reject(err));
+    });
+
+    doc.fontSize(18).font('Helvetica-Bold').text('ORDEN DE COMPRA', { align: 'center' });
+    doc.moveDown(0.5);
+    doc.fontSize(10).font('Helvetica').text(`Número: ${order.orderNumber}`, { align: 'center' });
+    doc.text(`Fecha: ${new Date(order.createdAt).toLocaleDateString('es-CO')}`, { align: 'center' });
+    doc.moveDown(1);
+
+    doc.font('Helvetica-Bold').fontSize(12).text('Proveedor:');
+    doc.font('Helvetica').fontSize(10);
+    doc.text(String(order.supplier?.name || 'N/A'));
+    if (order.supplier?.nit) doc.text(`NIT: ${order.supplier.nit}`);
+    if (order.supplier?.phone) doc.text(`Teléfono: ${order.supplier.phone}`);
+    doc.moveDown(1);
+
+    doc.font('Helvetica-Bold').fontSize(10).text('Detalle de Productos:', { underline: true });
+    doc.moveDown(0.5);
+
+    const tableTop = doc.y;
+    doc.font('Helvetica-Bold').fontSize(9);
+    doc.text('Producto', 40, tableTop, { width: 250 });
+    doc.text('Cant.', 300, tableTop, { width: 60 });
+    doc.text('Costo Unit.', 370, tableTop, { width: 90, align: 'right' });
+    doc.text('Subtotal', 470, tableTop, { width: 90, align: 'right' });
+    doc.moveTo(40, tableTop + 15).lineTo(560, tableTop + 15).stroke();
+    doc.moveDown(0.8);
+
+    doc.font('Helvetica').fontSize(9);
+    let rowY = doc.y;
+    
+    // BLINDAJE: Usar for...of y validar cada item explícitamente
+    const items = order.items || [];
+    for (const item of items) {
+      if (!item) continue;
+      
+      // BLINDAJE: String() y Number() previenen errores de undefined.toString()
+      const name = String(item.product?.nameCommercial || 'Producto').substring(0, 40);
+      const qty = Number(item.quantityOrdered ?? 0);
+      const cost = Number(item.unitCost ?? 0);
+      const subtotal = qty * cost;
+
+      doc.text(name, 40, rowY, { width: 250 });
+      doc.text(String(qty), 300, rowY, { width: 60 });
+      doc.text(`$${cost.toLocaleString('es-CO')}`, 370, rowY, { width: 90, align: 'right' });
+      doc.text(`$${subtotal.toLocaleString('es-CO')}`, 470, rowY, { width: 90, align: 'right' });
+      rowY += 15;
+    }
+
+    doc.moveTo(40, rowY + 5).lineTo(560, rowY + 5).stroke();
+    doc.moveDown(1.5);
+
+    doc.font('Helvetica-Bold').fontSize(11);
+    doc.text(`SUBTOTAL: $${Number(order.subtotal || 0).toLocaleString('es-CO')}`, 350, doc.y, { width: 200, align: 'right' });
+    doc.moveDown(0.5);
+    doc.text(`TOTAL: $${Number(order.totalAmount || 0).toLocaleString('es-CO')}`, 350, doc.y, { width: 200, align: 'right' });
+
+    doc.moveDown(2);
+    doc.font('Helvetica').fontSize(8).text('----------------------------------------', { align: 'center' });
+    doc.text('Documento generado automáticamente', { align: 'center' });
+    doc.text(`Generado: ${new Date().toLocaleString('es-CO')}`, { align: 'center' });
+
+    doc.end();
+    const pdfBuffer = await pdfPromise;
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="orden-${order.orderNumber}.pdf"`);
+    res.setHeader('Content-Length', pdfBuffer.length.toString());
+    res.send(pdfBuffer);
+
+  } catch (error: any) {
+    console.error('❌ [PDF Backend] Error crítico:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: 'Error al generar PDF', details: error.message });
+    }
+  }
+}

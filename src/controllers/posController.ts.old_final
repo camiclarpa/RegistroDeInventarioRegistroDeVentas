@@ -1,0 +1,281 @@
+import { Request, Response } from 'express';
+import { Prisma } from '@prisma/client';
+import { ZodError } from 'zod';
+import {
+  createSaleSchema,
+  cancelSaleSchema,
+  listSalesQuerySchema,
+  searchCustomersQuerySchema,
+} from '../utils/validators';
+import {
+  findProductByCode,
+  validateStockAvailability,
+  calculateSaleTotals,
+  processSaleTransaction,
+  getSaleById,
+  getAllSales,
+  cancelSale,
+  searchCustomers,
+  InsufficientStockError,
+} from '../services/posService';
+import { createIncomeFromSale } from '../services/financialTransactionService';
+import { createReceivableFromSale } from '../services/debtService';
+import { logAction } from '../services/auditService';
+import { logger } from '../config/logger';
+
+const ok = (res: Response, data: unknown, status = 200) =>
+  res.status(status).json({ success: true, data });
+
+const fail = (res: Response, error: string, status = 400, details?: unknown) =>
+  res.status(status).json({ success: false, error, ...(details ? { details } : {}) });
+
+function extractParam(param: string | string[] | undefined): string {
+  if (Array.isArray(param)) return param[0] ?? '';
+  return param ?? '';
+}
+
+function handleError(res: Response, err: unknown, context: string) {
+  logger.error(`[PosController] ${context}`, { err });
+
+  if (err instanceof ZodError) {
+    return fail(res, 'Datos de entrada inválidos', 422, err.flatten());
+  }
+
+  if (err instanceof InsufficientStockError) {
+    return fail(res, err.message, 409, {
+      type: 'INSUFFICIENT_STOCK',
+      product: err.productName,
+      available: err.available,
+      requested: err.requested,
+    });
+  }
+
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    if (err.code === 'P2002') return fail(res, 'Ya existe un registro con esos datos', 409);
+    if (err.code === 'P2025') return fail(res, 'Registro no encontrado', 404);
+  }
+
+  if (err instanceof Error) return fail(res, err.message, 400);
+  return fail(res, 'Error interno del servidor', 500);
+}
+
+export async function getProductByBarcode(req: Request, res: Response) {
+  try {
+    const code = extractParam(req.params['code']).trim();
+    const product = await findProductByCode(code);
+    if (!product) return fail(res, `Producto no encontrado para el código "${code}"`, 404);
+
+    const base = Number(product.salePriceBase);
+    const tax = Number(product.taxRate);
+    return ok(res, { ...product, salePriceWithTax: Math.round((base * (1 + tax / 100)) * 100) / 100 });
+  } catch (err) {
+    return handleError(res, err, 'getProductByBarcode');
+  }
+}
+
+export async function createSale(req: Request, res: Response) {
+  try {
+    const input = createSaleSchema.parse(req.body);
+    const userId = req.user?.id ?? 'unknown';
+
+    await validateStockAvailability(input.items.map(i => ({ productId: i.productId, quantity: i.quantity })));
+
+    const sale = await processSaleTransaction(input, userId);
+    const total = Number(sale.total);
+
+    if (input.paymentMethod === 'CREDIT') {
+      if (sale.customerId) {
+        void createReceivableFromSale(sale.id, sale.customerId, total).catch(e =>
+          logger.error('[posController] Error al crear CxC', { err: e, saleId: sale.id })
+        );
+      }
+    } else {
+      void createIncomeFromSale(sale.id, total, input.paymentMethod, userId).catch(e =>
+        logger.error('[posController] Error al registrar ingreso en caja', { err: e, saleId: sale.id })
+      );
+    }
+
+    void logAction(userId, 'POS_SALE_COMPLETED', 'Sale', sale.id, {
+      invoice: sale.id,
+      total,
+      paymentMethod: input.paymentMethod,
+      itemsCount: sale.items?.length || 0,
+      customerId: sale.customerId,
+    }, req.ip);
+
+    const serializeSale = (s: any) => ({
+      id: s.id,
+      saleNumber: s.saleNumber,
+      customerId: s.customerId,
+      customerName: s.customerName,
+      userId: s.userId,
+      subtotal: s.subtotal,
+      discountAmount: s.discountAmount,
+      taxAmount: s.taxAmount,
+      total: s.total,
+      paymentMethod: s.paymentMethod,
+      status: s.status,
+      notes: s.notes,
+      createdAt: s.createdAt,
+      items: s.items?.map((item: any) => ({
+        id: item.id,
+        productId: item.productId,
+        productNameSnapshot: item.productNameSnapshot,
+        skuSnapshot: item.skuSnapshot,
+        quantity: item.quantity,
+        unitPrice: item.unitPrice,
+        discountPerItem: item.discountPerItem,
+        lineTotal: item.lineTotal,
+      })) || [],
+    });
+
+    return ok(res, serializeSale(sale), 201);
+  } catch (err) {
+    return handleError(res, err, 'createSale');
+  }
+}
+
+export async function getSaleByIdHandler(req: Request, res: Response) {
+  try {
+    const id = extractParam(req.params['id']);
+    const sale = await getSaleById(id);
+    if (!sale) return fail(res, 'Venta no encontrada', 404);
+    return ok(res, sale);
+  } catch (err) {
+    return handleError(res, err, 'getSaleById');
+  }
+}
+
+export async function getAllSalesHandler(req: Request, res: Response) {
+  try {
+    const query = listSalesQuerySchema.parse(req.query);
+    const callerId = req.user?.id ?? 'unknown';
+    const isAdmin = (req.user as any)?.permissions?.includes('sales.admin') ?? false;
+    const result = await getAllSales(query, callerId, isAdmin);
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'getAllSales');
+  }
+}
+
+export async function cancelSaleHandler(req: Request, res: Response) {
+  try {
+    const id = extractParam(req.params['id']);
+    const input = cancelSaleSchema.parse(req.body);
+    const userId = req.user?.id ?? 'unknown';
+    const result = await cancelSale(id, input, userId);
+    void logAction(userId, 'POS_SALE_CANCELLED', 'Sale', id, { reason: input.reason, saleId: result.saleId }, req.ip);
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'cancelSale');
+  }
+}
+
+export async function searchCustomersHandler(req: Request, res: Response) {
+  try {
+    const query = searchCustomersQuerySchema.parse(req.query);
+    const result = await searchCustomers(query);
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'searchCustomers');
+  }
+}
+
+export async function previewTotals(req: Request, res: Response) {
+  try {
+    const { items, discountAmount, taxRate } = req.body as {
+      items: Array<{ quantity: number; unitPrice: number; discountPerItem?: number }>;
+      discountAmount?: number;
+      taxRate?: number;
+    };
+    if (!Array.isArray(items) || items.length === 0) return fail(res, 'Se requiere al menos un ítem para calcular totales', 400);
+    const totals = calculateSaleTotals(items, discountAmount, taxRate);
+    return ok(res, totals);
+  } catch (err) {
+    return handleError(res, err, 'previewTotals');
+  }
+}
+
+function extractId(param: string | string[]): string {
+  return Array.isArray(param) ? param[0] : param;
+}
+
+export async function downloadInvoicePdf(req: Request, res: Response) {
+  try {
+    const saleId = extractId(req.params['id']);
+    const sale = await getSaleById(saleId);
+    if (!sale) return fail(res, 'Venta no encontrada', 404);
+
+    const items = sale.items || [];
+    const customer = sale.customers;
+
+    const html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Factura ${sale.saleNumber}</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 20px; font-size: 12px; }
+    .header { text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; margin-bottom: 20px; }
+    .company { font-size: 18px; font-weight: bold; }
+    .invoice-info { display: flex; justify-content: space-between; margin: 20px 0; }
+    table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background: #f5f5f5; }
+    .totals { text-align: right; margin-top: 20px; }
+    .totals div { margin: 5px 0; }
+    .total { font-weight: bold; font-size: 14px; }
+    .footer { margin-top: 40px; text-align: center; font-size: 10px; color: #666; }
+
+  </div>
+
+  <div class="invoice-info">
+    <div>
+      <strong>Cliente:</strong><br>
+      ${customer?.nameCommercial || 'Público General'}<br>
+      ${customer?.identificationNumber ? 'Doc: ' + customer.identificationNumber + '<br>' : ''}
+      ${customer?.phone ? 'Tel: ' + customer.phone : ''}
+    </div>
+    <div style="text-align: right;">
+      <strong>Método de Pago:</strong><br>
+      ${sale.paymentMethod}<br><br>
+      <strong>Estado:</strong><br>
+      ${sale.status}
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>Producto</th><th style="text-align: center;">Cant.</th><th style="text-align: right;">Precio Unit.</th><th style="text-align: right;">Desc.</th><th style="text-align: right;">Subtotal</th></tr>
+    </thead>
+    <tbody>
+      {(items && items.length) ? items.map((item: any) => `
+      <tr>
+        <td>${item.productNameSnapshot || 'Producto'}</td>
+        <td style="text-align: center;">${item.quantity}</td>
+        <td style="text-align: right;">$${Number(item.unitPrice).toLocaleString('es-CO')}</td>
+        <td style="text-align: right;">$${Number(item.discountPerItem || 0).toLocaleString('es-CO')}</td>
+        <td style="text-align: right;">$${Number((item.unitPrice * item.quantity) - (item.discountPerItem || 0)).toLocaleString('es-CO')}</td>
+      </tr>
+      `).join('') : <tr><td colspan="5" style="text-align: center;">No hay productos</td></tr>}
+    </tbody>
+  </table>
+
+  <div class="totals">
+    <div>Subtotal: $${Number(sale.subtotal).toLocaleString('es-CO')}</div>
+    <div>Descuento: -$${Number(sale.discountAmount || 0).toLocaleString('es-CO')}</div>
+    <div>Impuestos (19%): $${Number(sale.taxAmount || 0).toLocaleString('es-CO')}</div>
+    <div class="total">TOTAL: $${Number(sale.totalAmount).toLocaleString('es-CO')}</div>
+  </div>
+
+    res.setHeader('Content-Type', 'text/html');
+    res.setHeader('Content-Disposition', `attachment; filename="Factura-${sale.saleNumber}.html"`);
+    res.send(html);
+    logger.info(`Invoice HTML requested for sale ${sale.id}`);
+  } catch (error: any) {
+    logger.error('[posController] downloadInvoicePdf', { err: error, saleId: req.params.id });
+    return fail(res, 'Error al generar factura: ' + error.message, 500);
+  }
+}
+

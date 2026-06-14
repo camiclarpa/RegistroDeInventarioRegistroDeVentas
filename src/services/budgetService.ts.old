@@ -1,0 +1,90 @@
+/**
+ * budgetService.ts — Pilar 5: Control de Gastos y Presupuestos
+ */
+import { ExpenseCategory } from '@prisma/client';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+function toNum(v: unknown): number { return parseFloat(String(v ?? 0)) || 0; }
+
+const CATEGORY_LABELS: Record<string, string> = {
+  [ExpenseCategory.OPERATIVO]: 'Gastos Operativos',
+  [ExpenseCategory.FINANCIERO]: 'Comisiones Bancarias / Financieros',
+  [ExpenseCategory.IMPUESTO]: 'Impuestos y Retenciones',
+  [ExpenseCategory.INVERSION]: 'Inversiones / Activos Fijos',
+  [ExpenseCategory.VARIOS]: 'Varios / Otros',
+};
+
+export interface BudgetInput { category: string; month: number; year: number; amount: number; }
+export interface BudgetLineItem { category: string; categoryLabel: string; budgeted: number; actual: number; remaining: number; executionPct: number; isAlert: boolean; isOverBudget: boolean; projectedEOM: number; }
+export interface BudgetVsActual { period: { month: number; year: number; label: string }; lines: BudgetLineItem[]; totals: { budgeted: number; actual: number; remaining: number; executionPct: number }; alerts: BudgetLineItem[]; }
+
+export async function setBudget(userId: string, input: BudgetInput): Promise<object> {
+  const existing = await prisma.budgets.findUnique({ where: { category_month_year: { category: input.category, month: input.month, year: input.year } } });
+  const budget = existing
+    ? await prisma.budgets.update({ where: { id: existing.id }, data: { amount: input.amount } })
+    : await prisma.budgets.create({ data: { category: input.category, month: input.month, year: input.year, amount: input.amount, createdByUserId: userId } });
+  logger.info(`[budgetService] Presupuesto ${CATEGORY_LABELS[input.category]} ${input.month}/${input.year}: $${input.amount}`);
+  return budget;
+}
+
+export async function getBudgetVsActual(month: number, year: number): Promise<BudgetVsActual> {
+  const monthStart = new Date(year, month - 1, 1, 0, 0, 0, 0);
+  const monthEnd = new Date(year, month, 0, 23, 59, 59, 999);
+  const today = new Date();
+  const MONTH_NAMES = ['', 'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const dayOfMonth = today.getMonth() + 1 === month && today.getFullYear() === year ? today.getDate() : daysInMonth;
+  const daysElapsed = Math.max(1, dayOfMonth);
+
+  const budgets = await prisma.budgets.findMany({ where: { month, year } });
+  const rawExpenses = await prisma.financial_transactions.findMany({
+    where: { type: { in: ['EXPENSE'] }, expenseCategory: { not: null }, timestamp: { gte: monthStart, lte: monthEnd } },
+    select: { expenseCategory: true, amount: true },
+  });
+
+  const actualMap = new Map<string, number>();
+  for (const exp of rawExpenses) { if (exp.expenseCategory) { const prev = actualMap.get(exp.expenseCategory) ?? 0; actualMap.set(exp.expenseCategory, prev + toNum(exp.amount)); } }
+
+  const categories = new Set<ExpenseCategory>([...budgets.map(b => b.category), ...Array.from(actualMap.keys()) as ExpenseCategory[]]);
+  const budgetMap = new Map<string, number>();
+  for (const b of budgets) { budgetMap.set(b.category, toNum(b.amount)); }
+
+  const lines: BudgetLineItem[] = [];
+  for (const cat of categories) {
+    const budgeted = budgetMap.get(cat) ?? 0;
+    const actual = actualMap.get(cat) ?? 0;
+    const remaining = budgeted - actual;
+    const execPct = budgeted > 0 ? (actual / budgeted) * 100 : actual > 0 ? 100 : 0;
+    const dailyRate = daysElapsed > 0 ? actual / daysElapsed : 0;
+    const projectedEOM = parseFloat((dailyRate * daysInMonth));
+    lines.push({ category: cat, categoryLabel: CATEGORY_LABELS[cat] ?? cat, budgeted: parseFloat(budgeted), actual: parseFloat(actual), remaining: parseFloat(remaining), executionPct: parseFloat(execPct.toFixed(1)), isAlert: execPct >= 80 && execPct < 100, isOverBudget: execPct >= 100, projectedEOM });
+  }
+  lines.sort((a, b) => b.executionPct - a.executionPct);
+
+  const totalBudgeted = lines.reduce((s, l) => s + l.budgeted, 0);
+  const totalActual = lines.reduce((s, l) => s + l.actual, 0);
+  const totalRemaining = totalBudgeted - totalActual;
+  const totalExecPct = totalBudgeted > 0 ? (totalActual / totalBudgeted) * 100 : 0;
+  const alerts = lines.filter(l => l.isAlert || l.isOverBudget);
+
+  logger.info(`[budgetService] BudgetVsActual ${MONTH_NAMES[month]}/${year}: ejecución=${totalExecPct.toFixed(1)}%`);
+  return { period: { month, year, label: `${MONTH_NAMES[month]} ${year}` }, lines, totals: { budgeted: parseFloat(totalBudgeted), actual: parseFloat(totalActual), remaining: parseFloat(totalRemaining), executionPct: parseFloat(totalExecPct.toFixed(1)) }, alerts };
+}
+
+export interface BudgetAlert { category: string; categoryLabel: string; budgeted: number; actual: number; executionPct: number; alertLevel: 'WARNING' | 'CRITICAL' | 'OK'; }
+
+export async function checkBudgetAlert(category: string, month: number, year: number): Promise<BudgetAlert> {
+  const monthStart = new Date(year, month - 1, 1, 0, 0, 0, 0);
+  const monthEnd = new Date(year, month, 0, 23, 59, 59, 999);
+  const [budget, actualAgg] = await Promise.all([
+    prisma.budgets.findUnique({ where: { category_month_year: { category, month, year } } }),
+    prisma.financial_transactions.aggregate({ where: { type: { in: ['EXPENSE'] }, expenseCategory: category, timestamp: { gte: monthStart, lte: monthEnd } }, _sum: { amount: true } }),
+  ]);
+  const budgeted = toNum(budget?.amount ?? 0);
+  const actual = toNum(actualAgg._sum.amount);
+  const executionPct = budgeted > 0 ? (actual / budgeted) * 100 : 0;
+  const alertLevel: 'WARNING' | 'CRITICAL' | 'OK' = executionPct >= 100 ? 'CRITICAL' : executionPct >= 80 ? 'WARNING' : 'OK';
+  if (alertLevel !== 'OK') { logger.warn(`[budgetService] ALERTA ${alertLevel} — ${CATEGORY_LABELS[category]}: ${executionPct.toFixed(1)}%`); }
+  return { category, categoryLabel: CATEGORY_LABELS[category] ?? category, budgeted: parseFloat(budgeted), actual: parseFloat(actual), executionPct: parseFloat(executionPct.toFixed(1)), alertLevel };
+}

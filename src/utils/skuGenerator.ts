@@ -1,0 +1,99 @@
+import { PrismaClient } from '@prisma/client';
+import { redis } from '../config/redis';
+import { logger } from '../config/logger';
+
+export async function generateSKU(brandId: string, categoryId: string, prisma: PrismaClient): Promise<string> {
+  const lockKey = `sku:lock:${brandId}:${categoryId}`;
+  const sequenceKey = `sku:seq:${brandId}:${categoryId}`;
+  const maxRetries = 3;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // Adquirir lock distribuido (NX=only if not exists, EX=expire in 5s)
+      const lockAcquired = await redis.set(lockKey, `${Date.now()}:${brandId}`, { NX: true, EX: 5 });
+      if (!lockAcquired) {
+        await new Promise(r => setTimeout(r, 50 * attempt));
+        continue;
+      }
+
+      try {
+        const sequence = await redis.incr(sequenceKey);
+        const [category, brand] = await Promise.all([
+          prisma.categories.findUnique({ where: { id: categoryId }, select: { codePrefix: true, name: true } }),
+          prisma.brands.findUnique({ where: { id: brandId }, select: { name: true } }),
+        ]);
+        
+        const catPrefix = (category?.codePrefix || category?.name?.substring(0, 3) || 'CAT').toString().toUpperCase().replace(/[^A-Z0-9]/g, '').substring(0, 3).padEnd(3, 'X');
+        const brandPrefix = (brand?.name || 'GEN').toString().toUpperCase().replace(/[^A-Z0-9]/g, '').substring(0, 3).padEnd(3, 'X');
+        const candidateSKU = `${brandPrefix}-${catPrefix}-${String(sequence).padStart(4, '0')}`.substring(0, 20);
+        
+        // Doble-check: verificar unicidad en BD
+        const exists = await prisma.products.findUnique({ where: { skuInternal: candidateSKU }, select: { id: true } });
+        if (exists) { await redis.incr(sequenceKey); continue; }
+        
+        logger.info('[generateSKU] Generado', { sku: candidateSKU, brandId, categoryId });
+        return candidateSKU;
+        
+      } finally {
+        // Liberar lock solo si somos dueños
+        const lockValue = await redis.get(lockKey);
+        if (typeof lockValue === 'string' && lockValue.includes(brandId)) await redis.del(lockKey);
+      }
+    } catch (error) {
+      logger.error('[generateSKU] Error', { error: error instanceof Error ? error.message : String(error), attempt });
+      if (attempt === maxRetries) throw new Error('No se pudo generar SKU único');
+      await new Promise(r => setTimeout(r, 100 * attempt));
+    }
+  }
+  throw new Error('No se pudo generar SKU único');
+}
+
+export async function generateUniqueBarcode(existingBarcode?: string): Promise<string> {
+  if (existingBarcode?.trim()) return existingBarcode.trim();
+  let ean = Array.from({length: 12}, () => Math.floor(Math.random() * 10)).join('');
+  let sum = ean.split('').reduce((s, d, i) => s + parseInt(d) * (i % 2 === 0 ? 1 : 3), 0);
+  return ean + ((10 - (sum % 10)) % 10);
+}
+
+/**
+ * Genera un SKU alfanumérico aleatorio único
+ * Formato: 12 caracteres (letras mayúsculas + números)
+ * Ejemplo: A7K9M2P4X1Q8
+ */
+export async function generateRandomSKU(prisma: PrismaClient): Promise<string> {
+  const maxAttempts = 10;
+  
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      // Generar SKU aleatorio de 12 caracteres
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+      let sku = '';
+      for (let i = 0; i < 12; i++) {
+        sku += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+      
+      // Verificar unicidad en BD
+      const exists = await prisma.products.findUnique({ 
+        where: { skuInternal: sku }, 
+        select: { id: true } 
+      });
+      
+      if (!exists) {
+        logger.info('[generateRandomSKU] Generado', { sku, attempt });
+        return sku;
+      }
+      
+      logger.debug('[generateRandomSKU] SKU duplicado, reintentando', { sku, attempt });
+    } catch (error) {
+      logger.error('[generateRandomSKU] Error', { 
+        error: error instanceof Error ? error.message : String(error), 
+        attempt 
+      });
+      if (attempt === maxAttempts) {
+        throw new Error('No se pudo generar SKU único después de múltiples intentos');
+      }
+    }
+  }
+  
+  throw new Error('No se pudo generar SKU único');
+}

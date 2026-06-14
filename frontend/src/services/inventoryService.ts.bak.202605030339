@@ -1,0 +1,141 @@
+import { api } from './api'
+
+export interface Category {
+  id: string
+  name: string
+  codePrefix: string
+  isActive: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export interface Brand {
+  id: string
+  name: string
+  logoUrl?: string
+  isActive: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ProductInput {
+  name: string
+  sku?: string
+  barcode?: string
+  description?: string
+  category?: string
+  brand?: string
+  brandId?: string
+  costPrice: number
+  salePrice: number
+  taxRate?: number
+  stock: number
+  minStock?: number
+  binLocation?: string
+  isActive?: boolean
+}
+
+export interface Product {
+  id: string
+  name: string
+  sku: string
+  barcode?: string
+  description?: string
+  category?: { id: string; name: string }
+  brand?: { id: string; name: string }
+  costPrice: number
+  salePrice: number
+  taxRate: number
+  stock: number
+  minStock: number
+  binLocation?: string
+  isActive: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export const inventoryService = {
+  getCategories: async (): Promise<Category[]> => {
+    const { data } = await api.get('/inventory/categories')
+    if (Array.isArray(data)) return data
+    const inner = data?.data ?? data
+    if (Array.isArray(inner)) return inner
+    return Array.isArray(inner?.data) ? inner.data : []
+  },
+
+  getAllCategories: async (): Promise<Category[]> => {
+    return inventoryService.getCategories()
+  },
+
+  // CORREGIDO: Se agregó 'payload' como nombre del argumento
+  createFullCategory: async (payload: { name: string; codePrefix: string }): Promise<Category> => {
+    const { data } = await api.post('/inventory/categories', payload)
+    return data.data ?? data
+  },
+
+  updateCategory: async (id: string, payload: Partial<Category>): Promise<Category> => {
+    const { data } = await api.put(`/inventory/categories/${id}`, payload)
+    return data.data ?? data
+  },
+
+  deleteCategory: async (id: string): Promise<void> => {
+    await api.delete(`/inventory/categories/${id}`)
+  },
+
+  getBrands: async (): Promise<Brand[]> => {
+    const { data } = await api.get('/inventory/brands')
+    if (Array.isArray(data)) return data
+    const inner = data?.data ?? data
+    if (Array.isArray(inner)) return inner
+    return Array.isArray(inner?.data) ? inner.data : []
+  },
+
+  // CORREGIDO: Se agregó 'payload' como nombre del argumento
+  createBrand: async (payload: { name: string; logoUrl?: string }): Promise<Brand> => {
+    const { data } = await api.post('/inventory/brands', payload)
+    return data.data ?? data
+  },
+
+  updateBrand: async (id: string, payload: Partial<Brand>): Promise<Brand> => {
+    const { data } = await api.put(`/inventory/brands/${id}`, payload)
+    return data.data ?? data
+  },
+
+  deleteBrand: async (id: string): Promise<void> => {
+    await api.delete(`/inventory/brands/${id}`)
+  },
+
+  createProduct: async (payload: ProductInput & { categoryId: string; brandId?: string }) => {
+    const { data } = await api.post('/inventory/products', payload)
+    return data.data ?? data
+  },
+
+  updateProduct: async (id: string, payload: Partial<ProductInput> & { categoryId?: string; brandId?: string }) => {
+    const { data } = await api.put(`/inventory/products/${id}`, payload)
+    return data.data ?? data
+  },
+
+  getProducts: async (params?: { search?: string; category?: string; categoryId?: string; lowStock?: boolean; page?: number; limit?: number }) => {
+    const { data } = await api.get('/inventory/products', { params })
+    return data
+  },
+
+  // CORREGIDO: Se agregó 'stockData' como nombre del argumento
+  adjustStock: async (id: string, stockData: { quantity: number; reason: string }): Promise<Product> => {
+    const { data } = await api.post(`/inventory/products/${id}/adjust-stock`, stockData)
+    return data.data ?? data
+  },
+
+  deleteProduct: async (id: string): Promise<void> => {
+    await api.delete(`/inventory/products/${id}`)
+  },
+
+  importFromExcel: async (file: File): Promise<{ success: boolean; count: number; imported?: number; errors?: any[] }> => {
+    const formData = new FormData()
+    formData.append('file', file)
+    const { data } = await api.post('/inventory/import', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    })
+    return data
+  },
+}

@@ -1,0 +1,86 @@
+import { Router } from 'express';
+import { authenticate } from '../middleware/authMiddleware';
+import { prisma } from '../config/prisma';
+
+const router = Router();
+
+// Middleware básico de autenticación
+router.use(authenticate);
+
+// ─── Salud del sistema ───────────────────────────────────────────────────
+router.get('/health', async (req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ 
+      success: true, 
+      data: { 
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        database: 'connected'
+      } 
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Database connection failed' });
+  }
+});
+
+// ─── Respaldos ───────────────────────────────────────────────────────────
+router.post('/backups', async (req, res) => {
+  res.json({ success: true, data: { message: 'Backup triggered (stub)', id: 'stub-' + Date.now() } });
+});
+
+router.get('/backups', async (req, res) => {
+  res.json({ success: true, data: [] });
+});
+
+router.get('/backups/:id', async (req, res) => {
+  res.json({ success: true, data: { id: req.params.id, status: 'completed', size: '0 MB' } });
+});
+
+router.post('/backups/:id/restore', async (req, res) => {
+  res.json({ success: true, data: { message: 'Restore prepared (stub)' } });
+});
+
+// ─── Auditoría ───────────────────────────────────────────────────────────
+router.get('/audit', async (req, res) => {
+  try {
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 20;
+    const skip = (page - 1) * limit;
+
+    const [logs, total] = await Promise.all([
+      prisma.systemAudit.findMany({
+        skip, take: limit, orderBy: { createdAt: 'desc' }
+      }),
+      prisma.systemAudit.count()
+    ]);
+
+    res.json({ 
+      success: true, 
+      data: logs,
+      meta: { total, page, limit, totalPages: Math.ceil(total / limit) }
+    });
+  } catch (error) {
+    // Fallback si la tabla no existe aún
+    res.json({ success: true, data: [], meta: { total: 0, page: 1, limit: 20 } });
+  }
+});
+
+// ─── Notificaciones ──────────────────────────────────────────────────────
+router.get('/notifications', async (req, res) => {
+  try {
+    res.json({ success: true, data: [] });
+  } catch (error) {
+    res.json({ success: true, data: [] });
+  }
+});
+
+router.patch('/notifications/read', async (req, res) => {
+  try {
+    res.json({ success: true, data: { updated: 0 } });
+  } catch (error) {
+    res.json({ success: true, data: { updated: 0 } });
+  }
+});
+
+export default router;

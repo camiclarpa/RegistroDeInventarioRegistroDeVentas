@@ -1,0 +1,242 @@
+"""
+Multi-Agent Orchestrator para SIGC-Motos
+Usa Groq API (GRATIS) + LangGraph
+"""
+import os
+from typing import TypedDict, Annotated, List
+from groq import Groq
+from langgraph.graph import StateGraph, END
+
+class AgentState(TypedDict):
+    """Estado de la conversación"""
+    messages: List[str]
+    current_agent: str
+    context: dict
+    response: str
+    product_data: dict
+
+class VoiceMultiAgentOrchestrator:
+    """
+    Orquestador Multi-Agente especializado en compras de productos
+    """
+    
+    def __init__(self):
+        self.api_key = os.getenv("GROQ_API_KEY")
+        if not self.api_key:
+            raise ValueError("GROQ_API_KEY no configurada")
+        
+        self.client = Groq(api_key=self.api_key)
+        
+        # Definir agentes especializados
+        self.agents = {
+            "product_info": self.product_info_agent,
+            "category_agent": self.category_agent,
+            "brand_agent": self.brand_agent,
+            "price_agent": self.price_agent,
+            "confirmation_agent": self.confirmation_agent
+        }
+        
+        # Construir grafo de LangGraph
+        self.graph = self._build_graph()
+    
+    def _build_graph(self):
+        """Construye el grafo de conversación"""
+        workflow = StateGraph(AgentState)
+        
+        # Agregar nodos de agentes
+        for agent_name, agent_func in self.agents.items():
+            workflow.add_node(agent_name, agent_func)
+        
+        # Nodo de enrutamiento
+        workflow.add_node("router", self.route_to_agent)
+        
+        # Flujo principal
+        workflow.set_entry_point("router")
+        
+        for agent_name in self.agents.keys():
+            workflow.add_edge(agent_name, "router")
+        
+        return workflow.compile()
+    
+    def route_to_agent(self, state: AgentState) -> str:
+        """
+        Decide qué agente debe manejar la consulta actual
+        """
+        if not state["messages"]:
+            return "product_info"
+        
+        last_message = state["messages"][-1].lower()
+        
+        # Clasificación simple basada en keywords
+        if any(word in last_message for word in ["nombre", "producto", "qué es", "cuál es"]):
+            return "product_info"
+        elif any(word in last_message for word in ["categoría", "categoria", "tipo", "familia"]):
+            return "category_agent"
+        elif any(word in last_message for word in ["marca", "fabricante", "brand"]):
+            return "brand_agent"
+        elif any(word in last_message for word in ["precio", "valor", "cuesta", "costo"]):
+            return "price_agent"
+        elif any(word in last_message for word in ["confirmar", "guardar", "listo", "sí", "si"]):
+            return "confirmation_agent"
+        else:
+            return "product_info"
+    
+    async def product_info_agent(self, state: AgentState) -> AgentState:
+        """Agente que extrae información del producto"""
+        last_message = state["messages"][-1]
+        
+        prompt = f"""
+        Eres un asistente experto en productos de repuestos de motos.
+        
+        El usuario dice: "{last_message}"
+        
+        Extrae la siguiente información del producto:
+        - Nombre completo del producto
+        - Características principales si las menciona
+        
+        Responde de forma clara y amable confirmando el nombre del producto.
+        Si no está claro, pregunta amablemente por el nombre completo.
+        """
+        
+        response = self.client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=150,
+            temperature=0.7
+        )
+        
+        state["response"] = response.choices[0].message.content
+        return state
+    
+    async def category_agent(self, state: AgentState) -> AgentState:
+        """Agente que maneja categorías de productos"""
+        last_message = state["messages"][-1]
+        
+        prompt = f"""
+        El usuario menciona una categoría: "{last_message}"
+        
+        Categorías comunes en repuestos de motos:
+        - Aceites y lubricantes
+        - Frenos (pastillas, discos, bombas)
+        - Cadena y piñones
+        - Llantas y neumáticos
+        - Filtros (aire, aceite, gasolina)
+        - Baterías
+        - Luces y bombillos
+        - Amortiguadores
+        - Guayas
+        - Comandos
+        - Espejos
+        - Otros
+        
+        Confirma la categoría mencionada o sugiere la más cercana.
+        """
+        
+        response = self.client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=100
+        )
+        
+        state["response"] = response.choices[0].message.content
+        return state
+    
+    async def brand_agent(self, state: AgentState) -> AgentState:
+        """Agente que maneja marcas"""
+        last_message = state["messages"][-1]
+        
+        prompt = f"""
+        El usuario menciona una marca: "{last_message}"
+        
+        Marcas comunes:
+        - Bajaj (Boxer, Pulsar, Platino)
+        - Yamaha (Crypton, FZ, MT)
+        - Honda (CG, Titan, Biz)
+        - Suzuki (GN, AX, Intruder)
+        - AKT
+        - Genérico/Universal
+        
+        Confirma la marca o pregunta si es genérico.
+        """
+        
+        response = self.client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=100
+        )
+        
+        state["response"] = response.choices[0].message.content
+        return state
+    
+    async def price_agent(self, state: AgentState) -> AgentState:
+        """Agente que maneja precios"""
+        last_message = state["messages"][-1]
+        
+        prompt = f"""
+        El usuario menciona un precio: "{last_message}"
+        
+        Extrae el valor numérico del precio y confírmalo en pesos colombianos.
+        Ejemplo: "veinticinco mil" → "$25.000"
+        
+        Responde confirmando el precio de venta del producto.
+        """
+        
+        response = self.client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=100
+        )
+        
+        state["response"] = response.choices[0].message.content
+        return state
+    
+    async def confirmation_agent(self, state: AgentState) -> AgentState:
+        """Agente de confirmación final"""
+        product_data = state.get("product_data", {})
+        
+        prompt = f"""
+        El usuario quiere confirmar los datos del producto.
+        
+        Datos recopilados:
+        - Nombre: {product_data.get('name', 'No especificado')}
+        - Categoría: {product_data.get('category', 'No especificada')}
+        - Marca: {product_data.get('brand', 'No especificada')}
+        - Precio Venta: {product_data.get('sale_price', 'No especificado')}
+        - Cantidad: {product_data.get('quantity', '1')}
+        
+        Genera un resumen claro y pregunta si desea guardar el producto.
+        """
+        
+        response = self.client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=150
+        )
+        
+        state["response"] = response.choices[0].message.content
+        return state
+    
+    async def process(self, user_message: str, context: dict = None) -> dict:
+        """
+        Procesa un mensaje y retorna la respuesta del agente
+        
+        Args:
+            user_message: Mensaje del usuario
+            context: Contexto adicional (producto actual, etc.)
+        
+        Returns:
+            Dict con response y product_data
+        """
+        initial_state = {
+            "messages": [user_message],
+            "current_agent": "router",
+            "context": context or {},
+            "response": "",
+            "product_data": context.get("product_data", {})
+        }
+        
+        result = await self.graph.ainvoke(initial_state)
+        return {
+            "response": result["response"],
+            "product_data": result.get("product_data", {})
+        }

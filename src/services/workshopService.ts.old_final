@@ -1,0 +1,46 @@
+import { Prisma } from '@prisma/client';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+const OIL_CHANGE_KM = 3000;
+const OIL_CHANGE_DAYS = 90;
+
+export async function createWorkshopVisit(data: { customerId: string; motorcycleId?: string; kmReal?: number; services: string[]; technician?: string; totalCost: number; notes?: string; nextServiceKm?: number; nextServiceDate?: Date; }) {
+  const nextKm = data.nextServiceKm ?? (data.kmReal ? data.kmReal + OIL_CHANGE_KM : undefined);
+  const visit = await prisma.workshopVisit.create({ data: { customerId: data.customerId, motorcycleId: data.motorcycleId, kmReal: data.kmReal, services: data.services, technician: data.technician, totalCost: data.totalCost, status: 'COMPLETED', notes: data.notes, nextServiceKm: nextKm, nextServiceDate: data.nextServiceDate } });
+  if (data.motorcycleId && data.kmReal) await prisma.motorcycle.update({ where: { id: data.motorcycleId }, data: { lastKm: data.kmReal } });
+  await schedulePredictiveReminders(visit.id, data.customerId, data.motorcycleId, data.kmReal, data.services);
+  logger.info(`[workshopService] Visita ${visit.id} registrada — cliente ${data.customerId}`);
+  return visit;
+}
+
+async function schedulePredictiveReminders(visitId: string, customerId: string, motorcycleId: string | undefined, kmReal: number | undefined, services: string[]) {
+  const reminders: Array<{ type: string; message: string; dueDate: Date }> = [];
+  if (services.some(s => /aceite|oil|cambio/i.test(s))) {
+    const dueDate = new Date(); dueDate.setDate(dueDate.getDate() + OIL_CHANGE_DAYS);
+    const kmMsg = kmReal ? ` (aprox. km ${(kmReal + OIL_CHANGE_KM).toLocaleString('es-CO')})` : '';
+    reminders.push({ type: 'OIL_CHANGE', message: `Cambio de aceite programado${kmMsg}. Basado en visita ${visitId.slice(-6).toUpperCase()}.`, dueDate });
+  }
+  if (services.some(s => /frenos?|brake/i.test(s))) {
+    const dueDate = new Date(); dueDate.setDate(dueDate.getDate() + 180);
+    reminders.push({ type: 'MAINTENANCE', message: 'Revisión de frenos recomendada en 6 meses.', dueDate });
+  }
+  for (const r of reminders) await prisma.reminder.create({ data: { customerId, ...r } });
+}
+
+export async function listWorkshopVisits(params: { customerId?: string; motorcycleId?: string; page: number; limit: number; }) {
+  const { customerId, motorcycleId, page, limit } = params;
+  const skip = (page - 1) * limit;
+  const where: Prisma.WorkshopVisitWhereInput = { ...(customerId && { customerId }), ...(motorcycleId && { motorcycleId }) };
+  const [items, total] = await prisma.$transaction([
+    prisma.workshopVisit.findMany({ where, skip, take: limit, orderBy: { createdAt: 'desc' }, include: { customer: { select: { id: true, name: true, phone: true } }, motorcycle: { select: { id: true, plate: true, brand: true, model: true } } } }),
+    prisma.workshopVisit.count({ where }),
+  ]);
+  return { data: items, meta: { total, page, limit, totalPages: Math.ceil(total / limit) } };
+}
+
+export async function getWorkshopSummary(customerId: string) {
+  const visits = await prisma.workshopVisit.findMany({ where: { customerId }, orderBy: { createdAt: 'desc' }, include: { motorcycle: { select: { plate: true, brand: true, model: true } } } });
+  const totalSpent = visits.reduce((s, v) => s + parseFloat(String(v.totalCost)), 0);
+  return { visits, totalSpent, visitCount: visits.length };
+}

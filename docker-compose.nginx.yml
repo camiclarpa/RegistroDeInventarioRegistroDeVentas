@@ -1,0 +1,53 @@
+# ═══════════════════════════════════════════════════════════════
+# docker-compose.nginx.yml - VERSIÓN SNAP COMPATIBLE
+# Usa volúmenes con nombre (NO bind-mounts relativos)
+# ═══════════════════════════════════════════════════════════════
+
+networks:
+  sigh_motos_default:
+    external: true
+
+services:
+  sigc_nginx:
+    image: nginx:1.27-alpine
+    container_name: sigc_nginx
+    restart: unless-stopped
+    ports:
+      - "8888:80"
+      - "9443:443"
+    volumes:
+      # ✅ nginx.conf desde ruta permitida por Snap
+      - /var/snap/docker/common/nginx.conf:/etc/nginx/nginx.conf:ro
+      # ✅ Volúmenes con nombre (NO rutas relativas)
+      - sigh_motos_certbot-certs:/etc/nginx/certs:ro
+      - sigh_motos_uploads:/app/uploads:ro
+    networks:
+      - sigh_motos_default
+    depends_on:
+      - sigc_certbot
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  sigc_certbot:
+    image: certbot/certbot:latest
+    container_name: sigc_certbot
+    restart: unless-stopped
+    volumes:
+      # ✅ Volúmenes con nombre (NO rutas relativas)
+      - sigh_motos_certbot-certs:/etc/letsencrypt
+      - sigh_motos_certbot-www:/var/www/certbot
+    networks:
+      - sigh_motos_default
+    # Entrypoint para renovación automática de certificados
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+
+volumes:
+  sigh_motos_certbot-certs:
+    external: true
+  sigh_motos_certbot-www:
+    external: true
+  sigh_motos_uploads:
+    external: true

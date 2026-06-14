@@ -1,0 +1,324 @@
+import { useState, useRef, useEffect } from 'react'
+import { X, Package, CheckCircle, Trash2, Save } from 'lucide-react'
+import { toast } from 'sonner'
+import { SmartScannerInput, type SmartScannerHandle } from '@/components/SmartScannerInput'
+import { inventoryService } from '@/services/inventoryService'
+import type { Product } from '@/types'
+
+interface BatchScannerModalProps {
+  isOpen: boolean
+  onClose: () => void
+  products: Product[]
+  onSuccess: () => void
+}
+
+interface ScannedProduct {
+  product: Product
+  quantity: number
+  costPrice: number
+  salePrice: number
+}
+
+export function BatchScannerModal({ isOpen, onClose, products, onSuccess }: BatchScannerModalProps) {
+  const [scannedItems, setScannedItems] = useState<ScannedProduct[]>([])
+  const [saving, setSaving] = useState(false)
+  const scannerRef = useRef<SmartScannerHandle>(null)
+
+  useEffect(() => {
+    if (isOpen) {
+      setTimeout(() => scannerRef.current?.focus(), 100)
+    }
+  }, [isOpen])
+
+  const handleNewProduct = async (barcode: string) => {
+    console.log('🆕 Creando producto nuevo con barcode:', barcode)
+    
+    try {
+      // Crear producto con datos mínimos
+      // El backend generará automáticamente el SKU aleatorio
+      const newProduct = await inventoryService.createProduct({
+        name: `[PENDIENTE] Escanee: ${barcode}`,
+        barcode: barcode,
+        categoryId: 'cmp35aa93936beac2be5pendiente', // Categoría 'NECESITA EDITAR'
+        brandId: 'cmp793q7p000301nsxm80nri5', // Marca 'Genérico'
+        costPrice: 1,
+        salePrice: 1,
+        taxRate: 19,
+        stock: 1,
+        minStock: 5,
+        locationBin: 'A-01',
+      })
+      
+      console.log('✅ Producto nuevo creado:', newProduct)
+      toast.success(`Producto nuevo creado: ${newProduct.sku}`)
+      
+      // Agregar a la lista de productos escaneados
+      handleProductScanned(newProduct)
+      
+    } catch (error) {
+      console.error('❌ Error creando producto nuevo:', error)
+      toast.error('Error al crear producto nuevo')
+    }
+  }
+
+  const handleProductScanned = (product: Product) => {
+    const existing = scannedItems.find(item => item.product.id === product.id)
+    
+    if (existing) {
+      setScannedItems(prev => 
+        prev.map(item => 
+          item.product.id === product.id 
+            ? { ...item, quantity: item.quantity + 1 }
+            : item
+        )
+      )
+      toast.info(`Cantidad actualizada: ${product.name}`)
+    } else {
+      setScannedItems(prev => [...prev, {
+        product,
+        quantity: 1,
+        costPrice: product.costPrice,
+        salePrice: product.salePrice
+      }])
+      toast.success(`Producto agregado: ${product.name}`)
+    }
+  }
+
+  const updateQuantity = (productId: string, quantity: number) => {
+    if (quantity < 1) return
+    setScannedItems(prev => 
+      prev.map(item => 
+        item.product.id === productId ? { ...item, quantity } : item
+      )
+    )
+  }
+
+  const updateCostPrice = (productId: string, costPrice: number) => {
+    setScannedItems(prev => 
+      prev.map(item => 
+        item.product.id === productId ? { ...item, costPrice } : item
+      )
+    )
+  }
+
+  const updateSalePrice = (productId: string, salePrice: number) => {
+    setScannedItems(prev => 
+      prev.map(item => 
+        item.product.id === productId ? { ...item, salePrice } : item
+      )
+    )
+  }
+
+  const removeItem = (productId: string) => {
+    setScannedItems(prev => prev.filter(item => item.product.id !== productId))
+    toast.info('Producto eliminado')
+  }
+
+  const handleSaveAll = async () => {
+    if (scannedItems.length === 0) {
+      toast.error('No hay productos para guardar')
+      return
+    }
+
+    setSaving(true)
+    try {
+      let successCount = 0
+      let errorCount = 0
+
+      for (const item of scannedItems) {
+        try {
+          await inventoryService.createProduct({
+            name: item.product.name,
+            sku: item.product.sku,
+            barcode: item.product.barcode,
+            categoryId: item.product.categoryId,
+            brandId: item.product.brandId,
+            costPrice: item.costPrice,
+            salePrice: item.salePrice,
+            taxRate: item.product.taxRate || 19,
+            stock: item.quantity,
+            minStock: item.product.minStock || 5,
+            locationBin: item.product.locationBin || 'A-01',
+            description: item.product.description
+          })
+          successCount++
+        } catch (error) {
+          console.error(`Error al guardar ${item.product.name}:`, error)
+          errorCount++
+        }
+      }
+
+      if (successCount > 0) {
+        toast.success(`${successCount} producto(s) guardado(s) exitosamente`)
+      }
+      if (errorCount > 0) {
+        toast.error(`${errorCount} producto(s) no se pudieron guardar`)
+      }
+
+      setScannedItems([])
+      onSuccess()
+      onClose()
+    } catch (error) {
+      console.error('Error al guardar productos:', error)
+      toast.error('Error al guardar los productos')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (!isOpen) return null
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-lg shadow-xl max-w-5xl w-full max-h-[90vh] overflow-hidden flex flex-col">
+        {/* Header */}
+        <div className="px-6 py-4 border-b flex items-center justify-between bg-gradient-to-r from-blue-600 to-indigo-600 text-white">
+          <div className="flex items-center gap-3">
+            <Package className="w-6 h-6" />
+            <div>
+              <h2 className="text-xl font-bold">Escanear Productos por Lotes</h2>
+              <p className="text-sm text-blue-100">Escanea múltiples productos y guárdalos en inventario</p>
+            </div>
+          </div>
+          <button onClick={onClose} className="hover:bg-white/20 rounded-lg p-2 transition-colors">
+            <X className="w-6 h-6" />
+          </button>
+        </div>
+
+        {/* Scanner */}
+        <div className="px-6 py-4 border-b bg-gray-50">
+          <SmartScannerInput
+            ref={scannerRef}
+            onProductScanned={handleProductScanned}
+            onNewProduct={handleNewProduct}
+            products={products}
+            disabled={saving}
+          />
+        </div>
+
+        {/* Scanned Items List */}
+        <div className="flex-1 overflow-y-auto px-6 py-4">
+          {scannedItems.length === 0 ? (
+            <div className="text-center py-12 text-gray-400">
+              <Package className="w-16 h-16 mx-auto mb-4 opacity-50" />
+              <p className="text-lg font-medium">No hay productos escaneados</p>
+              <p className="text-sm mt-2">Escanea un código de barras para comenzar</p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-lg font-semibold text-gray-800">
+                  Productos escaneados ({scannedItems.length})
+                </h3>
+                <div className="text-sm text-gray-600">
+                  Total: <span className="font-bold text-blue-600">${scannedItems.reduce((sum, item) => sum + (item.costPrice * item.quantity), 0).toLocaleString('es-CO')}</span>
+                </div>
+              </div>
+
+              {scannedItems.map((item) => (
+                <div key={item.product.id} className="border rounded-lg p-4 hover:shadow-md transition-shadow">
+                  <div className="flex items-start gap-4">
+                    <div className="flex-1">
+                      <div className="flex items-start justify-between mb-2">
+                        <div>
+                          <h4 className="font-semibold text-gray-900">{item.product.name}</h4>
+                          <p className="text-sm text-gray-500">SKU: {item.product.sku || 'N/A'} | Barcode: {item.product.barcode || 'N/A'}</p>
+                        </div>
+                        <button
+                          onClick={() => removeItem(item.product.id)}
+                          className="text-red-500 hover:bg-red-50 rounded-lg p-2 transition-colors"
+                          disabled={saving}
+                        >
+                          <Trash2 className="w-5 h-5" />
+                        </button>
+                      </div>
+
+                      <div className="grid grid-cols-3 gap-3 mt-3">
+                        <div>
+                          <label className="block text-xs font-medium text-gray-700 mb-1">Cantidad</label>
+                          <input
+                            type="number"
+                            min="1"
+                            value={item.quantity}
+                            onChange={(e) => updateQuantity(item.product.id, parseInt(e.target.value) || 1)}
+                            className="input-field text-sm"
+                            disabled={saving}
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium text-gray-700 mb-1">Precio Costo</label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            value={item.costPrice}
+                            onChange={(e) => updateCostPrice(item.product.id, parseFloat(e.target.value) || 0)}
+                            className="input-field text-sm"
+                            disabled={saving}
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium text-gray-700 mb-1">Precio Venta</label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            value={item.salePrice}
+                            onChange={(e) => updateSalePrice(item.product.id, parseFloat(e.target.value) || 0)}
+                            className="input-field text-sm"
+                            disabled={saving}
+                          />
+                        </div>
+                      </div>
+
+                      <div className="mt-2 text-sm text-gray-600">
+                        Subtotal: <span className="font-semibold">${(item.costPrice * item.quantity).toLocaleString('es-CO')}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="px-6 py-4 border-t bg-gray-50 flex items-center justify-between">
+          <div className="text-sm text-gray-600">
+            {scannedItems.length > 0 && (
+              <span>
+                {scannedItems.reduce((sum, item) => sum + item.quantity, 0)} unidades en total
+              </span>
+            )}
+          </div>
+          <div className="flex gap-3">
+            <button
+              onClick={onClose}
+              className="btn-outline"
+              disabled={saving}
+            >
+              Cancelar
+            </button>
+            <button
+              onClick={handleSaveAll}
+              className="btn-primary flex items-center gap-2"
+              disabled={saving || scannedItems.length === 0}
+            >
+              {saving ? (
+                <>
+                  <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                  Guardando...
+                </>
+              ) : (
+                <>
+                  <Save className="w-4 h-4" />
+                  Guardar {scannedItems.length} Producto(s)
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}

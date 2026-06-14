@@ -1,0 +1,53 @@
+import { Request, Response } from 'express';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+export async function getMeHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const userId = (req as any).user?.id;
+
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'No autenticado' });
+    }
+
+    const user = await prisma.users.findUnique({
+      where: { id: userId },
+      include: { roles: true }
+    });
+
+    if (!user || !user.isActive) {
+      return res.status(401).json({ success: false, error: 'Usuario no encontrado o inactivo' });
+    }
+
+    let permissions: string[] = [];
+    try {
+      const rolePerms = await prisma.$queryRaw`
+        SELECT p.name FROM permissions p
+        JOIN role_permissions rp ON rp."permissionId" = p.id
+        WHERE rp."roleId" = ${user.roleId}
+      `;
+      permissions = (rolePerms as any[]).map(p => p.name);
+    } catch (err) {
+      logger.warn('[getMeHandler] No se pudieron cargar permisos:', err);
+      permissions = [];
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.roles?.name || 'user',
+        permissions: permissions
+      }
+    });
+  } catch (error) {
+    logger.error('[getMeHandler] Error:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Error al obtener información del usuario'
+    });
+  }
+}
+

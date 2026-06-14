@@ -1,0 +1,128 @@
+import { redis } from '../config/redis';
+import zlib from 'zlib';
+import { promisify } from 'util';
+
+const gzip = promisify(zlib.gzip);
+const gunzip = promisify(zlib.gunzip);
+
+export class CacheService {
+  private static instance: CacheService;
+  private defaultTTL: number = 300; // 5 minutos
+  private useCompression: boolean = true;
+
+  private constructor() {}
+
+  static getInstance(): CacheService {
+    if (!CacheService.instance) {
+      CacheService.instance = new CacheService();
+    }
+    return CacheService.instance;
+  }
+
+  // Comprimir datos antes de guardar
+  private async compress(data: any): Promise<Buffer> {
+    const jsonString = JSON.stringify(data);
+    return gzip(jsonString);
+  }
+
+  // Descomprimir datos al leer
+  private async decompress(buffer: Buffer): Promise<any> {
+    const decompressed = await gunzip(buffer);
+    return JSON.parse(decompressed.toString());
+  }
+
+  async get<T>(key: string): Promise<T | null> {
+    try {
+      const data = await redis.get(key);
+      if (!data) return null;
+      
+      // Si es buffer comprimido (empezando con 0x1F8B)
+      if (Buffer.isBuffer(data) && data[0] === 0x1F && data[1] === 0x8B) {
+        return await this.decompress(data);
+      }
+      
+      // Si es string normal
+      return JSON.parse(data);
+    } catch (error) {
+      console.error(`[Cache] Error getting key ${key}:`, error);
+      return null;
+    }
+  }
+
+  async set(key: string, value: any, ttl: number = this.defaultTTL): Promise<void> {
+    try {
+      let dataToStore: any;
+      
+      if (this.useCompression && JSON.stringify(value).length > 1024) {
+        dataToStore = await this.compress(value);
+      } else {
+        dataToStore = JSON.stringify(value);
+      }
+      
+      await redis.set(key, dataToStore, { EX: ttl });
+    } catch (error) {
+      console.error(`[Cache] Error setting key ${key}:`, error);
+    }
+  }
+
+  async del(key: string): Promise<void> {
+    try {
+      await redis.del(key);
+    } catch (error) {
+      console.error(`[Cache] Error deleting key ${key}:`, error);
+    }
+  }
+
+  async delPattern(pattern: string): Promise<void> {
+    try {
+      const keys = await redis.keys(pattern);
+      if (keys.length > 0) {
+        await redis.del(keys);
+      }
+      console.log(`[Cache] Invalidated ${keys.length} keys with pattern ${pattern}`);
+    } catch (error) {
+      console.error(`[Cache] Error deleting pattern ${pattern}:`, error);
+    }
+  }
+
+  // Keys específicas para inventario
+  getProductsKey(page: number, limit: number, filters: any): string {
+    return `products:list:${page}:${limit}:${JSON.stringify(filters)}`;
+  }
+
+  getProductKey(id: string): string {
+    return `product:${id}`;
+  }
+
+  getLowStockKey(): string {
+    return 'products:low-stock';
+  }
+
+  getCategoriesKey(): string {
+    return 'categories:list';
+  }
+
+  getBrandsKey(): string {
+    return 'brands:list';
+  }
+
+  // Invalidación inteligente
+  async invalidateProductCache(productId?: string): Promise<void> {
+    if (productId) {
+      await this.del(this.getProductKey(productId));
+    }
+    // Invalidar listas de productos (todas las páginas)
+    await this.delPattern('products:list:*');
+    await this.delPattern('products:low-stock');
+    console.log(`[Cache] Invalidated product cache for product ${productId || 'all'}`);
+  }
+
+  // Obtener estadísticas de caché
+  async getStats(): Promise<object> {
+    const info = await redis.info('stats');
+    const keyspace = await redis.info('keyspace');
+    return { info, keyspace };
+  }
+}
+
+export const cacheService = CacheService.getInstance();

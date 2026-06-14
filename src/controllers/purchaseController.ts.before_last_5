@@ -1,0 +1,368 @@
+import crypto from 'crypto';
+import { Request, Response } from 'express';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+import { Prisma } from '@prisma/client';
+
+const ok = (res: Response, data: unknown, status = 200) =>
+  res.status(status).json({ success: true, data });
+
+const fail = (res: Response, error: string, status = 400) =>
+  res.status(status).json({ success: false, error });
+
+const getStr = (v: unknown): string | undefined => {
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v) && typeof v[0] === 'string') return v[0];
+  return undefined;
+};
+
+const getNum = (v: unknown, def = 0): number => {
+  const n = Number(getStr(v));
+  return isNaN(n) ? def : n;
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// PURCHASE ORDERS
+// ═══════════════════════════════════════════════════════════════════════
+
+export async function listPurchaseOrdersHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const page = getNum(req.query.page, 1);
+    const limit = getNum(req.query.limit, 20);
+    const status = getStr(req.query.status);
+    const supplierId = getStr(req.query.supplierId);
+
+    const where: any = {};
+    if (status) where.status = status;
+    if (supplierId) where.supplierId = supplierId;
+
+    const [data, total] = await prisma.$transaction([
+      prisma.purchase_orders.findMany({
+        where,
+        include: {
+          suppliers: { select: { id: true, name: true } },
+          items: { 
+            include: { 
+              product: { select: { id: true, name: true, skuInternal: true } } 
+            } 
+          }
+        },
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      prisma.purchase_orders.count({ where }),
+    ]);
+
+    return ok(res, { data, total, totalPages: Math.ceil(total / limit) });
+  } catch (err) {
+    logger.error('[purchaseController] listPurchaseOrdersHandler', err);
+    return fail(res, 'Error al obtener órdenes de compra', 500);
+  }
+}
+
+export async function getPurchaseOrderByIdHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const id = getStr(req.params.id);
+    if (!id) return fail(res, 'ID requerido', 400);
+
+    const order = await prisma.purchase_orders.findUnique({
+      where: { id },
+      include: { 
+        suppliers: true, 
+        purchase_order_items: { include: { product: true } }, 
+        accountPayable: true 
+      }
+    });
+    if (!order) return fail(res, 'Orden no encontrada', 404);
+    return ok(res, order);
+  } catch (err) {
+    logger.error('[purchaseController] getPurchaseOrderByIdHandler', err);
+    return fail(res, 'Error al obtener orden', 500);
+  }
+}
+
+export async function createPurchaseOrderHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const { supplierId, items, expectedDate, notes } = req.body;
+    const userId = (req.user as any)?.id;
+
+    if (!supplierId || !items?.length) {
+      return fail(res, 'Proveedor y items son requeridos', 400);
+    }
+
+    // Calcular totales
+    let subtotal = 0;
+    for (const item of items) {
+      subtotal += (item.unitCost || 0) * (item.quantity || 0);
+    }
+
+    const orderNumber = `PO-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+
+    const order = await prisma.purchase_orders.create({
+      data: {
+        orderNumber,
+        supplierId,
+        userId,
+        expectedDate: expectedDate ? new Date(expectedDate) : null,
+        notes,
+        status: 'PENDING',
+        subtotal,
+        taxAmount: 0,
+        totalAmount: subtotal,
+        items: {
+          create: items.map((item: any) => ({
+            productId: item.productId,
+            quantity: item.quantity,
+            unitCost: item.unitCost,
+            lineTotal: item.unitCost * item.quantity,
+          })),
+        },
+      } as any,
+      include: {
+        suppliers: true,
+        purchase_order_items: { include: { product: true } },
+      },
+    });
+
+    return ok(res, order, 201);
+  } catch (err) {
+    logger.error('[purchaseController] createPurchaseOrderHandler', err);
+    return fail(res, 'Error al crear orden de compra', 500);
+  }
+}
+
+export async function updatePurchaseOrderHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const id = getStr(req.params.id);
+    if (!id) return fail(res, 'ID requerido', 400);
+
+    const { status, notes, receivedDate } = req.body;
+
+    const order = await prisma.purchase_orders.update({
+      where: { id },
+      data: {
+        status,
+        notes,
+        receivedDate: receivedDate ? new Date(receivedDate) : undefined,
+      } as any,
+      include: {
+        suppliers: true,
+        purchase_order_items: { include: { product: true } },
+      },
+    });
+
+    return ok(res, order);
+  } catch (err) {
+    logger.error('[purchaseController] updatePurchaseOrderHandler', err);
+    return fail(res, 'Error al actualizar orden', 500);
+  }
+}
+
+export async function receivePurchaseOrderHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const id = getStr(req.params.id);
+    if (!id) return fail(res, 'ID requerido', 400);
+
+    const { receivedItems } = req.body;
+    const userId = (req.user as any)?.id;
+
+    // Obtener la orden actual
+    const order = await prisma.purchase_orders.findUnique({
+      where: { id },
+      include: { purchase_order_items: true },
+    });
+
+    if (!order) return fail(res, 'Orden no encontrada', 404);
+    if (order.status === 'RECEIVED') return fail(res, 'Orden ya recibida completamente', 400);
+
+    // Actualizar cantidades recibidas
+    for (const received of receivedItems) {
+      await prisma.purchase_order_items.update({
+        where: { id: received.itemId },
+        data: { quantityReceived: { increment: received.quantity } },
+      });
+
+      // Actualizar stock del producto
+      const item = order.items.find(i => i.id === received.itemId);
+      if (item) {
+        await prisma.products.update({
+          where: { id: item.productId },
+          data: { stockQuantity: { increment: received.quantity } },
+        });
+
+        // Registrar movimiento de inventario
+        await prisma.inventory_movements.create({
+          data: {
+            productId: item.productId,
+            type: 'ENTRY',
+            quantity: received.quantity,
+            unitCostAtMoment: item.unitCost,
+            referenceDoc: order.orderNumber,
+            reason: 'Recepción de compra',
+            performedByUserId: userId,
+          } as any,
+        });
+      }
+    }
+
+    // Verificar si todos los items están completamente recibidos
+    const updatedItems = await prisma.purchase_order_items.findMany({
+      where: { purchaseOrderId: id },
+    });
+
+    const allReceived = updatedItems.every(
+      item => (item.quantityReceived || 0) >= item.quantity
+    );
+
+    const newStatus = allReceived ? 'RECEIVED' : 'PARTIALLY_RECEIVED';
+
+    await prisma.purchase_orders.update({
+      where: { id },
+      data: { status: newStatus, receivedDate: new Date() },
+    });
+
+    return ok(res, { message: 'Orden recibida exitosamente' });
+  } catch (err) {
+    logger.error('[purchaseController] receivePurchaseOrderHandler', err);
+    return fail(res, 'Error al recibir orden', 500);
+  }
+}
+
+export async function deletePurchaseOrderHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const id = getStr(req.params.id);
+    if (!id) return fail(res, 'ID requerido', 400);
+
+    await prisma.purchase_orders.delete({ where: { id } });
+    return ok(res, { message: 'Orden eliminada' });
+  } catch (err) {
+    logger.error('[purchaseController] deletePurchaseOrderHandler', err);
+    return fail(res, 'Error al eliminar orden', 500);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SUPPLIERS
+// ═══════════════════════════════════════════════════════════════════════
+
+export async function listSuppliersHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const page = getNum(req.query.page, 1);
+    const limit = getNum(req.query.limit, 20);
+    const search = getStr(req.query.search);
+
+    const where: any = {};
+    if (search) {
+      where.OR = [
+        { name: { contains: search, mode: 'insensitive' } },
+        { email: { contains: search, mode: 'insensitive' } },
+        { contact: { contains: search, mode: 'insensitive' } },
+      ];
+    }
+
+    const [data, total] = await prisma.$transaction([
+      prisma.suppliers.findMany({
+        where,
+        orderBy: { name: 'asc' },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      prisma.suppliers.count({ where }),
+    ]);
+
+    return ok(res, { data, total, totalPages: Math.ceil(total / limit) });
+  } catch (err) {
+    logger.error('[purchaseController] listSuppliersHandler', err);
+    return fail(res, 'Error al obtener proveedores', 500);
+  }
+}
+
+export async function getSupplierByIdHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const id = getStr(req.params.id);
+    if (!id) return fail(res, 'ID requerido', 400);
+
+    const supplier = await prisma.suppliers.findUnique({
+      where: { id },
+      include: {
+        purchase_orders: {
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+        },
+      },
+    });
+
+    if (!supplier) return fail(res, 'Proveedor no encontrado', 404);
+    return ok(res, supplier);
+  } catch (err) {
+    logger.error('[purchaseController] getSupplierByIdHandler', err);
+    return fail(res, 'Error al obtener proveedor', 500);
+  }
+}
+
+export async function createSupplierHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const { name, contact, phone, email, address, nit } = req.body;
+
+    if (!name) return fail(res, 'Nombre requerido', 400);
+
+    const supplier = await prisma.suppliers.create({
+      data: {
+        name,
+        contact,
+        phone,
+        email,
+        address,
+        nit,
+        isActive: true,
+      } as any,
+    });
+
+    return ok(res, supplier, 201);
+  } catch (err) {
+    logger.error('[purchaseController] createSupplierHandler', err);
+    return fail(res, 'Error al crear proveedor', 500);
+  }
+}
+
+export async function updateSupplierHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const id = getStr(req.params.id);
+    if (!id) return fail(res, 'ID requerido', 400);
+
+    const { name, contact, phone, email, address, nit, isActive } = req.body;
+
+    const supplier = await prisma.suppliers.update({
+      where: { id },
+      data: {
+        name,
+        contact,
+        phone,
+        email,
+        address,
+        nit,
+        isActive,
+      } as any,
+    });
+
+    return ok(res, supplier);
+  } catch (err) {
+    logger.error('[purchaseController] updateSupplierHandler', err);
+    return fail(res, 'Error al actualizar proveedor', 500);
+  }
+}
+
+export async function deleteSupplierHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const id = getStr(req.params.id);
+    if (!id) return fail(res, 'ID requerido', 400);
+
+    await prisma.suppliers.delete({ where: { id } });
+    return ok(res, { message: 'Proveedor eliminado' });
+  } catch (err) {
+    logger.error('[purchaseController] deleteSupplierHandler', err);
+    return fail(res, 'Error al eliminar proveedor', 500);
+  }
+}
+

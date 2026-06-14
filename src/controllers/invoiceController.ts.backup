@@ -1,0 +1,275 @@
+/**
+ * invoiceController.ts — Módulo 3: Facturación y Documentación Comercial
+ *
+ * Endpoints HTTP:
+ *  GET  /api/v1/invoices/config      — Leer configuración de empresa
+ *  PUT  /api/v1/invoices/config      — Actualizar configuración de empresa (ADMIN)
+ *  GET  /api/v1/invoices/:id         — Obtener documento de factura para imprimir
+ *  POST /api/v1/invoices/:id/cancel  — Cancelar factura (ADMIN)
+ */
+
+import { Request, Response } from 'express';
+import { Prisma }            from '@prisma/client';
+import { ZodError }          from 'zod';
+import { companyConfigSchema, cancelSaleSchema } from '../utils/validators';
+import {
+  getCompanyConfig,
+  updateCompanyConfig,
+  generateInvoiceDocument,
+  cancelInvoice,
+} from '../services/invoiceService';
+import { prisma }    from '../config/prisma';
+import { logAction } from '../services/auditService';
+import { logger }   from '../config/logger';
+
+// ─── Helpers HTTP ─────────────────────────────────────────────────────────────
+
+const ok = (res: Response, data: unknown, status = 200) =>
+  res.status(status).json({ success: true, data });
+
+const fail = (res: Response, error: string, status = 400, details?: unknown) =>
+  res.status(status).json({ success: false, error, ...(details ? { details } : {}) });
+
+function extractParam(param: string | string[] | undefined): string {
+  if (Array.isArray(param)) return param[0] ?? '';
+  return param ?? '';
+}
+
+function handleError(res: Response, err: unknown, context: string) {
+  logger.error(`[InvoiceController] ${context}`, { err });
+
+  if (err instanceof ZodError) {
+    return fail(res, 'Datos de entrada inválidos', 422, err.flatten());
+  }
+
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    if (err.code === 'P2025') {
+      return fail(res, 'Registro no encontrado', 404);
+    }
+  }
+
+  if (err instanceof Error) {
+    return fail(res, err.message, 400);
+  }
+
+  return fail(res, 'Error interno del servidor', 500);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LISTADO DE FACTURAS
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function listInvoicesHandler(req: Request, res: Response) {
+  logger.info('[PAGINATION DEBUG] req.query:', JSON.stringify(req.query));
+  try {
+    const page       = Math.max(1, parseInt(String(req.query['page'] ?? '1')));
+    const limit      = Math.min(100, Math.max(1, parseInt(String(req.query['limit'] ?? '100'))));
+    const startDate  = req.query['startDate'] as string | undefined;
+    const endDate    = req.query['endDate']   as string | undefined;
+    const customerId = req.query['customerId'] as string | undefined;
+    const customerName = req.query['customerName'] as string | undefined;
+    const customerIdentification = req.query['customerIdentification'] as string | undefined;
+    const status     = req.query['status']    as string | undefined;
+    let dbStatus: string | undefined = undefined;
+    if (status === 'EMITIDA') dbStatus = 'COMPLETED';
+    else if (status === 'ANULADA') dbStatus = 'CANCELLED';
+    const isDianFilter = (status === 'ENVIADA_DIAN' || status === 'ENVIADA DIAN');
+
+    // Where simple línea por línea
+    const where: any = {};
+    if (customerId && customerId !== '' && customerId !== 'undefined') where.customerId = customerId;
+    if (dbStatus === 'COMPLETED' || dbStatus === 'CANCELLED' || dbStatus === 'REFUNDED') where.status = dbStatus;
+    // Filtro de fechas: startDate desde 00:00:00, endDate hasta 23:59:59.999
+    if (startDate) {
+      try {
+        const start = new Date(startDate);
+        if (!isNaN(start.getTime())) {
+          where.createdAt = { ...where.createdAt, gte: start };
+        }
+      } catch {}
+    }
+    if (endDate) {
+      try {
+        const end = new Date(endDate);
+        if (!isNaN(end.getTime())) {
+          // Ajustar endDate para incluir TODO el día (23:59:59.999)
+          end.setHours(23, 59, 59, 999);
+          where.createdAt = { ...where.createdAt, lte: end };
+        }
+      } catch {}
+    }
+    // Filtros de cliente (case-insensitive)
+    // Si hay ambos filtros, usar AND. Si solo hay uno, usar OR.
+    if (customerName && customerName !== '' && customerIdentification && customerIdentification !== '') {
+      // Ambos filtros: AND
+      where.AND = [
+        {
+          OR: [
+            { customerName: { contains: customerName, mode: 'insensitive' } },
+            { customer: { name: { contains: customerName, mode: 'insensitive' } } },
+          ]
+        },
+        {
+          OR: [
+            { customerIdentification: { contains: customerIdentification, mode: 'insensitive' } },
+            { customer: { identificationNumber: { contains: customerIdentification, mode: 'insensitive' } } },
+          ]
+        }
+      ];
+    } else if (customerName && customerName !== '') {
+      // Solo filtro de nombre: OR
+      where.OR = [
+        { customerName: { contains: customerName, mode: 'insensitive' } },
+        { customer: { name: { contains: customerName, mode: 'insensitive' } } },
+      ];
+    } else if (customerIdentification && customerIdentification !== '') {
+      // Solo filtro de cédula: OR
+      where.OR = [
+        { customerIdentification: { contains: customerIdentification, mode: 'insensitive' } },
+        { customer: { identificationNumber: { contains: customerIdentification, mode: 'insensitive' } } },
+      ];
+    }
+    if (isDianFilter) where.id = '__zero__';
+    logger.info('[WHERE]', JSON.stringify(where));
+
+    // Logging ANTES de la query
+    logger.info('[QUERY] findMany where:', JSON.stringify(where), 'skip:', (page-1)*limit, 'take:', limit);
+    
+    // Query SECUENCIAL para findMany (no Promise.all)
+    const sales = await prisma.sale.findMany({
+      where: where,
+      skip: (page - 1) * limit,
+      take: limit,
+      orderBy: { createdAt: 'desc' },
+      include: {
+          customer: { select: { id: true, name: true, identificationNumber: true, phone: true, address: true } },
+          items:    {
+            select: {
+              id: true,
+              quantity: true,
+              unitPrice: true,
+              productId: true,
+              productNameSnapshot: true,
+              skuSnapshot: true,
+              lineTotal: true,
+              discountPerItem: true
+            }
+          },
+        },
+    });
+    
+    // Logging DESPUÉS de findMany
+    logger.info('[RESULT] findMany returned:', sales.length, 'records');
+    
+    // Query SECUENCIAL para count
+    const total = await prisma.sale.count({ where: where });
+    logger.info('[RESULT] count returned:', total);
+
+    // Mapear Sale a formato Invoice que espera el frontend
+    const mappedInvoices = (sales as any).map((sale: any) => {
+      // Mapeo DIRECTO: usar sale.status (no sale.invoice)
+      // SaleStatus enum: COMPLETED|CANCELLED|REFUNDED → Frontend: EMITIDA|ANULADA|REEMBOLSADA
+      const statusMap: Record<string, string> = {
+        'COMPLETED': 'EMITIDA',
+        'CANCELLED': 'ANULADA', 
+        'REFUNDED': 'REEMBOLSADA'
+      };
+      const invoiceStatus = statusMap[sale.status] || 'PENDIENTE';
+
+      // Calcular customerName y customerIdentification
+      const customerName = sale.customer?.name || sale.customerName || 'Consumidor Final';
+      const customerIdentification = sale.customer?.identificationNumber || sale.customerIdentification || '';
+
+      return {
+        id: sale.id,
+        invoiceNumber: sale.saleNumber,
+        issuedAt: sale.createdAt,  // Usar createdAt directamente (sin invoice)
+        total: sale.totalAmount?.toString() ?? '0',
+        status: invoiceStatus,  // Mapeo directo desde sale.status
+        customer: sale.customer,
+        customerName: customerName,
+        customerIdentification: customerIdentification,
+        items: sale.items,
+        paymentMethod: sale.paymentMethod,
+        notes: sale.notes,
+        createdAt: sale.createdAt,
+        updatedAt: sale.updatedAt,
+      };
+    });
+
+    return ok(res, {
+      invoices: mappedInvoices,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    });
+  } catch (err) {
+    return handleError(res, err, 'listInvoices');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFIGURACIÓN DE EMPRESA
+// ═══════════════════════════════════════════════════════════════════════════
+
+export function getCompanyConfigHandler(_req: Request, res: Response) {
+  try {
+    const config = getCompanyConfig();
+    return ok(res, config);
+  } catch (err) {
+    return handleError(res, err, 'getCompanyConfig');
+  }
+}
+
+export function updateCompanyConfigHandler(req: Request, res: Response) {
+  try {
+    const input  = companyConfigSchema.parse(req.body);
+    const result = updateCompanyConfig(input);
+
+    const userId = req.user?.id ?? 'unknown';
+    void logAction(userId, 'INVOICE_CONFIG_UPDATED', 'SystemConfig', 'company', {
+      fields: Object.keys(input),
+    }, req.ip);
+
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'updateCompanyConfig');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DOCUMENTOS DE FACTURA
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function getInvoiceHandler(req: Request, res: Response) {
+  try {
+    const id  = extractParam(req.params['id']);
+    const doc = await generateInvoiceDocument(id);
+
+    if (!doc) return fail(res, `Factura no encontrada para el identificador "${id}"`, 404);
+
+    return ok(res, doc);
+  } catch (err) {
+    return handleError(res, err, 'getInvoice');
+  }
+}
+
+export async function cancelInvoiceHandler(req: Request, res: Response) {
+  try {
+    const id     = extractParam(req.params['id']);
+    const input  = cancelSaleSchema.parse(req.body);
+    const userId = req.user?.id ?? 'unknown';
+
+    const result = await cancelInvoice(id, input, userId);
+
+    void logAction(userId, 'INVOICE_CANCELLED', 'Sale', id, {
+      reason:      input.reason,
+      invoiceNumber: result.saleNumber,
+    }, req.ip);
+
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'cancelInvoice');
+  }
+}

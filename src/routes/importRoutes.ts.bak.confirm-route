@@ -1,0 +1,84 @@
+import * as XLSX from 'xlsx';
+import { Router } from 'express';
+import multer from 'multer';
+import { analyzeExcelPatterns, executeImport } from '../services/importService';
+import { normalizeBrand, generateAutoSKU, generateAutoBarcode, validateProductCoherence, validateEAN13 } from '../services/importService';
+
+const router = Router();
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Analizar Excel y mostrar preview
+router.post('/analyze', upload.single('file'), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No se subió archivo' });
+    }
+    
+    const analysis = analyzeExcelPatterns(req.file.buffer);
+    
+    res.json({ 
+      success: true, 
+      data: analysis 
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Ejecutar importación masiva
+router.post('/execute', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No se subió archivo' });
+    }
+    
+    const { confirmedBrands, confirmedCategories } = req.body;
+    
+    if (!confirmedBrands || !confirmedCategories) {
+      return res.status(400).json({ error: 'Faltan marcas o categorías' });
+    }
+    
+    const result = await executeImport(
+      req.file.buffer, 
+      confirmedBrands, 
+      confirmedCategories
+    );
+    
+    res.json({ 
+      success: true, 
+      count: result.count,
+      message: `✅ ${result.count} productos importados exitosamente` 
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+// STEP: Endpoint de Traducción Inteligente
+router.post("/smart-translate", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    const { mappingConfig, userId } = req.body;
+    const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const rawData = XLSX.utils.sheet_to_json(sheet);
+    const enriched = rawData.map((row: any, idx: number) => {
+      const name = String(row[mappingConfig?.nameColumn || "PRODUCTO"] || "").trim();
+      const brand = normalizeBrand(String(row[mappingConfig?.brandColumn || "MARCA"] || ""));
+      const category = String(row[mappingConfig?.categoryColumn || "CATEGORIA"] || "").trim();
+      const salePrice = parseFloat(String(row[mappingConfig?.salePriceColumn || "VALOR COMERCIAL"] || 0)) || 0;
+      const costPrice = parseFloat(String(row[mappingConfig?.costPriceColumn || "VALOR SIN IVA"] || 0)) || 0;
+      const stock = parseInt(String(row[mappingConfig?.stockColumn || "CANTIDAD"] || 0)) || 0;
+      const sku = row[mappingConfig?.skuColumn] || generateAutoSKU(brand, category, idx);
+      const barcode = row[mappingConfig?.barcodeColumn] || generateAutoBarcode(sku);
+      const { errors, warnings } = validateProductCoherence({ name, salePrice, costPrice, stock, barcode }, idx + 2);
+      const qualityScore = errors.length > 0 ? 0 : (warnings.length > 0 ? 85 : 100);
+      return { name, brand, category, salePrice, costPrice, stock, sku, barcode, errors, warnings, qualityScore };
+    });
+    const valid = enriched.filter((p: any) => p.errors.length === 0).length;
+    const avgQuality = Math.round(enriched.reduce((sum: number, p: any) => sum + p.qualityScore, 0) / enriched.length) || 0;
+    res.json({ success: true, data: { enrichedProducts: enriched, validationReport: { totalProducts: enriched.length, validProducts: valid, productsWithWarnings: enriched.filter((p: any) => p.warnings.length > 0).length, productsWithErrors: enriched.filter((p: any) => p.errors.length > 0).length, qualityScore: avgQuality } } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+export default router;

@@ -1,0 +1,102 @@
+import { Request, Response } from "express";
+import os from "os";
+import { prisma } from "../config/prisma";
+import { logger } from "../config/logger";
+import { triggerBackup } from "../services/backupService";
+import { runHealthAlerts } from "../services/healthService";
+
+export async function getHealth(_: Request, res: Response) {
+  const { status, alerts } = await runHealthAlerts();
+  let dbOk = true;
+  try { await prisma.$queryRaw`SELECT 1`; } catch { dbOk = false; }
+  const uptime = process.uptime();
+  const memTotal = os.totalmem() / 1024 / 1024;
+  const memUsed = memTotal - (os.freemem() / 1024 / 1024);
+  res.json({
+    status: alerts.length ? "DEGRADED" : "OK",
+    uptime,
+    database: { ok: dbOk, latencyMs: 0 },
+    memory: { usedMb: Math.round(memUsed), totalMb: Math.round(memTotal), usedPct: Math.round((memUsed / memTotal) * 100) },
+    cpu: { loadAvg1: os.loadavg()[0].toFixed(2), loadAvg5: os.loadavg()[1].toFixed(2) },
+    disk: { note: "OK" },
+    alerts,
+  });
+}
+
+export async function listBackups(_: Request, res: Response) {
+  const data = await prisma.systemBackup.findMany({ orderBy: { createdAt: "desc" }, take: 20 });
+  res.json(data);
+}
+
+export async function getBackupStatus(req: Request, res: Response) {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const b = await prisma.systemBackup.findUnique({ where: { id } });
+  if (!b) return res.status(404).json({ error: "No encontrado" });
+  res.json(b);
+}
+
+export async function triggerBackupCtrl(req: Request, res: Response) {
+  const userId = (req as any).user?.id ?? "system";
+  const b = await triggerBackup(userId);
+  res.json({ success: true, backupId: b.id, message: "Respaldo iniciado" });
+}
+
+export async function prepareRestore(req: Request, res: Response) {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const b = await prisma.systemBackup.findUnique({ where: { id } });
+  if (!b || b.status !== "COMPLETED") return res.status(400).json({ success: false, message: "Respaldo no válido o no completado" });
+  await prisma.systemBackup.update({ where: { id }, data: { status: "PENDING" } });
+  res.json({ success: true, message: `Restauración preparada. Ejecutar en VPS: bash scripts/pg-restore.sh ${id}` });
+}
+
+export async function listAuditLogs(req: Request, res: Response) {
+  const page = Math.max(1, parseInt(String(req.query.page ?? "1")));
+  const limit = Math.min(100, parseInt(String(req.query.limit ?? "30")));
+  const action = String(req.query.action ?? "").trim() || undefined;
+  const where: Record<string, unknown> = {};
+  if (action) where.action = { contains: action };
+
+  const [logs, total] = await Promise.all([
+    prisma.systemAudit.findMany({
+      where,
+      skip: (page - 1) * limit,
+      take: limit,
+      orderBy: { createdAt: "desc" }
+    }),
+    prisma.systemAudit.count({ where }),
+  ]);
+
+  const userIds = logs.map(l => l.userId).filter((id): id is string => !!id);
+  let usersMap: Record<string, { id: string; name: string }> = {};
+
+  if (userIds.length > 0) {
+    const users = await prisma.user.findMany({
+      where: { id: { in: userIds } },
+      select: { id: true, name: true }
+    });
+    usersMap = Object.fromEntries(users.map(u => [u.id, { id: u.id, name: u.name }]));
+  }
+
+  const data = logs.map(log => ({
+    ...log,
+    user: log.userId ? usersMap[log.userId] : null
+  }));
+
+  res.json({ data, total, page, totalPages: Math.ceil(total / limit) });
+}
+
+export async function getMyNotifications(req: Request, res: Response) {
+  const userId = (req as any).user?.id;
+  const limit = Math.min(50, parseInt(String(req.query.limit ?? "20")));
+  const data = await prisma.notification.findMany({ where: { userId }, take: limit, orderBy: { createdAt: "desc" } });
+  res.json(data);
+}
+
+export async function markNotificationsRead(req: Request, res: Response) {
+  const userId = (req as any).user?.id;
+  const { ids } = req.body;
+  const where: Record<string, unknown> = { userId, isRead: false };
+  if (ids && Array.isArray(ids)) where.id = { in: ids };
+  await prisma.notification.updateMany({ where, data: { isRead: true, readAt: new Date() } });
+  res.json({ success: true });
+}

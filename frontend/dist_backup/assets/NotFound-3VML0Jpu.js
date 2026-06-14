@@ -1,0 +1,6 @@
+import{c as a,j as e,B as s}from"./index-DySgS_qq.js";import{d as n}from"./vendor-DsgdNR_k.js";import"./charts-CcB0lBwR.js";/**
+ * @license lucide-react v0.454.0 - ISC
+ *
+ * This source code is licensed under the ISC license.
+ * See the LICENSE file in the root directory of this source tree.
+ */const r=a("House",[["path",{d:"M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8",key:"5wwlr5"}],["path",{d:"M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z",key:"1d0kgt"}]]);function o(){const t=n();return e.jsx("div",{className:"min-h-screen bg-gradient-to-br from-blue-950 to-blue-900 flex items-center justify-center p-4",children:e.jsxs("div",{className:"text-center",children:[e.jsx("div",{className:"w-20 h-20 bg-orange-500 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-lg",children:e.jsx(s,{className:"w-11 h-11 text-white"})}),e.jsx("h1",{className:"text-8xl font-black text-white mb-2",children:"404"}),e.jsx("p",{className:"text-blue-200 text-lg mb-8",children:"Página no encontrada"}),e.jsxs("button",{onClick:()=>t("/dashboard"),className:"btn-primary",children:[e.jsx(r,{className:"w-4 h-4"})," Volver al Inicio"]})]})})}export{o as default};

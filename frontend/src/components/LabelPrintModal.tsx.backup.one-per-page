@@ -1,0 +1,379 @@
+import React, { useRef } from 'react';
+import Barcode from 'react-barcode';
+
+interface LabelPrintModalProps {
+  productName: string;
+  sku: string;
+  barcode: string;
+  quantity: number;
+  onClose: () => void;
+}
+
+export const LabelPrintModal: React.FC<LabelPrintModalProps> = ({
+  productName,
+  sku,
+  barcode,
+  quantity,
+  onClose
+}) => {
+  const labelRef = useRef<HTMLDivElement>(null);
+
+  const handlePrint = () => {
+    const printWindow = window.open('', '_blank', 'width=800,height=600');
+    if (!printWindow) {
+      alert('❌ No se pudo abrir la ventana de impresión. Permite las ventanas emergentes.');
+      return;
+    }
+
+    // Configuración matemática para 32mm x 25mm en Carta
+    const LABEL_WIDTH = 32;
+    const LABEL_HEIGHT = 25;
+    const GAP = 2;
+    const COLS = 5;
+    const ROWS = 9;
+    const LABELS_PER_PAGE = COLS * ROWS; // 45 etiquetas
+    const totalPages = Math.ceil(quantity / LABELS_PER_PAGE);
+    
+    // Generar HTML
+    let pagesHTML = '';
+    
+    for (let page = 0; page < totalPages; page++) {
+      const startIdx = page * LABELS_PER_PAGE;
+      const endIdx = Math.min(startIdx + LABELS_PER_PAGE, quantity);
+      const labelsOnPage = endIdx - startIdx;
+      
+      let labelsHTML = '';
+      for (let i = startIdx; i < endIdx; i++) {
+        labelsHTML += `
+        <div class="label-card">
+          <div class="label-header">Taller y Repuestos Clavijos</div>
+          <div class="label-name">${productName}</div>
+          <div class="label-barcode">
+            <div class="sku">SKU: ${sku}</div>
+            <img src="https://barcode.tec-it.com/barcode.ashx?data=${barcode}&code=Code128&translate-esc=on" alt="Barcode" />
+            <div class="number">${barcode}</div>
+          </div>
+        </div>`;
+      }
+
+      // Rellenar espacio vacío en la última página para mantener grid
+      const emptySlots = LABELS_PER_PAGE - labelsOnPage;
+      let paddingHTML = '';
+      for(let j=0; j<emptySlots; j++) {
+        paddingHTML += `<div class="empty-slot"></div>`;
+      }
+
+      pagesHTML += `
+      <div class="print-page">
+        <div class="page-header no-print">
+          <span>Página ${page + 1} de ${totalPages}</span>
+          <span>${labelsOnPage} etiquetas</span>
+        </div>
+        <div class="grid-container">
+          ${labelsHTML}
+          ${paddingHTML}
+        </div>
+      </div>`;
+    }
+
+    const printHTML = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>Etiquetas - ${quantity} unidades</title>
+          <style>
+            @page {
+              size: letter portrait;
+              margin: 10mm;
+            }
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+              font-family: 'Helvetica Neue', Arial, sans-serif;
+              background: #f1f5f9;
+              -webkit-print-color-adjust: exact;
+            }
+            
+            /* =========================================
+               UI DE CONTROL (NO IMPRIME)
+               ========================================= */
+            .toolbar {
+              background: #0f172a;
+              color: white;
+              padding: 16px 24px;
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              position: sticky;
+              top: 0;
+              z-index: 100;
+              box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            .toolbar h1 { font-size: 18px; font-weight: 600; }
+            .toolbar .info { font-size: 13px; opacity: 0.8; }
+            .toolbar .count { font-size: 24px; font-weight: 700; }
+            
+            .actions {
+              display: flex;
+              gap: 12px;
+              background: white;
+              padding: 12px 24px;
+              border-bottom: 1px solid #e2e8f0;
+            }
+            .btn {
+              padding: 8px 20px;
+              border-radius: 6px;
+              font-size: 14px;
+              font-weight: 600;
+              cursor: pointer;
+              border: none;
+              transition: all 0.2s;
+            }
+            .btn-cancel { background: #e2e8f0; color: #334155; }
+            .btn-cancel:hover { background: #cbd5e1; }
+            .btn-print { background: #0284c7; color: white; }
+            .btn-print:hover { background: #0369a1; }
+
+            /* =========================================
+               GRID DE PÁGINAS
+               ========================================= */
+            .print-preview {
+              display: flex;
+              flex-direction: column;
+              align-items: center;
+              gap: 20px;
+              padding: 20px;
+            }
+
+            .print-page {
+              width: 216mm; /* Letter Width */
+              height: 279mm; /* Letter Height */
+              background: white;
+              padding: 10mm;
+              box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+              position: relative;
+            }
+
+            .page-header {
+              display: flex;
+              justify-content: space-between;
+              font-size: 12px;
+              color: #64748b;
+              margin-bottom: 10mm;
+              border-bottom: 1px solid #e2e8f0;
+              padding-bottom: 4px;
+            }
+
+            /* =========================================
+               GRID DE ETIQUETAS (5 columnas x 9 filas)
+               ========================================= */
+            .grid-container {
+              display: grid;
+              grid-template-columns: repeat(5, 1fr);
+              grid-template-rows: repeat(9, 1fr);
+              width: 100%;
+              height: 259mm; /* 279mm - 20mm margins */
+              gap: 0; /* Handled by borders */
+            }
+
+            /* =========================================
+               DISEÑO DE ETIQUETA (32mm x 25mm)
+               ========================================= */
+            .label-card {
+              width: 32mm;
+              height: 25mm;
+              padding: 1mm;
+              display: flex;
+              flex-direction: column;
+              align-items: center;
+              justify-content: space-between;
+              border-right: 0.5px dashed #cbd5e1;
+              border-bottom: 0.5px dashed #cbd5e1;
+              background: white;
+              position: relative;
+              overflow: hidden;
+            }
+
+            /* Eliminar bordes derechos de la última columna */
+            .label-card:nth-child(5n) { border-right: none; }
+            /* Eliminar bordes inferiores de la última fila */
+            .label-card:nth-last-child(-n+5) { border-bottom: none; }
+
+            .label-header {
+              font-size: 5.5px;
+              font-weight: 700;
+              text-transform: uppercase;
+              letter-spacing: 0.3px;
+              color: #0f172a;
+              border-bottom: 0.5px solid #0f172a;
+              width: 100%;
+              text-align: center;
+              padding-bottom: 0.5mm;
+              margin-bottom: 0.5mm;
+              white-space: nowrap;
+              overflow: hidden;
+            }
+
+            .label-name {
+              font-size: 6.5px;
+              font-weight: 600;
+              text-align: center;
+              line-height: 1.15;
+              color: #1e293b;
+              flex-grow: 1;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              word-break: break-word;
+              overflow: hidden;
+              max-height: 8mm;
+              padding: 0 0.5mm;
+            }
+
+            .label-barcode {
+              text-align: center;
+              margin-top: auto;
+            }
+
+            .sku {
+              font-size: 5.5px;
+              font-family: 'Courier New', monospace;
+              font-weight: 700;
+              color: #334155;
+              margin-bottom: 0.3mm;
+            }
+
+            .label-barcode img {
+              max-width: 26mm;
+              max-height: 10mm;
+              height: auto;
+              display: block;
+              margin: 0 auto;
+            }
+
+            .number {
+              font-size: 5.5px;
+              font-family: 'Courier New', monospace;
+              color: #64748b;
+              margin-top: 0.3mm;
+              letter-spacing: 0.3px;
+            }
+
+            .empty-slot {
+              visibility: hidden;
+              pointer-events: none;
+            }
+
+            /* =========================================
+               REGLAS DE IMPRESIÓN
+               ========================================= */
+            @media print {
+              body { background: white; padding: 0; margin: 0; }
+              .no-print { display: none !important; }
+              .toolbar, .actions { display: none !important; }
+              
+              .print-preview {
+                display: block;
+                padding: 0;
+                gap: 0;
+              }
+
+              .print-page {
+                width: 100%;
+                height: 100vh;
+                box-shadow: none;
+                padding: 0;
+                margin: 0;
+                page-break-after: always;
+                break-after: page;
+              }
+              
+              .print-page:last-child {
+                page-break-after: auto;
+              }
+
+              .page-header { display: none; }
+            }
+          </style>
+        </head>
+        <body>
+          <div class="toolbar no-print">
+            <div>
+              <h1>🏷️ Impresión de Etiquetas</h1>
+              <div class="info">${productName}</div>
+            </div>
+            <div style="text-align: right;">
+              <div class="count">${quantity}</div>
+              <div class="info">unidades · 32x25mm</div>
+            </div>
+          </div>
+          
+          <div class="actions no-print">
+            <button class="btn btn-cancel" onclick="window.close()">Cancelar</button>
+            <button class="btn btn-print" onclick="window.print()">🖨️ Imprimir Ahora</button>
+          </div>
+
+          <div class="print-preview">
+            ${pagesHTML}
+          </div>
+        </body>
+      </html>
+    `;
+
+    printWindow.document.write(printHTML);
+    printWindow.document.close();
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg overflow-hidden animate-in fade-in zoom-in duration-200">
+        {/* Header del Modal */}
+        <div className="px-6 py-4 border-b border-gray-100 flex justify-between items-center bg-gray-50/50">
+          <h3 className="text-lg font-bold text-gray-800">Vista Previa de Etiqueta</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 transition-colors p-1 rounded-full hover:bg-gray-100">
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+          </button>
+        </div>
+
+        {/* Cuerpo del Modal */}
+        <div className="p-8 flex flex-col items-center bg-gray-100/50">
+          <div ref={labelRef} className="bg-white rounded border border-gray-300 shadow-md flex flex-col items-center justify-between" style={{ width: '32mm', height: '25mm', padding: '1.5mm 2mm' }}>
+            <div className="w-full text-center border-b border-gray-900 pb-0.5 mb-0.5">
+              <span className="text-[6px] font-bold uppercase tracking-widest text-gray-900 leading-none">
+                Taller y Repuestos Clavijos
+              </span>
+            </div>
+            <div className="w-full text-center font-semibold text-gray-800 flex-grow flex items-center justify-center px-0.5 leading-tight overflow-hidden" style={{ fontSize: '6.5px', maxHeight: '7mm' }}>
+              {productName}
+            </div>
+            <div className="w-full flex flex-col items-center mt-auto">
+              <span className="text-[5.5px] font-mono font-bold text-gray-700 mb-0.5 tracking-wide">SKU: {sku}</span>
+              <Barcode value={barcode} format="CODE128" width={1.2} height={16} displayValue={false} margin={0} />
+              <span className="text-[5.5px] font-mono text-gray-600 mt-0.5 tracking-wider">{barcode}</span>
+            </div>
+          </div>
+          
+          <div className="mt-6 text-center">
+            <p className="text-sm text-gray-600">
+              Se imprimirán <strong className="text-sky-600">{quantity}</strong> etiquetas idénticas según el stock.
+            </p>
+            <p className="text-xs text-gray-400 mt-1">Formato: 32mm x 25mm · 45 por página</p>
+          </div>
+        </div>
+
+        {/* Footer del Modal */}
+        <div className="px-6 py-4 border-t border-gray-100 flex justify-between items-center bg-gray-50">
+          <button onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-200 rounded-lg transition-colors">
+            Cancelar
+          </button>
+          <button 
+            onClick={handlePrint} 
+            className="px-6 py-2 text-sm font-semibold text-white bg-sky-600 hover:bg-sky-700 rounded-lg shadow-sm flex items-center gap-2 transition-all transform hover:scale-105 active:scale-95"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z" /></svg>
+            Imprimir {quantity} Etiquetas
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};

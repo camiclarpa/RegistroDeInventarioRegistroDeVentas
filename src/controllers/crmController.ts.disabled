@@ -1,0 +1,358 @@
+import { Request, Response } from 'express';
+import { z } from 'zod';
+import { PaymentMethod } from '@prisma/client';
+import { logger } from '../config/logger';
+import {
+  searchCustomersCRM, listCustomersCRM, getCustomer360, addCommunicationLog,
+  calculateLoyalty, addMotorcycle, updateMotorcycle, createReminder,
+} from '../services/crmService';
+import {
+  checkCreditLimit, createCredit, registerCreditPayment,
+  getCustomerCredits, updateCreditLimit,
+} from '../services/creditService';
+import {
+  getActiveWarranties, getAllWarranties, markWarrantyClaimed,
+} from '../services/warrantyService';
+import { createOrUpdateCustomer, createNewCustomer, updateCustomer } from '../services/customerService';
+
+import {
+  createCommunication, listCommunications, markCommunicationRead, getUnreadCount,
+} from '../services/communicationService';
+import {
+  createTicket, listTickets, updateTicket, getTicketById,
+} from '../services/ticketService';
+import {
+  createQuote, listQuotes, updateQuoteStatus, getQuoteById,
+} from '../services/quoteService';
+import {
+  createWorkshopVisit, listWorkshopVisits, getWorkshopSummary,
+} from '../services/workshopService';
+
+import { refreshCustomerRfm, refreshAllRfm, getCrmKpis } from '../services/crmAnalyticsService';
+
+function getUserId(req: Request): string {
+  return (req as any).user?.id ?? 'system';
+}
+
+// Helper para convertir req.params[key] a string (maneja string | string[])
+function getParam(req: Request, key: string): string {
+  const val = req.params[key];
+  return Array.isArray(val) ? val[0] : String(val ?? '');
+}
+
+function handleError(res: Response, err: unknown, context: string) {
+  const message = err instanceof Error ? err.message : 'Error interno';
+  const code = (err as any)?.code;
+  logger.error(`[crmController] ${context}:`, err);
+  if (code === 'CREDIT_LIMIT_EXCEEDED') return res.status(400).json({ error: message, code });
+  if (message.includes('no encontrado') || message.includes('not found')) return res.status(404).json({ error: message });
+  return res.status(500).json({ error: message });
+}
+
+const createCustomerSchema = z.object({
+  name: z.string().min(2), phone: z.string().min(7).optional(),
+  email: z.string().email().optional(), identificationNumber: z.string().optional(),
+  address: z.string().optional(), notes: z.string().optional(),
+  preferences: z.string().optional(), tags: z.array(z.string()).optional(),
+  creditLimit: z.number().positive().optional(),
+});
+const updateCustomerSchema = createCustomerSchema.partial();
+const createCreditSchema = z.object({
+  saleId: z.string().cuid(), customerId: z.string().cuid(),
+  totalAmount: z.number().positive(),
+  dueDate: z.string().datetime({ offset: true }).or(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)),
+});
+const paymentSchema = z.object({
+  amount: z.number().positive(), paymentMethod: z.nativeEnum(PaymentMethod),
+  notes: z.string().optional(), cashRegisterId: z.string().optional(),
+});
+const motorcycleSchema = z.object({
+  plate: z.string().min(3).max(10), brand: z.string().min(2), model: z.string().min(1),
+  year: z.number().int().min(1990).max(2030).optional(), lastKm: z.number().int().min(0).optional(),
+});
+const reminderSchema = z.object({ type: z.string().min(2), message: z.string().min(3), dueDate: z.string() });
+const claimSchema = z.object({ notes: z.string().min(3) });
+const communicationSchema = z.object({ customerId: z.string().cuid(), type: z.string().min(2), message: z.string().min(3) });
+
+export async function searchCustomers(req: Request, res: Response) {
+  try { const q = String(req.query['q'] ?? '').trim(); if (q.length < 2) return res.json([]); return res.json(await searchCustomersCRM(q)); }
+  catch (err) { return handleError(res, err, 'searchCustomers'); }
+}
+export async function listCustomers(req: Request, res: Response) {
+  try {
+    const page = Math.max(1, parseInt(String(req.query['page'] ?? '1')));
+    const limit = Math.min(100, parseInt(String(req.query['limit'] ?? '20')));
+    return res.json(await listCustomersCRM({ page, limit, tier: req.query['tier'] as string | undefined, search: req.query['search'] as string | undefined }));
+  } catch (err) { return handleError(res, err, 'listCustomers'); }
+}
+export async function getCustomerDetail(req: Request, res: Response) {
+  try { const c = await getCustomer360(getParam(req, 'id')); if (!c) return res.status(404).json({ error: 'Cliente no encontrado' }); return res.json(c); }
+  catch (err) { return handleError(res, err, 'getCustomerDetail'); }
+}
+export async function createCustomer(req: Request, res: Response) {
+  try { return res.status(201).json(await createNewCustomer(createCustomerSchema.parse(req.body))); }
+  catch (err) { if (err instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: err.issues }); return handleError(res, err, 'createCustomer'); }
+}
+export async function patchCustomer(req: Request, res: Response) {
+  try { return res.json(await updateCustomer(getParam(req, 'id'), updateCustomerSchema.parse(req.body))); }
+  catch (err) { if (err instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: err.issues }); return handleError(res, err, 'patchCustomer'); }
+}
+export async function setCreditLimit(req: Request, res: Response) {
+  try { const { limit } = req.body as { limit: number | null }; return res.json(await updateCreditLimit(getParam(req, 'id'), limit, getUserId(req))); }
+  catch (err) { return handleError(res, err, 'setCreditLimit'); }
+}
+export async function getCredits(req: Request, res: Response) {
+  try { return res.json(await getCustomerCredits(getParam(req, 'id'))); }
+  catch (err) { return handleError(res, err, 'getCredits'); }
+}
+export async function postCredit(req: Request, res: Response) {
+  try { const { saleId, customerId, totalAmount, dueDate } = createCreditSchema.parse(req.body); return res.status(201).json(await createCredit(saleId, customerId, totalAmount, new Date(dueDate), getUserId(req))); }
+  catch (err) { if (err instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: err.issues }); return handleError(res, err, 'postCredit'); }
+}
+export async function checkLimit(req: Request, res: Response) {
+  try { return res.json(await checkCreditLimit(getParam(req, 'id'), parseFloat(String(req.query['amount'] ?? '0')))); }
+  catch (err) { return handleError(res, err, 'checkLimit'); }
+}
+export async function payCreditInstallment(req: Request, res: Response) {
+  try { const { amount, paymentMethod, notes, cashRegisterId } = paymentSchema.parse(req.body); return res.json(await registerCreditPayment(getParam(req, 'id'), amount, paymentMethod, getUserId(req), notes, cashRegisterId)); }
+  catch (err) { if (err instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: err.issues }); return handleError(res, err, 'payCreditInstallment'); }
+}
+export async function getWarranties(req: Request, res: Response) {
+  try { const sf = req.query['status'] as string | undefined; const cid = getParam(req, 'id'); return res.json(sf === 'all' ? await getAllWarranties(cid) : await getActiveWarranties(cid)); }
+  catch (err) { return handleError(res, err, 'getWarranties'); }
+}
+export async function claimWarranty(req: Request, res: Response) {
+  try { const { notes } = claimSchema.parse(req.body); return res.json(await markWarrantyClaimed(getParam(req, 'id'), notes)); }
+  catch (err) { if (err instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: err.issues }); return handleError(res, err, 'claimWarranty'); }
+}
+export async function postCommunication(req: Request, res: Response) {
+  try { const { customerId, type, message } = communicationSchema.parse(req.body); return res.status(201).json(await addCommunicationLog(customerId, type, message, getUserId(req))); }
+  catch (err) { if (err instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: err.issues }); return handleError(res, err, 'postCommunication'); }
+}
+export async function postMotorcycle(req: Request, res: Response) {
+  try { return res.status(201).json(await addMotorcycle(getParam(req, 'id'), motorcycleSchema.parse(req.body))); }
+  catch (err) { if (err instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: err.issues }); return handleError(res, err, 'postMotorcycle'); }
+}
+export async function patchMotorcycle(req: Request, res: Response) {
+  try { return res.json(await updateMotorcycle(getParam(req, 'id'), motorcycleSchema.partial().parse(req.body))); }
+  catch (err) { if (err instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: err.issues }); return handleError(res, err, 'patchMotorcycle'); }
+}
+export async function postReminder(req: Request, res: Response) {
+  try { const { type, message, dueDate } = reminderSchema.parse(req.body); return res.status(201).json(await createReminder(getParam(req, 'id'), type, message, new Date(dueDate))); }
+  catch (err) { if (err instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: err.issues }); return handleError(res, err, 'postReminder'); }
+}
+export async function addLoyaltyPoints(req: Request, res: Response) {
+  try { const { amount } = req.body as { amount: number }; if (!amount || amount <= 0) return res.status(400).json({ error: 'amount debe ser mayor que cero' }); return res.json(await calculateLoyalty(getParam(req, 'id'), amount)); }
+  catch (err) { return handleError(res, err, 'addLoyaltyPoints'); }
+}
+
+// ─── ANALYTICS / RFM ─────────────────────────────────────────────────────────
+export async function getRfmAnalytics(req: Request, res: Response) {
+  try {
+    const kpis = await getCrmKpis();
+    return res.json(kpis);
+  } catch (err) { return handleError(res, err, 'getRfmAnalytics'); }
+}
+
+export async function getCustomerRfm(req: Request, res: Response) {
+  try {
+    const customerId = getParam(req, 'id');
+    const rfm = await refreshCustomerRfm(customerId);
+    if (!rfm) return res.status(404).json({ error: 'Cliente no encontrado' });
+    return res.json(rfm);
+  } catch (err) { return handleError(res, err, 'getCustomerRfm'); }
+}
+
+export async function refreshAllCustomersRfm(req: Request, res: Response) {
+  try {
+    const updated = await refreshAllRfm();
+    return res.json({ success: true, updated });
+  } catch (err) { return handleError(res, err, 'refreshAllCustomersRfm'); }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMUNICACIONES
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function listCommunicationsHandler(req: Request, res: Response) {
+  try {
+    const page = Math.max(1, parseInt(String(req.query['page'] ?? '1')));
+    const limit = Math.min(100, parseInt(String(req.query['limit'] ?? '20')));
+    const customerId = req.query['customerId'] as string | undefined;
+    const channel = req.query['channel'] as string | undefined;
+    const status = req.query['status'] as string | undefined;
+    
+    const result = await listCommunications({ page, limit, customerId, channel, status });
+    return res.json(result);
+  } catch (err) { return handleError(res, err, 'listCommunicationsHandler'); }
+}
+
+export async function createCommunicationHandler(req: Request, res: Response) {
+  try {
+    const { customerId, channel, message, direction, metadata } = req.body;
+    const result = await createCommunication({
+      customerId,
+      channel,
+      message,
+      direction: direction || 'OUTBOUND',
+      sentByUserId: getUserId(req),
+      metadata,
+    });
+    return res.status(201).json(result);
+  } catch (err) { return handleError(res, err, 'createCommunicationHandler'); }
+}
+
+export async function markCommunicationReadHandler(req: Request, res: Response) {
+  try {
+    const id = getParam(req, 'id');
+    await markCommunicationRead(id);
+    return res.json({ success: true });
+  } catch (err) { return handleError(res, err, 'markCommunicationReadHandler'); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TICKETS
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function listTicketsHandler(req: Request, res: Response) {
+  try {
+    const page = Math.max(1, parseInt(String(req.query['page'] ?? '1')));
+    const limit = Math.min(100, parseInt(String(req.query['limit'] ?? '20')));
+    const customerId = req.query['customerId'] as string | undefined;
+    const status = req.query['status'] as string | undefined;
+    
+    const result = await listTickets({ page, limit, customerId, status });
+    return res.json(result);
+  } catch (err) { return handleError(res, err, 'listTicketsHandler'); }
+}
+
+export async function createTicketHandler(req: Request, res: Response) {
+  try {
+    const { customerId, subject, description, priority, assignedTo } = req.body;
+    const result = await createTicket({
+      customerId,
+      subject,
+      description,
+      priority: priority || 'MEDIUM',
+      assignedTo,
+    });
+    return res.status(201).json(result);
+  } catch (err) { return handleError(res, err, 'createTicketHandler'); }
+}
+
+export async function updateTicketHandler(req: Request, res: Response) {
+  try {
+    const id = getParam(req, 'id');
+    const { status, priority, assignedTo, resolution } = req.body;
+    const result = await updateTicket(id, { status, priority, assignedTo, resolution });
+    return res.json(result);
+  } catch (err) { return handleError(res, err, 'updateTicketHandler'); }
+}
+
+export async function getTicketHandler(req: Request, res: Response) {
+  try {
+    const id = getParam(req, 'id');
+    const result = await getTicketById(id);
+    if (!result) return res.status(404).json({ error: 'Ticket no encontrado' });
+    return res.json(result);
+  } catch (err) { return handleError(res, err, 'getTicketHandler'); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COTIZACIONES
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function listQuotesHandler(req: Request, res: Response) {
+  try {
+    const page = Math.max(1, parseInt(String(req.query['page'] ?? '1')));
+    const limit = Math.min(100, parseInt(String(req.query['limit'] ?? '20')));
+    const customerId = req.query['customerId'] as string | undefined;
+    const status = req.query['status'] as string | undefined;
+    
+    const result = await listQuotes({ page, limit, customerId, status });
+    return res.json(result);
+  } catch (err) { return handleError(res, err, 'listQuotesHandler'); }
+}
+
+export async function createQuoteHandler(req: Request, res: Response) {
+  try {
+    const { customerId, items, discount, expiresAt, notes } = req.body;
+    const result = await createQuote({
+      customerId,
+      items,
+      discount: discount || 0,
+      expiresAt: expiresAt ? new Date(expiresAt) : undefined,
+      createdById: getUserId(req),
+    });
+    return res.status(201).json(result);
+  } catch (err) { return handleError(res, err, 'createQuoteHandler'); }
+}
+
+export async function updateQuoteHandler(req: Request, res: Response) {
+  try {
+    const id = getParam(req, 'id');
+    const { status } = req.body;
+    if (!status) return res.status(400).json({ error: 'Status requerido' });
+    const result = await updateQuoteStatus(id, status);
+    return res.json(result);
+  } catch (err) { return handleError(res, err, 'updateQuoteHandler'); }
+}
+
+export async function getQuoteHandler(req: Request, res: Response) {
+  try {
+    const id = getParam(req, 'id');
+    const result = await getQuoteById(id);
+    if (!result) return res.status(404).json({ error: 'Cotización no encontrada' });
+    return res.json(result);
+  } catch (err) { return handleError(res, err, 'getQuoteHandler'); }
+}
+
+export async function deleteQuoteHandler(req: Request, res: Response) {
+  try {
+    const id = getParam(req, 'id');
+    // No existe deleteQuote, marcamos como CANCELLED
+    await updateQuoteStatus(id, 'CANCELLED');
+    return res.json({ success: true, message: 'Cotización cancelada' });
+  } catch (err) { return handleError(res, err, 'deleteQuoteHandler'); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TALLER (WORKSHOP)
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function listWorkshopVisitsHandler(req: Request, res: Response) {
+  try {
+    const page = Math.max(1, parseInt(String(req.query['page'] ?? '1')));
+    const limit = Math.min(100, parseInt(String(req.query['limit'] ?? '20')));
+    const customerId = req.query['customerId'] as string | undefined;
+    
+    const result = await listWorkshopVisits({ page, limit, customerId });
+    return res.json(result);
+  } catch (err) { return handleError(res, err, 'listWorkshopVisitsHandler'); }
+}
+
+export async function createWorkshopVisitHandler(req: Request, res: Response) {
+  try {
+    const { customerId, motorcycleId, kmReal, services, technician, totalCost, notes, nextServiceKm } = req.body;
+    const result = await createWorkshopVisit({
+      customerId,
+      motorcycleId,
+      kmReal,
+      services,
+      technician,
+      totalCost,
+      notes,
+      nextServiceKm,
+    });
+    return res.status(201).json(result);
+  } catch (err) { return handleError(res, err, 'createWorkshopVisitHandler'); }
+}
+
+export async function getWorkshopVisitHandler(req: Request, res: Response) {
+  try {
+    const customerId = getParam(req, 'id');
+    const result = await getWorkshopSummary(customerId);
+    return res.json(result);
+  } catch (err) { return handleError(res, err, 'getWorkshopVisitHandler'); }
+}

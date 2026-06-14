@@ -1,0 +1,70 @@
+import axios, { AxiosInstance, InternalAxiosRequestConfig } from 'axios'
+
+const API_BASE_URL = (import.meta as any)?.env?.VITE_API_BASE_URL || '/api/v1'
+
+const api: AxiosInstance = axios.create({
+  baseURL: API_BASE_URL,
+  withCredentials: true,
+  headers: { 'Content-Type': 'application/json' },
+})
+
+// ✅ INTERCEPTOR CON LOGS EXTENSOS PARA DEBUG
+api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
+  console.log('🔍 INTERCEPTOR - URL:', config.url)
+  console.log('🔍 INTERCEPTOR - Headers antes:', config.headers)
+  
+  try {
+    if (typeof window !== 'undefined') {
+      const authStorage = localStorage.getItem('sigc-auth')
+      console.log('🔍 INTERCEPTOR - Auth storage:', authStorage ? 'EXISTS' : 'NULL')
+      
+      if (authStorage) {
+        const parsed = JSON.parse(authStorage)
+        console.log('🔍 INTERCEPTOR - Parsed:', parsed)
+        
+        const token = 
+          parsed?.state?.token ||
+          parsed?.token ||
+          parsed?.user?.token ||
+          parsed?.state?.user?.token
+        
+        console.log('🔍 INTERCEPTOR - Token extraído:', token ? token.substring(0, 30) + '...' : 'NULL')
+        
+        if (token) {
+          console.log('✅ INTERCEPTOR - Agregando Authorization header')
+          config.headers.Authorization = `Bearer ${token}`
+          console.log('✅ INTERCEPTOR - Headers después:', config.headers)
+        } else {
+          console.error('❌ INTERCEPTOR - Token NO encontrado en parsed')
+          console.log('  parsed.state:', parsed.state)
+          console.log('  parsed.token:', parsed.token)
+        }
+      } else {
+        console.error('❌ INTERCEPTOR - No hay auth en localStorage')
+      }
+    } else {
+      console.warn('⚠️  INTERCEPTOR - typeof window es undefined')
+    }
+  } catch (e) {
+    console.error('❌ INTERCEPTOR - Error en try/catch:', e)
+  }
+  
+  return config
+})
+
+api.interceptors.response.use(
+  (response) => {
+    console.log('✅ RESPONSE:', response.config.url, 'Status:', response.status)
+    return response
+  },
+  (error) => {
+    console.error('❌ RESPONSE ERROR:', error.config?.url, 'Status:', error.response?.status)
+    if (error.response?.status === 401 && typeof window !== 'undefined') {
+      console.error('🔒 401 - Disparando evento sigc:unauthorized')
+      window.dispatchEvent(new CustomEvent('sigc:unauthorized'))
+    }
+    return Promise.reject(error)
+  }
+)
+
+export default api

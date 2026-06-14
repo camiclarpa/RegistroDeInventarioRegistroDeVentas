@@ -1,0 +1,17 @@
+import { Router } from 'express';
+import { authenticate, authorize } from '../middleware/authMiddleware';
+import * as supplierCtrl from '../controllers/supplierController';
+
+const router = Router();
+
+const canRead = [authenticate, authorize('purchases.read')];
+const canWrite = [authenticate, authorize('purchases.write')];
+
+router.get('/', ...canRead, supplierCtrl.getSuppliers);
+router.get('/:id', ...canRead, supplierCtrl.getSupplierById);
+router.post('/', ...canWrite, supplierCtrl.createSupplier);
+router.delete('/:id', ...canWrite, supplierCtrl.deactivateSupplierHandler);
+
+router.patch('/:id/reactivate', ...canWrite, supplierCtrl.reactivateSupplierHandler);
+
+export default router;

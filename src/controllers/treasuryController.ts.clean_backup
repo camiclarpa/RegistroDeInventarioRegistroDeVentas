@@ -1,0 +1,417 @@
+import { Request, Response } from 'express';
+import { ZodError } from 'zod';
+import { Prisma } from '@prisma/client';
+import {
+  openCashShiftSchema,
+  registerExpenseSchema,
+  closeCashShiftSchema,
+  dailySummaryQuerySchema,
+} from '../utils/validators';
+import * as treasuryService from '../services/treasuryService';
+import * as bankingService from '../services/bankingService';
+import * as taxService from '../services/taxService';
+import * as cashFlowService from '../services/cashFlowService';
+import * as budgetService from '../services/budgetService';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+const ok = (res: Response, data: unknown, status = 200) =>
+  res.status(status).json({ success: true, data });
+
+const fail = (res: Response, error: string, status = 400, details?: unknown) =>
+  res.status(status).json({ success: false, error, ...(details ? { details } : {}) });
+
+function handleError(res: Response, err: unknown, context: string): Response {
+  logger.error(`[treasuryController] ${context}`, { err });
+  if (err instanceof ZodError) {
+    return fail(res, 'Datos de entrada inválidos', 422, err.flatten());
+  }
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    if (err.code === 'P2002') return fail(res, 'Registro duplicado', 409);
+    if (err.code === 'P2025') return fail(res, 'Registro no encontrado', 404);
+  }
+  if (err instanceof Error) return fail(res, err.message, 400);
+  return fail(res, 'Error interno del servidor', 500);
+}
+
+// ─── POST /api/v1/treasury/open ─────────────────────────────────────────────
+export async function openCashRegister(req: Request, res: Response): Promise<Response> {
+  try {
+    const data = openCashShiftSchema.parse(req.body);
+    // const register = await treasuryService.openCashShift(
+    const register = { id: "temp", message: "Pendiente de implementar" };
+      req.user!.id,
+      parseFloat(data.initialBalance),
+      data.notes,
+    );
+    return ok(res, register, 201);
+  } catch (err) {
+    return handleError(res, err, 'openCashRegister');
+  }
+}
+
+// ─── POST /api/v1/treasury/expenses ─────────────────────────────────────────
+export async function registerExpense(req: Request, res: Response): Promise<Response> {
+  try {
+    const data = registerExpenseSchema.parse(req.body);
+    const tx = { id: "temp", message: "Pendiente de implementar" };
+    const tx = await treasuryService.registerExpenseTransaction(req.user!.id, {
+      amount: parseFloat(data.amount),
+      description: data.description,
+      category: data.category,
+      paymentMethod: data.paymentMethod,
+    });
+    return ok(res, tx, 201);
+  } catch (err) {
+    return handleError(res, err, 'registerExpense');
+  }
+}
+
+// ─── GET /api/v1/treasury/summary ───────────────────────────────────────────
+export async function getDailySummary(req: Request, res: Response): Promise<Response> {
+  try {
+    const query = dailySummaryQuerySchema.parse(req.query);
+    const canViewAll = (req.user as any)?.permissions?.includes('users.admin') || false;
+    const targetUserId = canViewAll && query.userId ? query.userId : (req.user as any)?.id;
+    const summary = await treasuryService.getDailyShiftSummary(targetUserId, query.date);
+    return ok(res, summary);
+  } catch (err) {
+    return handleError(res, err, 'getDailySummary');
+  }
+}
+
+// ─── POST /api/v1/treasury/close ────────────────────────────────────────────
+export async function closeCashRegister(req: Request, res: Response): Promise<Response> {
+  try {
+    const result = { message: "Pendiente de implementar" };
+    const data = closeCashShiftSchema.parse(req.body);
+    const result = await treasuryService.closeCashShift(
+      req.user!.id,
+      parseFloat(data.physicalCount),
+      data.observations,
+    );
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'closeCashRegister');
+  }
+}
+
+// ─── GET /api/v1/treasury/global-summary ────────────────────────────────────
+    const data = { message: "Pendiente de implementar" };
+export async function getGlobalSummary(req: Request, res: Response): Promise<Response> {
+  try {
+    const data = await treasuryService.getGlobalTreasurySummary();
+    return ok(res, data);
+  } catch (err) {
+    return handleError(res, err, 'getGlobalSummary');
+  }
+}
+
+// ─── GET /api/v1/treasury/report ────────────────────────────────────────────
+export async function getDailyReport(req: Request, res: Response): Promise<Response> {
+  try {
+    const rawDate = req.query['date'] as string;
+    const report = { message: "Pendiente de implementar" };
+    const date = rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate)
+      ? rawDate
+      : new Date().toISOString().split('T')[0]!;
+    const report = await treasuryService.generateDailyReport(date);
+    return ok(res, report);
+  } catch (err) {
+    return handleError(res, err, 'getDailyReport');
+  }
+}
+    const shift = { message: "Pendiente de implementar" };
+
+// ─── GET /api/v1/treasury/shift ─────────────────────────────────────────────
+export async function getActiveShift(req: Request, res: Response): Promise<Response> {
+  try {
+    const shift = await treasuryService.getActiveShiftForUser((req.user as any)?.id);
+    return ok(res, shift);
+  } catch (err) {
+    return handleError(res, err, 'getActiveShift');
+  }
+}
+
+// ─── GET /api/v1/treasury/cash-register ─────────────────────────────────────
+export async function getCashRegisters(req: Request, res: Response): Promise<Response> {
+  try {
+    const page = Math.max(1, parseInt(String(req.query['page'] ?? '1')));
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query['limit'] ?? '20'))));
+    const [registers, total] = await Promise.all([
+      prisma.cash_registers.findMany({
+        skip: (page - 1) * limit,
+        take: limit,
+        orderBy: { openedAt: 'desc' },
+        include: {
+          openedBy: { select: { id: true, name: true } },
+          closedBy: { select: { id: true, name: true } },
+        },
+      }),
+      prisma.cash_registers.count(),
+    ]);
+    return ok(res, { registers, total, page, limit, totalPages: Math.ceil(total / limit) });
+  } catch (err) {
+    return handleError(res, err, 'getCashRegisters');
+  }
+}
+
+// ─── GET /api/v1/treasury/transactions ──────────────────────────────────────
+export async function getTransactions(req: Request, res: Response): Promise<Response> {
+  try {
+    const cashRegisterId = req.query['cashRegisterId'] as string | undefined;
+    const page = Math.max(1, parseInt(String(req.query['page'] ?? '1')));
+      const activeShift = null;
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query['limit'] ?? '50'))));
+    const where: any = {};
+    if (cashRegisterId) {
+      where.cashRegisterId = cashRegisterId;
+    } else {
+      const activeShift = await treasuryService.getActiveShiftForUser((req.user as any)?.id);
+      if (activeShift) {
+        where.cashRegisterId = activeShift.id;
+      } else {
+        return ok(res, { transactions: [], total: 0, page, limit, totalPages: 0 });
+      }
+    }
+    const [transactions, total] = await Promise.all([
+      prisma.financial_transactions.findMany({
+        where,
+        skip: (page - 1) * limit,
+        take: limit,
+        orderBy: { timestamp: 'desc' },
+        include: { performedBy: { select: { id: true, name: true } } },
+      }),
+      prisma.financial_transactions.count({ where }),
+    ]);
+    return ok(res, { transactions, total, page, limit, totalPages: Math.ceil(total / limit) });
+  } catch (err) {
+    return handleError(res, err, 'getTransactions');
+  }
+}
+
+// ─── POST /api/v1/treasury/deposits ─────────────────────────────────────────
+export async function createDeposit(req: Request, res: Response): Promise<Response> {
+  try {
+    const { amount, bankName, accountNumber, reference, depositDate, notes, cashRegisterId } = req.body;
+    if (!amount || !bankName || !depositDate) return fail(res, 'amount, bankName y depositDate son requeridos', 400);
+    const deposit = await bankingService.createDeposit((req.user as any)?.id, {
+      amount: parseFloat(amount),
+      bankName,
+      accountNumber,
+      reference,
+      depositDate: new Date(depositDate),
+      notes,
+      cashRegisterId,
+    });
+    return ok(res, deposit, 201);
+  } catch (err) {
+    return handleError(res, err, 'createDeposit');
+  }
+}
+
+// ─── GET /api/v1/treasury/deposits ──────────────────────────────────────────
+export async function getDeposits(req: Request, res: Response): Promise<Response> {
+  try {
+    const rawDate = req.query['date'] as string;
+    const date = rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : undefined;
+    const deposits = await bankingService.getDeposits(date);
+    return ok(res, deposits);
+  } catch (err) {
+    return handleError(res, err, 'getDeposits');
+  }
+}
+
+    const updated = { id, status, message: "Pendiente de implementar" };
+// ─── PATCH /api/v1/treasury/deposits/:id/status ─────────────────────────────
+export async function updateDepositStatus(req: Request, res: Response): Promise<Response> {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    if (!status) return fail(res, 'Status requerido', 400);
+    const updated = await bankingService.updateDepositStatus(id, status);
+    return ok(res, updated);
+  } catch (err) {
+    return handleError(res, err, 'updateDepositStatus');
+  }
+}
+
+// ─── POST /api/v1/treasury/bank-transfers ───────────────────────────────────
+export async function createBankTransfer(req: Request, res: Response): Promise<Response> {
+  try {
+    const { fromAccount, toAccount, amount, reference, description } = req.body;
+    if (!fromAccount || !toAccount || !amount || !description) return fail(res, 'Campos requeridos', 400);
+    const transfer = await bankingService.createBankTransfer((req.user as any)?.id, {
+      fromAccount,
+      toAccount,
+      amount: parseFloat(amount),
+      reference,
+      description,
+    });
+    return ok(res, transfer, 201);
+  } catch (err) {
+    return handleError(res, err, 'createBankTransfer');
+  }
+}
+
+// ─── GET /api/v1/treasury/bank-transfers ────────────────────────────────────
+export async function getBankTransfers(req: Request, res: Response): Promise<Response> {
+  try {
+    const rawDate = req.query['date'] as string;
+    const date = rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : undefined;
+    const transfers = await bankingService.getBankTransfers(date);
+    return ok(res, transfers);
+  } catch (err) {
+    return handleError(res, err, 'getBankTransfers');
+  }
+}
+
+// ─── GET /api/v1/treasury/in-transit ────────────────────────────────────────
+export async function getInTransitMoney(req: Request, res: Response): Promise<Response> {
+  try {
+    const rawDate = req.query['date'] as string;
+    const date = rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : undefined;
+    const result = await bankingService.getInTransitMoney(date);
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'getInTransitMoney');
+  }
+}
+
+// ─── GET /api/v1/treasury/daily-liquidity ───────────────────────────────────
+export async function getDailyLiquidity(req: Request, res: Response): Promise<Response> {
+  try {
+    const rawDate = req.query['date'] as string;
+    const date = rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : undefined;
+    const result = await bankingService.getDailyLiquidity(date);
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'getDailyLiquidity');
+  }
+}
+
+// ─── GET /api/v1/treasury/tax-summary ───────────────────────────────────────
+export async function getTaxSummary(req: Request, res: Response): Promise<Response> {
+  try {
+    const now = new Date();
+    const month = parseInt(String(req.query['month'] ?? now.getMonth() + 1));
+    const year = parseInt(String(req.query['year'] ?? now.getFullYear()));
+    if (month < 1 || month > 12 || year < 2020) return fail(res, 'Parámetros inválidos', 400);
+    const summary = await taxService.getMonthlyTaxSummary(month, year);
+    return ok(res, summary);
+  } catch (err) {
+    return handleError(res, err, 'getTaxSummary');
+  }
+}
+
+// ─── POST /api/v1/treasury/withholdings ─────────────────────────────────────
+export async function registerWithholding(req: Request, res: Response): Promise<Response> {
+  try {
+    const { transactionId, type, baseAmount } = req.body;
+    if (!transactionId || !type || !baseAmount) return fail(res, 'Campos requeridos', 400);
+    const result = await taxService.registerWithholding(transactionId, type, parseFloat(baseAmount));
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'registerWithholding');
+  }
+}
+
+// ─── GET /api/v1/treasury/withholding-calc ──────────────────────────────────
+export async function calculateWithholding(req: Request, res: Response): Promise<Response> {
+  try {
+    const { type, baseAmount } = req.query;
+    if (!type || !baseAmount) return fail(res, 'Campos requeridos', 400);
+    const calc = taxService.calculateWithholding(parseFloat(baseAmount as string), type as string);
+    return ok(res, calc);
+  } catch (err) {
+    return handleError(res, err, 'calculateWithholding');
+  }
+}
+
+// ─── POST /api/v1/treasury/budgets ──────────────────────────────────────────
+export async function setBudget(req: Request, res: Response): Promise<Response> {
+  try {
+    const { category, month, year, amount } = req.body;
+    if (!category || !month || !year || !amount) return fail(res, 'Campos requeridos', 400);
+    const budget = await budgetService.setBudget((req.user as any)?.id, {
+      category,
+      month: parseInt(month),
+      year: parseInt(year),
+      amount: parseFloat(amount),
+    });
+    return ok(res, budget, 201);
+  } catch (err) {
+    return handleError(res, err, 'setBudget');
+  }
+}
+
+// ─── GET /api/v1/treasury/budgets ───────────────────────────────────────────
+export async function getBudgetVsActual(req: Request, res: Response): Promise<Response> {
+  try {
+    const now = new Date();
+    const month = parseInt(String(req.query['month'] ?? now.getMonth() + 1));
+    const year = parseInt(String(req.query['year'] ?? now.getFullYear()));
+    if (month < 1 || month > 12 || year < 2020) return fail(res, 'Parámetros inválidos', 400);
+    const result = await budgetService.getBudgetVsActual(month, year);
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'getBudgetVsActual');
+  }
+}
+
+// ─── GET /api/v1/treasury/cash-flow-projection ──────────────────────────────
+export async function getCashFlowProjection(req: Request, res: Response): Promise<Response> {
+  try {
+    const rawDays = req.query['days'];
+    const days = typeof rawDays === 'string' ? Math.min(30, Math.max(1, parseInt(rawDays))) : 7;
+    const projection = await cashFlowService.getCashFlowProjection(days);
+    return ok(res, projection);
+  } catch (err) {
+    return handleError(res, err, 'getCashFlowProjection');
+  }
+}
+
+// ─── GET /api/v1/treasury/overdue-receivables ───────────────────────────────
+export async function getOverdueReceivables(req: Request, res: Response): Promise<Response> {
+  try {
+    const result = await cashFlowService.getOverdueReceivables();
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'getOverdueReceivables');
+  }
+}
+
+// ─── GET /api/v1/treasury/executive-kpis ────────────────────────────────────
+export async function getExecutiveKPIs(req: Request, res: Response): Promise<Response> {
+  try {
+    const kpis = await cashFlowService.getExecutiveKPIs();
+    return ok(res, kpis);
+  } catch (err) {
+    return handleError(res, err, 'getExecutiveKPIs');
+  }
+}
+
+// ─── GET /api/v1/treasury/cash-counts ───────────────────────────────────────
+export async function getCashCounts(req: Request, res: Response): Promise<Response> {
+  try {
+    const page = Math.max(1, parseInt(String(req.query['page'] ?? '1')));
+    const limit = Math.min(100, parseInt(String(req.query['limit'] ?? '20')));
+    const skip = (page - 1) * limit;
+
+    const counts = await prisma.cash_counts.findMany({
+      skip,
+      take: limit,
+      orderBy: { countedAt: 'desc' },
+    });
+
+    const total = await prisma.cash_counts.count();
+
+    return ok(res, {
+      data: counts,
+      meta: { total, page, limit, totalPages: Math.ceil(total / limit) },
+    });
+  } catch (err) {
+    return handleError(res, err, 'getCashCounts');
+  }
+}
+

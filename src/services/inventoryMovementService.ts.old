@@ -1,0 +1,51 @@
+import { MovementType } from '@prisma/client';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+interface CreateMovementInput {
+  productId: string;
+  type: string;
+  /** Siempre positivo. El tipo determina el efecto sobre el stock. */
+  quantity: number;
+  unitCost: number | string;
+  referenceDoc?: string;
+  reason?: string;
+  userId?: string;
+}
+
+/**
+ * Crea un registro en InventoryMovement.
+ * No modifica el stock directamente — eso lo hace productService para
+ * mantener la transacción atómica cuando sea necesario.
+ */
+export async function createMovement(data: CreateMovementInput) {
+  const movement = await prisma.inventory_movements.create({
+    data: {
+      product_id: data.productId,
+      type: data.type,
+      quantity: Math.abs(data.quantity), // Siempre positivo
+      unit_cost_at_moment: data.unitCost,
+      reference_doc: data.referenceDoc,
+      reason: data.reason,
+      performed_by_user_id: data.userId,
+    },
+  });
+
+  logger.info('InventoryMovement created', {
+    movementId: movement.id,
+    product_id: data.productId,
+    type: data.type,
+    qty: data.quantity,
+  });
+
+  return movement;
+}
+
+/** Devuelve los últimos N movimientos de un producto, ordenados por fecha. */
+export async function getMovementsByProduct(productId: string, limit = 50) {
+  return prisma.inventory_movements.findMany({
+    where: { product_id: productId },
+    orderBy: { created_at: 'desc' },
+    take: limit,
+  });
+}

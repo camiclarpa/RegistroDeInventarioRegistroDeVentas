@@ -1,0 +1,176 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  SIGC-Motos v2.0 — Docker Compose (Producción)
+#  Dominio:   motos.quantacloud.co
+#  VPS IP:    79.143.181.220
+# ═══════════════════════════════════════════════════════════════════════════
+
+services:
+  # ── 1. Base de datos PostgreSQL ───────────────────────────────────────────
+  db:
+    image: postgres:15-alpine
+    container_name: sigc_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    networks:
+      - sigc-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 40s
+
+  # ── 2. Migraciones Prisma (one-shot) ──────────────────────────────────────
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    container_name: sigc_migrate
+    # Usar db push en lugar de migrate deploy para BD existente
+    command: >
+      sh -c "
+      npx prisma db push --accept-data-loss --skip-generate ||
+      npx prisma migrate resolve --applied '*initial*' ||
+      echo 'Migrate completed or skipped'
+      "
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - sigc-net
+    restart: "no"
+
+  # ── 3. Backend API Node.js + Prisma ───────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: sigc_app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      NODE_ENV:     production
+      PORT:         3000
+      JWT_SECRET:   ${JWT_SECRET}
+      APP_URL:      ${APP_URL:-https://motos.quantacloud.co}
+      BACKUP_DIR:   /backups
+    volumes:
+      - uploads:/app/uploads
+      - ./logs:/app/logs
+      - ./backups:/backups
+    expose:
+      - "3000"
+    networks:
+      - sigc-net
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3000/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── 4. Nginx — Reverse Proxy + SSL + SPA ──────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: sigc_nginx
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8444:8444"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./frontend/dist:/usr/share/nginx/html
+      - uploads:/app/uploads:ro
+      - certbot-www:/var/www/certbot:ro
+      - certbot-certs:/etc/letsencrypt:ro
+      - ./ssl:/etc/ssl/nginx:ro
+    networks:
+      - sigc-net
+
+  # ── 5. Certbot — Renovación automática de certificados SSL ────────────────
+  certbot:
+    image: certbot/certbot:latest
+    container_name: sigc_certbot
+    volumes:
+      - certbot-certs:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+    entrypoint: >
+      /bin/sh -c "trap exit TERM;
+      while :; do
+      certbot renew --webroot --webroot-path=/var/www/certbot --quiet;
+      sleep 12h &
+      wait $${!};
+      done"
+    networks:
+      - sigc-net
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: sigc_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - sigc-net
+
+
+# ── Volúmenes persistentes ──────────────────────────────────────────────────
+
+  # ── 6. Voice Agent Service (Multi-Agente de Voz) ─────────────────────
+  voice:
+    build:
+      context: ./voice_service
+      dockerfile: Dockerfile
+    container_name: sigc_voice
+    restart: unless-stopped
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - REDIS_URL=redis://sigc_redis:6379
+      - DATABASE_URL=${DATABASE_URL}
+    expose:
+      - "8000"
+    networks:
+      - sigc-net
+    depends_on:
+      - redis
+
+volumes:
+  pgdata:
+    driver: local
+  uploads:
+    driver: local
+  certbot-www:
+    driver: local
+  certbot-certs:
+    driver: local
+  redis_data:
+    driver: local
+
+# ── Red interna ─────────────────────────────────────────────────────────────
+networks:
+  sigc-net:
+    driver: bridge

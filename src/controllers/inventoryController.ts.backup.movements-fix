@@ -1,0 +1,789 @@
+import { Request, Response } from 'express';
+import { Prisma } from '@prisma/client';
+import { ZodError } from 'zod';
+import {
+  createBrandSchema,
+  updateBrandSchema,
+  listBrandsQuerySchema,
+  createCategorySchema,
+  updateCategorySchema,
+  listCategoriesQuerySchema,
+  createProductSchema,
+  updateProductSchema,
+  patchStockSchema,
+  adjustStockSchema,
+  getProductsQuerySchema,
+} from '../utils/validators';
+import * as inventoryService from '../services/inventoryService';
+import { logAction } from '../services/auditService';
+import { logger } from '../config/logger';
+import { prisma } from '../config/prisma';
+
+// ─── Helpers HTTP ─────────────────────────────────────────────────────────────
+
+const ok = (res: Response, data: unknown, status = 200) =>
+  res.status(status).json({ success: true, data });
+
+const fail = (res: Response, error: string, status = 400, details?: unknown) =>
+  res.status(status).json({ success: false, error, ...(details ? { details } : {}) });
+
+function handleError(res: Response, err: unknown, context: string) {
+  logger.error(`[InventoryController] ${context}`, { err });
+
+  if (err instanceof ZodError) {
+    return fail(res, 'Datos de entrada inválidos', 422, err.flatten());
+  }
+
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    if (err.code === 'P2002') {
+      // Mensaje específico para conflictos de unicidad en inventario
+      const fields = (err.meta?.target as string[] | undefined) ?? [];
+      const isSkuOrBarcode =
+        fields.some((f) => f === 'skuInternal' || f === 'barcodeExternal');
+      return fail(
+        res,
+        isSkuOrBarcode
+          ? 'El SKU o Código de Barras ya existe'
+          : `Ya existe un registro con ese ${fields.join(', ')}`,
+        409,
+      );
+    }
+    if (err.code === 'P2025') {
+      return fail(res, 'Registro no encontrado', 404);
+    }
+  }
+
+  if (err instanceof Error) {
+    return fail(res, err.message, 400);
+  }
+
+  return fail(res, 'Error interno del servidor', 500);
+}
+
+function extractId(param: string | string[]): string {
+  return Array.isArray(param) ? param[0]! : param;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MARCAS (Brand)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/v1/inventory/brands
+ *
+ * @request  { name: string, logoUrl?: string, isActive?: boolean }
+ * @response { success: true, data: Brand }
+ */
+export async function createBrand(req: Request, res: Response) {
+  try {
+    const input = createBrandSchema.parse(req.body);
+    const brand = await inventoryService.createBrand(input);
+    void logAction(req.user?.id ?? null, 'CREATE_BRAND', 'Brand', brand.id, {
+      name: brand.name,
+    }, req.ip);
+    return ok(res, brand, 201);
+  } catch (err) {
+    return handleError(res, err, 'createBrand');
+  }
+}
+
+/**
+ * GET /api/v1/inventory/brands
+ *
+ * @query  query?, isActive?, page?, limit?
+ * @response { success: true, data: { data: Brand[], meta: PaginationMeta } }
+ */
+export async function getBrands(req: Request, res: Response) {
+  try {
+    const query = listBrandsQuerySchema.parse(req.query);
+    const result = await inventoryService.getBrands(query);
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'getBrands');
+  }
+}
+
+/**
+ * GET /api/v1/inventory/brands/:id
+ *
+ * @response { success: true, data: Brand & { _count: { products: number } } }
+ */
+export async function getBrandById(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const brand = await inventoryService.getBrandById(id);
+    if (!brand) return fail(res, 'Marca no encontrada', 404);
+    return ok(res, brand);
+  } catch (err) {
+    return handleError(res, err, 'getBrandById');
+  }
+}
+
+/**
+ * PUT /api/v1/inventory/brands/:id
+ *
+ * @request  Partial<CreateBrandInput>
+ * @response { success: true, data: Brand }
+ */
+export async function updateBrand(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const input = updateBrandSchema.parse(req.body);
+    const brand = await inventoryService.updateBrand(id, input);
+    void logAction(req.user?.id ?? null, 'UPDATE_BRAND', 'Brand', id, { changes: input }, req.ip);
+    return ok(res, brand);
+  } catch (err) {
+    return handleError(res, err, 'updateBrand');
+  }
+}
+
+/**
+ * DELETE /api/v1/inventory/brands/:id
+ * Soft delete — sólo desactiva si no tiene productos activos.
+ *
+ * @response { success: true, data: { message: string } }
+ */
+export async function deleteBrand(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    await inventoryService.deleteBrand(id);
+    void logAction(req.user?.id ?? null, 'DELETE_BRAND', 'Brand', id, {}, req.ip);
+    return ok(res, { message: 'Marca desactivada correctamente' });
+  } catch (err) {
+    return handleError(res, err, 'deleteBrand');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CATEGORÍAS (Category)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/v1/inventory/categories
+ *
+ * @request  { name, codePrefix, marginPercentage?, slug?, isActive? }
+ * @response { success: true, data: Category }
+ */
+
+/**
+ * GET /api/v1/inventory/categories
+ *
+ * @query  query?, isActive?, page?, limit?
+ * @response { success: true, data: { data: Category[], meta: PaginationMeta } }
+ */
+export async function getCategories(req: Request, res: Response) {
+  try {
+    const query = listCategoriesQuerySchema.parse(req.query);
+    const result = await inventoryService.getCategories(query);
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'getCategories');
+  }
+}
+
+/**
+ * GET /api/v1/inventory/categories/:id
+ * Acepta ID o slug como parámetro.
+ *
+ * @response { success: true, data: Category & { _count: { products: number } } }
+ */
+export async function getCategoryById(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const category = await inventoryService.getCategoryById(id);
+    if (!category) return fail(res, 'Categoría no encontrada', 404);
+    return ok(res, category);
+  } catch (err) {
+    return handleError(res, err, 'getCategoryById');
+  }
+}
+
+/**
+ * PUT /api/v1/inventory/categories/:id
+ *
+ * @request  Partial<CreateCategoryInput>
+ * @response { success: true, data: Category }
+ */
+export async function updateCategory(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const input = updateCategorySchema.parse(req.body);
+    const category = await inventoryService.updateCategory(id, input);
+    void logAction(req.user?.id ?? null, 'UPDATE_CATEGORY', 'Category', id, {
+      changes: input,
+    }, req.ip);
+    return ok(res, category);
+  } catch (err) {
+    return handleError(res, err, 'updateCategory');
+  }
+}
+
+/**
+ * DELETE /api/v1/inventory/categories/:id
+ * Soft delete — sólo desactiva si no tiene productos activos.
+ *
+ * @response { success: true, data: { message: string } }
+ */
+export async function deleteCategory(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    await inventoryService.deleteCategory(id);
+    void logAction(req.user?.id ?? null, 'DELETE_CATEGORY', 'Category', id, {}, req.ip);
+    return ok(res, { message: 'Categoría desactivada correctamente' });
+  } catch (err) {
+    return handleError(res, err, 'deleteCategory');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PRODUCTOS (Product)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/v1/inventory/products
+ *
+ * @request  {
+ *   partNumberOEM, brandId, categoryId, nameCommercial,
+ *   locationBin, costPriceAvg, stockQuantity?,
+ *   skuInternal?, barcodeExternal?, descriptionTech?,
+ *   compatibleModels?, salePriceBase?, taxRate?,
+ *   minStockLevel?, maxStockLevel?, imageKey?
+ * }
+ * @response { success: true, data: Product & { brand, category } }
+ */
+/** Maps Prisma product fields to frontend-friendly field names. */
+function serializeProduct(p: Record<string, unknown>) {
+  return {
+    id:          p['id'],
+    sku:         p['skuInternal'],
+    barcode:     p['barcodeExternal'],
+    name:        p['nameCommercial'],
+    description: p['descriptionTech'],
+    categoryId:  p['categoryId'],
+    category:    p['category'],
+    brandId:     p['brandId'],
+    brand:       p['brand'],
+    costPrice:   Number(p['costPriceAvg']),
+    salePrice:   Number(p['salePriceBase']),
+    taxRate:     Number(p['taxRate']),
+    stock:       p['stockQuantity'],
+    minStock:    p['minStockLevel'],
+    binLocation: p['locationBin'],
+    isActive:    p['isActive'],
+    createdAt:   p['createdAt'],
+    updatedAt:   p['updatedAt'],
+  };
+}
+
+export async function createProduct(req: Request, res: Response) {
+  try {
+    const body = req.body as Record<string, unknown>;
+    // Resolve brandId: use provided value or find/create the "Genérico" brand
+    const resolvedBrandId: string =
+      (typeof body['brandId'] === 'string' && body['brandId'])
+        ? body['brandId']
+        : await inventoryService.getOrCreateGenericBrand();
+    // Map frontend field names → backend field names
+    const mapped = {
+      nameCommercial:   body['nameCommercial']  ?? body['name'],
+      skuInternal:      body['skuInternal']     ?? body['sku'],
+      barcodeExternal:  body['barcodeExternal'] ?? body['barcode'],
+      partNumberOEM:    body['partNumberOEM']   ?? body['name'] ?? body['nameCommercial'],
+      brandId:          resolvedBrandId,
+      categoryId:       body['categoryId'],
+      costPriceAvg:     body['costPriceAvg']    ?? body['costPrice'],
+      salePriceBase:    body['salePriceBase']   ?? body['salePrice'],
+      taxRate:          body['taxRate'],
+      stockQuantity:    body['stockQuantity']   ?? body['stock'],
+      minStockLevel:    body['minStockLevel']   ?? body['minStock'],
+      locationBin:      body['locationBin']     ?? body['binLocation'] ?? 'SIN-UBICACION',
+      descriptionTech:  body['descriptionTech'] ?? body['description'],
+      compatibleModels: body['compatibleModels'] ?? [],
+      isActive:         body['isActive']        ?? true,
+    };
+    const input = createProductSchema.parse(mapped);
+    const userId = req.user?.id;
+    const product = await inventoryService.createProduct(input, userId);
+    void logAction(userId ?? null, 'CREATE_PRODUCT', 'Product', product.id, {
+      sku:  product.skuInternal,
+      name: product.nameCommercial,
+      cost: product.costPriceAvg,
+    }, req.ip);
+    return ok(res, serializeProduct(product as unknown as Record<string, unknown>), 201);
+  } catch (err) {
+    return handleError(res, err, 'createProduct');
+  }
+}
+
+/**
+ * GET /api/v1/inventory/products
+ *
+ * @query  search?, brandId?, categoryId?, isActive?,
+ *         sortBy? (ej: "nameCommercial:asc"), page?, limit?
+ *
+ * La búsqueda (`search`) cubre: nameCommercial, skuInternal, barcodeExternal,
+ * partNumberOEM y compatibleModels (JSON array de modelos compatibles).
+ * Los campos pesados (descriptionTech, compatibleModels) se omiten en la lista
+ * para optimizar el tamaño de la respuesta; están disponibles en GET /:id.
+ *
+ * @response { success: true, data: { data: Product[], meta: PaginationMeta } }
+ */
+export async function getAllProducts(req: Request, res: Response) {
+  try {
+    const query = getProductsQuerySchema.parse(req.query);
+    const result = await inventoryService.getAllProducts(query);
+    return ok(res, {
+      data: result.data.map((p) => serializeProduct(p as unknown as Record<string, unknown>)),
+      meta: result.meta,
+    });
+  } catch (err) {
+    return handleError(res, err, 'getAllProducts');
+  }
+}
+
+/**
+ * GET /api/v1/inventory/products/low-stock
+ * Retorna productos donde stockQuantity <= minStockLevel.
+ *
+ * @response { success: true, data: Array<{ id, skuInternal, nameCommercial, stockQuantity, minStockLevel, locationBin }> }
+ */
+export async function getLowStockProducts(_req: Request, res: Response) {
+  try {
+    const products = await inventoryService.getLowStockProducts();
+    return ok(res, products);
+  } catch (err) {
+    return handleError(res, err, 'getLowStockProducts');
+  }
+}
+
+/**
+ * GET /api/v1/inventory/products/:id
+ * Acepta ID, SKU interno o código de barras como parámetro.
+ *
+ * @response { success: true, data: Product & { brand, category, movements, salePriceWithTax, marginAmount, stockStatus } }
+ */
+export async function getProductById(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const product = await inventoryService.getProductById(id);
+    if (!product) return fail(res, 'Producto no encontrado', 404);
+    return ok(res, product);
+  } catch (err) {
+    return handleError(res, err, 'getProductById');
+  }
+}
+
+/**
+ * PUT /api/v1/inventory/products/:id
+ * No permite cambiar skuInternal. El stock se gestiona vía adjust-stock.
+ *
+ * @request  Partial<CreateProductInput> (sin skuInternal)
+ * @response { success: true, data: Product }
+ */
+export async function updateProduct(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const body = req.body as Record<string, unknown>;
+    // Map frontend field names → backend field names (only defined values)
+    const mapped: Record<string, unknown> = {};
+    const set = (key: string, ...sources: string[]) => {
+      for (const src of sources) {
+        // Skip undefined AND empty strings to avoid invalid CUID / min-length errors on partial updates
+        if (body[src] !== undefined && body[src] !== '') { mapped[key] = body[src]; return; }
+      }
+    };
+    set('nameCommercial',  'nameCommercial',  'name');
+    set('barcodeExternal', 'barcodeExternal', 'barcode');
+    set('partNumberOEM',   'partNumberOEM');
+    set('brandId',         'brandId');
+    set('categoryId',      'categoryId');
+    set('costPriceAvg',    'costPriceAvg',    'costPrice');
+    set('salePriceBase',   'salePriceBase',   'salePrice');
+    set('taxRate',         'taxRate');
+    set('stockQuantity',   'stockQuantity',   'stock');
+    set('minStockLevel',   'minStockLevel',   'minStock');
+    set('locationBin',     'locationBin',     'binLocation');
+    set('descriptionTech', 'descriptionTech', 'description');
+    set('isActive',        'isActive');
+    const input = updateProductSchema.parse(mapped);
+    const userId = req.user?.id;
+    const beforeRaw = await inventoryService.getProductRawById(id);
+    const product = await inventoryService.updateProduct(id, input, userId);
+    const afterRaw = await inventoryService.getProductRawById(id);
+    void logAction(userId ?? null, 'UPDATE_PRODUCT', 'Product', id, { changes: mapped }, req.ip);
+
+    // Auditoría campo a campo
+    if (beforeRaw && afterRaw) {
+      const auditReason = (req.body as Record<string, unknown>)['auditReason'] as string | undefined;
+      const userInfo = userId ? await prisma.user.findUnique({ where: { id: userId }, select: { name: true, email: true } }) : null;
+      const TRACKED_FIELDS: Array<[string, string]> = [
+        ['nameCommercial',  'Nombre'],
+        ['salePriceBase',   'Precio Venta'],
+        ['costPriceAvg',    'Precio Costo'],
+        ['stockQuantity',   'Stock'],
+        ['minStockLevel',   'Stock Mínimo'],
+        ['locationBin',     'Ubicación'],
+        ['taxRate',         'IVA'],
+        ['brandId',         'Marca'],
+        ['categoryId',      'Categoría'],
+        ['isActive',        'Estado'],
+        ['descriptionTech', 'Descripción'],
+      ];
+      const entries = TRACKED_FIELDS
+        .filter(([f]) => String((beforeRaw as Record<string, unknown>)[f] ?? '') !== String((afterRaw as Record<string, unknown>)[f] ?? ''))
+        .map(([f, label]) => ({
+          productId:  id,
+          userId:     userId ?? undefined,
+          userName:   userInfo?.name  ?? 'Sistema',
+          userEmail:  userInfo?.email ?? '',
+          fieldName:  label,
+          oldValue:   String((beforeRaw as Record<string, unknown>)[f] ?? ''),
+          newValue:   String((afterRaw as Record<string, unknown>)[f] ?? ''),
+          changeType: 'UPDATE',
+          reason:     auditReason ?? null,
+          ipAddress:  req.ip ?? null,
+        }));
+      void inventoryService.createProductAuditLogs(entries);
+    }
+
+    return ok(res, serializeProduct(product as unknown as Record<string, unknown>));
+  } catch (err) {
+    return handleError(res, err, 'updateProduct');
+  }
+}
+
+/**
+ * DELETE /api/v1/inventory/products/:id
+ * Soft delete — desactiva el producto (isActive = false).
+ * Devuelve advertencia si aún tiene stock.
+ *
+ * @response { success: true, data: { message: string, warning?: string } }
+ */
+export async function deleteProduct(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const result = await inventoryService.deleteProduct(id);
+    void logAction(req.user?.id ?? null, 'DELETE_PRODUCT', 'Product', id, {}, req.ip);
+    return ok(res, {
+      message: 'Producto desactivado correctamente',
+      ...(result.warning ? { warning: result.warning } : {}),
+    });
+  } catch (err) {
+    return handleError(res, err, 'deleteProduct');
+  }
+}
+
+/**
+ * PATCH /api/v1/inventory/products/:id/stock
+ *
+ * Ajuste rápido de inventario (conteo físico, corrección de error, merma).
+ * El tipo de movimiento se infiere automáticamente del signo de `quantity`:
+ *   - quantity > 0 → ADJUSTMENT_POS
+ *   - quantity < 0 → ADJUSTMENT_NEG
+ *
+ * @request  {
+ *   quantity: number  (no cero; negativo = salida/merma),
+ *   reason: string    (mínimo 3 caracteres),
+ *   referenceDoc?: string,
+ *   unitCost?: number (solo para entradas — recalcula el Costo Promedio Ponderado)
+ * }
+ * @response { success: true, data: { movement, previousStock, newStock, costPriceAvg } }
+ */
+export async function adjustStock(req: Request, res: Response) {
+  try {
+    const id    = extractId(req.params['id']!);
+    const input = patchStockSchema.parse(req.body);
+    const userId = req.user?.id;
+    const result = await inventoryService.adjustStock(id, input, userId);
+    // Ajuste manual de stock: registro de auditoría de alta prioridad
+    void logAction(userId ?? null, 'ADJUST_STOCK', 'Product', id, {
+      quantity:      input.quantity,
+      reason:        input.reason,
+      unitCost:      input.unitCost,
+      previousStock: result.previousStock,
+      newStock:      result.newStock,
+      costPriceAvg:  result.costPriceAvg,
+    }, req.ip);
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'adjustStock');
+  }
+}
+
+/**
+ * POST /api/v1/inventory/products/:id/adjust-stock
+ * Frontend-friendly alias that accepts { quantity, type, reason }.
+ * EXIT type flips quantity to negative; all others keep it positive.
+ */
+export async function adjustStockPost(req: Request, res: Response) {
+  try {
+    const id     = extractId(req.params['id']!);
+    const body   = adjustStockSchema.parse(req.body);
+    const userId = req.user?.id;
+    const signedQty = body.type === 'EXIT' ? -Math.abs(body.quantity) : Math.abs(body.quantity);
+    const result = await inventoryService.adjustStock(
+      id,
+      { quantity: signedQty, reason: body.reason },
+      userId,
+    );
+    void logAction(userId ?? null, 'ADJUST_STOCK', 'Product', id, {
+      type:          body.type,
+      quantity:      body.quantity,
+      reason:        body.reason,
+      previousStock: result.previousStock,
+      newStock:      result.newStock,
+    }, req.ip);
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'adjustStockPost');
+  }
+}
+
+/**
+ * GET /api/v1/inventory/products/:id/movements
+ *
+ * @query  limit? (default: 50, max: 200)
+ * @response { success: true, data: InventoryMovement[] }
+ */
+
+// ─── GET PRODUCT MOVEMENTS (formateado para frontend - 5 columnas + email) ──
+
+// ─── GET PRODUCT MOVEMENTS (formateado para frontend - 5 columnas + email) ──
+
+// ─── GET PRODUCT MOVEMENTS (formateado para frontend - 5 columnas + email) ──
+
+// ─── GET PRODUCT MOVEMENTS (email obtenido manualmente) ──────────────────
+
+// ─── GET PRODUCT MOVEMENTS (email obtenido manualmente) ──────────────────
+
+// ─── GET PRODUCT MOVEMENTS (Campos alineados con Frontend) ───────────────
+export async function getProductMovements(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const limitRaw = req.query['limit'];
+    const limit = Math.min(parseInt(typeof limitRaw === 'string' ? limitRaw : '50', 10) || 50, 200);
+    
+    // 1. Obtener movimientos
+    const movements = await inventoryService.getMovementsByProduct(id, limit);
+    
+    // 2. Obtener IDs únicos de usuarios
+    const userIds = [...new Set(
+      movements
+        .map((m: any) => m.performedByUserId)
+        .filter((uid: string) => uid && typeof uid === 'string')
+    )];
+    
+    // 3. Fetch users
+    let usersMap: Record<string, { email: string; name?: string }> = {};
+    if (userIds.length > 0) {
+      const users = await prisma.user.findMany({
+        where: { id: { in: userIds } },
+        select: { id: true, email: true, name: true }
+      });
+      usersMap = Object.fromEntries(users.map(u => [u.id, { email: u.email, name: u.name }]));
+    }
+    
+    // 4. Formatear para Frontend (Claves EXACTAS que espera Inventory.tsx)
+    const formatted = movements.map((m: any) => {
+      const ts = new Date(m.timestamp);
+      const validDate = !isNaN(ts.getTime());
+      const userInfo = m.performedByUserId ? usersMap[m.performedByUserId] : null;
+      
+      return {
+        // ✅ Claves que usa el Frontend para renderizar la tabla
+        createdAt: m.timestamp,       // <-- Frontend hace: new Date(log.createdAt)
+        reason: m.reason ? `${m.type}: ${m.reason}` : m.type, // <-- Frontend usa: log.reason
+        userName: userInfo?.email || userInfo?.name || 'Sistema', // <-- Frontend usa: log.userName
+        userEmail: userInfo?.email || '', // <-- Frontend muestra debajo del nombre
+        
+        // ✅ Campos adicionales para compatibilidad
+        fecha: validDate ? ts.toISOString().split('T')[0] : 'N/A',
+        hora: validDate ? ts.toTimeString().slice(0, 5) : 'N/A',
+        motivo: m.reason ? `${m.type}: ${m.reason}` : m.type,
+        cantidad: m.quantity,
+        id: m.id,
+        type: m.type,
+        timestamp: m.timestamp,
+        performedByUserId: m.performedByUserId
+      };
+    });
+    
+    return ok(res, formatted);
+  } catch (err) {
+    return handleError(res, err, 'getProductMovements');
+  }
+}
+export async function getCategoriesStats(req: Request, res: Response) {
+  try {
+    const stats = await inventoryService.getCategoriesStats();
+    return ok(res, stats);
+  } catch (err) {
+    return handleError(res, err, 'getCategoriesStats');
+  }
+}
+
+/**
+ * GET /api/v1/inventory/stats
+ * Resumen global del inventario: total productos, categorías, valor, stock bajo y sin stock.
+ *
+ * @response {
+ *   success: true,
+ *   data: {
+ *     totalProducts: number,
+ *     totalCategories: number,
+ *     totalValue: number,       // Suma de (costPriceAvg * stockQuantity) de productos activos
+ *     totalStock: number,       // Suma de unidades en stock (productos activos)
+ *     lowStockCount: number,    // Productos activos con stockQuantity <= minStockLevel
+ *     outOfStockCount: number   // Productos activos con stockQuantity = 0
+ *   }
+ * }
+ */
+export async function getInventoryStats(req: Request, res: Response) {
+  try {
+    const stats = await inventoryService.getInventoryStats();
+    return ok(res, stats);
+  } catch (err) {
+    return handleError(res, err, 'getInventoryStats');
+  }
+}
+
+// ── Auditoría de inventario ───────────────────────────────────────────────────
+
+export async function getAuditUsers(_req: Request, res: Response) {
+  try {
+    const rows = await prisma.productAuditLog.groupBy({
+      by: ['userId', 'userName', 'userEmail'],
+      _count: { id: true },
+      orderBy: { _count: { id: 'desc' } },
+    });
+    const data = rows.map(r => ({
+      userId:      r.userId,
+      userName:    r.userName,
+      userEmail:   r.userEmail,
+      changeCount: r._count.id,
+    }));
+    return ok(res, data);
+  } catch (err) {
+    return handleError(res, err, 'getAuditUsers');
+  }
+}
+
+export async function getInventoryAuditLogs(req: Request, res: Response) {
+  try {
+    const productId = extractId(req.params['productId'] ?? req.query['productId'] as string);
+    const result = await inventoryService.getProductAuditLogs(productId, {
+      page:       req.query['page']       ? Number(req.query['page'])  : 1,
+      limit:      req.query['limit']      ? Number(req.query['limit']) : 25,
+      startDate:  req.query['startDate']  as string | undefined,
+      endDate:    req.query['endDate']    as string | undefined,
+      userId:     req.query['userId']     as string | undefined,
+      changeType: req.query['changeType'] as string | undefined,
+    });
+    return ok(res, result);
+  } catch (err) {
+    return handleError(res, err, 'getInventoryAuditLogs');
+  }
+}
+
+// ─── EXPORT/IMPORT HANDLERS ──────────────────────────────────────────────
+
+export async function exportProducts(req: Request, res: Response) {
+  try {
+    const products = await prisma.product.findMany({
+      include: { category: true, brand: true },
+      where: { isActive: true }
+    });
+    
+    const csv = [
+      ['SKU','Nombre','Categoría','Marca','Costo','Venta','Stock','Ubicación'].join(','),
+      ...products.map(p => [
+        p.skuInternal, p.nameCommercial, p.category?.name || '', p.brand?.name || '',
+        p.costPriceAvg.toString(), p.salePriceBase.toString(), p.stockQuantity, p.locationBin || ''
+      ].join(','))
+    ].join('\n');
+    
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=inventario.csv');
+    return res.send(csv);
+  } catch (error) {
+    logger.error('[InventoryController] exportProducts', error);
+    return res.status(500).json({ success: false, error: 'Error al exportar' });
+  }
+}
+
+
+// ─── CREATE CATEGORY ─────────────────────────────────────────────────────
+
+// ─── CREATE CATEGORY ─────────────────────────────────────────────────────
+export async function createCategory(req: Request, res: Response) {
+  try {
+    const { name, description, codePrefix, isActive } = req.body;
+    
+    // Generar slug automáticamente desde el nombre
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').substring(0, 50) || `cat-${Date.now()}`;
+    
+    // Generar codePrefix si no se proporciona
+    const prefix = (codePrefix || name.substring(0, 3).toUpperCase().replace(/[^A-Z0-9]/g, '') || 'CAT').substring(0, 6);
+    
+    const category = await prisma.category.create({
+      data: {
+        name,
+        slug,
+        codePrefix: prefix,
+        isActive: isActive ?? true
+      }
+    });
+    
+    // ✅ CORREGIDO: Extraer userId del request para logAction
+    const userId = (req.user as any)?.id || 'system';
+    await logAction(userId, 'CATEGORY_CREATED', 'Category', category.id, { name: name }, req.ip);
+    
+    return res.status(201).json({ success: true, data: category });
+  } catch (error: any) {
+    logger.error('[InventoryController] createCategory', error);
+    if (error.code === 'P2002') {
+      return res.status(409).json({ success: false, error: 'Nombre o slug ya existe' });
+    }
+    return res.status(500).json({ success: false, error: 'Error al crear categoría' });
+  }
+}
+export async function bulkImportProducts(req: Request, res: Response) {
+  try {
+    const products = req.body as any[];
+    if (!Array.isArray(products)) return res.status(400).json({ success: false, error: 'Array requerido' });
+    
+    const created = [];
+    for (const p of products) {
+      const product = await prisma.product.create({
+        data: {
+          skuInternal: p.sku || p.skuInternal,
+          barcodeExternal: p.barcode || p.barcodeExternal,
+          partNumberOEM: p.partNumberOEM || p.sku || 'N/A',
+          brandId: p.brandId,
+          categoryId: p.categoryId,
+          nameCommercial: p.name || p.nameCommercial,
+          descriptionTech: p.description || p.descriptionTech || '',
+          compatibleModels: p.compatibleModels || [],
+          imageKey: p.imageKey,
+          locationBin: p.location || p.locationBin || 'A-1',
+          costPriceAvg: parseFloat(p.costPrice) || parseFloat(p.costPriceAvg) || 0,
+          salePriceBase: parseFloat(p.salePrice) || parseFloat(p.salePriceBase) || 0,
+          taxRate: parseFloat(p.iva) || parseFloat(p.taxRate) || 19,
+          stockQuantity: parseInt(p.stock) || parseInt(p.stockQuantity) || 0,
+          minStockLevel: parseInt(p.minStock) || parseInt(p.minStockLevel) || 5,
+          maxStockLevel: p.maxStock ? parseInt(p.maxStock) : undefined,
+          warrantyDays: parseInt(p.warrantyDays) || 0,
+          isActive: p.isActive ?? true
+        }
+      });
+      created.push(product);
+    }
+    return res.json({ success: true, data: created, count: created.length });
+  } catch (error: any) {
+    logger.error('[InventoryController] bulkImportProducts', error);
+    return res.status(500).json({ success: false, error: error.message || 'Error al importar' });
+  }
+}
+
+// ─── EXPORT/IMPORT HANDLERS ──────────────────────────────────────────────
+

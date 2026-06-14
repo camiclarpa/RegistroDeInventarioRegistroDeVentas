@@ -1,0 +1,118 @@
+import { AccountStatus } from '@prisma/client';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+import { createReceivableFromSale, recordPayment } from './debtService';
+import { addCommunicationLog } from './crmService';
+
+function toFloat(v: unknown): number {
+  return parseFloat(String(v ?? 0)) || 0;
+}
+
+export interface CreditLimitCheck {
+  allowed: boolean;
+  message?: string;
+  currentDebt: number;
+  creditLimit: number | null;
+  available: number | null;
+}
+
+export async function checkCreditLimit(customerId: string, requestedAmount: number): Promise<CreditLimitCheck> {
+  const customer = await prisma.customer.findUnique({
+    where: { id: customerId },
+    select: { creditLimit: true, name: true },
+  });
+  if (!customer) throw new Error('Cliente no encontrado');
+  if (!customer.creditLimit) {
+    return { allowed: true, currentDebt: 0, creditLimit: null, available: null };
+  }
+  const creditLimit = toFloat(customer.creditLimit);
+  const agg = await prisma.accountReceivable.aggregate({
+    where: {
+      customerId,
+      status: { in: [AccountStatus.PENDING.PARTIALLY_PAID.OVERDUE] },
+    },
+    _sum: { remainingBalance: true },
+  });
+  const currentDebt = toFloat(agg._sum.remainingBalance);
+  const available = creditLimit - currentDebt;
+  const projectedDebt = currentDebt + requestedAmount;
+  if (projectedDebt > creditLimit) {
+    return {
+      allowed: false,
+      message: `Límite excedido. Deuda: $${currentDebt.toLocaleString('es-CO')}, Disponible: $${available.toLocaleString('es-CO')}`,
+      currentDebt,
+      creditLimit,
+      available,
+    };
+  }
+  return { allowed: true, currentDebt, creditLimit, available };
+}
+
+export async function createCredit(saleId: string, customerId: string, totalAmount: number, dueDate: Date, userId: string) {
+  const check = await checkCreditLimit(customerId, totalAmount);
+  if (!check.allowed) {
+    const err = new Error(check.message ?? 'Límite de crédito excedido');
+    (err as any).code = 'CREDIT_LIMIT_EXCEEDED';
+    throw err;
+  }
+  const receivable = await createReceivableFromSale(saleId, customerId, totalAmount, dueDate);
+  await addCommunicationLog(customerId, 'CREDIT_CREATED', `Fiado $${totalAmount.toFixed(2)} vence ${dueDate.toLocaleDateString('es-CO')}`, userId);
+  logger.info(`[creditService] Crédito ${receivable.id} — $${totalAmount} — cliente ${customerId}`);
+  return receivable;
+}
+
+export async function registerCreditPayment(creditId: string, amount: number, paymentMethod: string, userId: string, notes?: string, cashRegisterId?: string) {
+  const result = await recordPayment({
+    accountReceivableId: creditId,
+    amount,
+    paymentMethod,
+    note: notes,
+    cashRegisterId,
+  }, userId);
+  const updated = await prisma.accountReceivable.findUnique({
+    where: { id: creditId },
+    select: { customerId: true, remainingBalance: true, status: true },
+  });
+  if (updated) {
+    const remaining = toFloat(updated.remainingBalance);
+    const msg = updated.status === 'PAID'
+      ? `Deuda saldada. Abono: $${amount.toFixed(2)}`
+      : `Abono $${amount.toFixed(2)}. Saldo: $${remaining.toFixed(2)}`;
+    await addCommunicationLog(updated.customerId, 'PAYMENT_RECEIVED', msg, userId);
+  }
+  return result;
+}
+
+export async function getCustomerCredits(customerId: string) {
+  const credits = await prisma.accountReceivable.findMany({
+    where: { customerId },
+    orderBy: [{ status: 'asc' }, { createdAt: 'desc' }],
+    include: {
+      sale: { select: { id: true, saleNumber: true, createdAt: true, totalAmount: true } },
+      payments: {
+        orderBy: { timestamp: 'desc' },
+        select: { id: true, amount: true, paymentMethod: true, timestamp: true, note: true },
+      },
+    },
+  });
+  const summary = credits.reduce((acc, c) => ({
+    totalDebt: acc.totalDebt + toFloat(c.totalDebt),
+    totalPaid: acc.totalPaid + toFloat(c.paidAmount),
+    totalPending: acc.totalPending + toFloat(c.remainingBalance),
+    count: credits.length,
+  }), { totalDebt: 0, totalPaid: 0, totalPending: 0, count: 0 });
+  return { credits, summary };
+}
+
+export async function updateCreditLimit(customerId: string, newLimit: number | null, userId: string) {
+  const customer = await prisma.customer.update({
+    where: { id: customerId },
+    data: { creditLimit: newLimit !== null ? newLimit.toFixed(2) : null },
+    select: { id: true, name: true, creditLimit: true },
+  });
+  const msg = newLimit !== null
+    ? `Límite: $${newLimit.toLocaleString('es-CO')}`
+    : 'Límite removido';
+  await addCommunicationLog(customerId, 'CREDIT_LIMIT_CHANGE', msg, userId);
+  return customer;
+}

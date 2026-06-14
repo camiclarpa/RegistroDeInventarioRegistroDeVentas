@@ -1,0 +1,1005 @@
+import React, { useState, useEffect } from 'react';
+import * as XLSX from 'xlsx';
+import { X, ChevronRight, CheckCircle2, AlertCircle, FileSpreadsheet, Upload, Eye, Settings, Barcode, Sparkles, Brain, TrendingUp, Users } from 'lucide-react';
+
+interface SmartImportModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onSuccess: () => void;
+}
+
+interface ExcelColumn {
+  originalName: string;
+  displayName: string;
+  columnIndex: number;
+  sampleData: any[];
+}
+
+interface SystemField {
+  key: string;
+  label: string;
+  required: boolean;
+  icon: string;
+  description: string;
+}
+
+const SYSTEM_FIELDS: SystemField[] = [
+  { key: 'name', label: 'Nombre del Producto', required: true, icon: '📝', description: 'Nombre completo del producto' },
+  { key: 'brand', label: 'Marca', required: true, icon: '🏷️', description: 'Marca o fabricante' },
+  { key: 'category', label: 'Categoría', required: true, icon: '📁', description: 'Categoría del producto' },
+  { key: 'salePrice', label: 'Precio de Venta', required: true, icon: '💰', description: 'Precio de venta al público' },
+  { key: 'stock', label: 'Stock (Cantidad)', required: true, icon: '📦', description: 'Cantidad disponible' },
+  { key: 'costPrice', label: 'Costo (Sin IVA)', required: false, icon: '📉', description: 'Costo del producto sin impuestos' },
+  { key: 'iva', label: 'IVA (Valor Total)', required: false, icon: '🧾', description: 'Valor total con IVA incluido' },
+];
+
+interface MappingConfig {
+  [key: string]: string;
+}
+
+interface AdvancedConfig {
+  generateSku: boolean;
+  generateBarcode: boolean;
+  skuTemplate: string;
+  barcodePrefix: string;
+  useExistingSku: boolean;
+  useExistingBarcode: boolean;
+}
+
+interface BrandCategoryConfig {
+  extractFromName: boolean;
+  extractFromDescription: boolean;
+  brandRule: 'first_word' | 'keyword' | 'custom';
+  categoryRule: 'keyword' | 'first_word' | 'custom';
+  brandKeywords: string[];
+  categoryKeywords: Record<string, string>;
+}
+
+interface AIRecommendation {
+  confidence: number;
+  basedOnImports: number;
+  suggestedMapping: MappingConfig;
+  suggestedBrandCategory: BrandCategoryConfig;
+  reason: string;
+  usedByUsers: number;
+}
+
+export const SmartImportModal: React.FC<SmartImportModalProps> = ({ isOpen, onClose, onSuccess }) => {
+  const [step, setStep] = useState(1);
+  const [loading, setLoading] = useState(false);
+  const [file, setFile] = useState<File | null>(null);
+
+  const [excelColumns, setExcelColumns] = useState<ExcelColumn[]>([]);
+  const [allRows, setAllRows] = useState<any[]>([]);
+  const [mapping, setMapping] = useState<MappingConfig>({});
+  const [preview, setPreview] = useState<any[]>([]);
+
+  const [showAdvancedConfig, setShowAdvancedConfig] = useState(false);
+  const [advancedConfig, setAdvancedConfig] = useState<AdvancedConfig>({
+    generateSku: true,
+    generateBarcode: true,
+    skuTemplate: '{brand:3}-{category:3}-{num:4}',
+    barcodePrefix: '770',
+    useExistingSku: false,
+    useExistingBarcode: false,
+  });
+
+  const [showBrandCategoryConfig, setShowBrandCategoryConfig] = useState(false);
+  const [brandCategoryConfig, setBrandCategoryConfig] = useState<BrandCategoryConfig>({
+    extractFromName: true,
+    extractFromDescription: false,
+    brandRule: 'keyword',
+    categoryRule: 'keyword',
+    brandKeywords: ['BAJAJ', 'CASTROL', 'AKT', 'MOBIL', 'KIXX', 'SHELL', 'YAMAHA', 'HONDA', 'SUZUKI'],
+    categoryKeywords: {
+      'aceite': 'Aceites',
+      'filtro': 'Filtros',
+      'freno': 'Frenos',
+      'bujia': 'Bujías',
+      'bateria': 'Baterías',
+      'amortiguador': 'Suspensión',
+      'cadena': 'Arrastre',
+      'balinera': 'Rodamientos',
+      'pastilla': 'Frenos',
+      'caucho': 'Cauuchos',
+      'kit': 'Kits',
+    },
+  });
+
+  const [aiRecommendation, setAiRecommendation] = useState<AIRecommendation | null>(null);
+  const [excelSignature, setExcelSignature] = useState<string>('');
+
+  useEffect(() => {
+    if (!isOpen) {
+      setStep(1);
+      setMapping({});
+      setExcelColumns([]);
+      setAllRows([]);
+      setFile(null);
+      setShowAdvancedConfig(false);
+      setShowBrandCategoryConfig(false);
+      setAiRecommendation(null);
+      setExcelSignature('');
+    }
+  }, [isOpen]);
+
+  const generateExcelSignature = (columns: ExcelColumn[], sampleRows: any[]): string => {
+    const columnNames = columns.map(c => c.originalName.toLowerCase().trim()).sort().join('|');
+    const dataTypes = sampleRows.slice(0, 3).map(row =>
+      row.map((cell: any) => {
+        if (!cell) return 'empty';
+        if (typeof cell === 'number') return 'number';
+        if (String(cell).includes('$') || !isNaN(parseFloat(String(cell).replace(/[$,]/g, '')))) return 'currency';
+        if (String(cell).length > 50) return 'long_text';
+        return 'text';
+      }).join(',')
+    ).join(';');
+    let hash = 0;
+    const str = columnNames + dataTypes;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash;
+    }
+    return Math.abs(hash).toString(36);
+  };
+
+  const fetchAIRecommendations = async (signature: string, columns: ExcelColumn[]) => {
+    try {
+      const token = localStorage.getItem('token') || localStorage.getItem('accessToken');
+      const response = await fetch('/api/v1/import/learning/recommendations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token && { 'Authorization': `Bearer ${token}` })
+        },
+        body: JSON.stringify({
+          excelSignature: signature,
+          columns: columns.map(c => ({ name: c.originalName, sample: c.sampleData[0] }))
+        })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (data.recommendation) {
+          setAiRecommendation(data.recommendation);
+        }
+      }
+    } catch (error) {
+      console.error('Error fetching AI recommendations:', error);
+    }
+  };
+
+  const saveImportPattern = async (importData: any) => {
+    try {
+      const token = localStorage.getItem('token') || localStorage.getItem('accessToken');
+      await fetch('/api/v1/import/learning/record', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token && { 'Authorization': `Bearer ${token}` })
+        },
+        body: JSON.stringify({
+          excelSignature,
+          columnMapping: mapping,
+          brandCategoryConfig,
+          advancedConfig,
+          success: true,
+          totalProducts: allRows.length
+        })
+      });
+    } catch (error) {
+      console.error('Error saving import pattern:', error);
+    }
+  };
+
+  const findHeaderRow = (data: any[]): number => {
+    for (let i = 0; i < Math.min(data.length, 10); i++) {
+      const row = data[i];
+      const keys = Object.keys(row);
+      if (keys.some(key => {
+        const val = row[key];
+        return val && String(val).trim().length > 0 && !String(val).includes('__EMPTY');
+      })) {
+        return i;
+      }
+    }
+    return 0;
+  };
+
+  const extractBrandAndCategory = (productName: string, description: string = ''): { brand: string; category: string } => {
+    const text = `${productName} ${description}`.toUpperCase();
+    const words = text.split(/[\s-]+/).filter(w => w.length > 2);
+    const ignoreWords = ['EL', 'LA', 'LOS', 'LAS', 'DE', 'DEL', 'PARA', 'CON', 'POR', 'Y', 'O', 'UN', 'UNA'];
+    let brand = 'Generic';
+    let category = 'Repuestos General';
+    if (brandCategoryConfig.brandRule === 'keyword') {
+      for (const keyword of brandCategoryConfig.brandKeywords) {
+        if (text.includes(keyword.toUpperCase())) {
+          brand = keyword;
+          break;
+        }
+      }
+      if (brand === 'Generic') {
+        for (const w of words) {
+          if (!ignoreWords.includes(w) && /^[A-ZÁ-Ú]/.test(w)) {
+            brand = w;
+            break;
+          }
+        }
+      }
+    } else if (brandCategoryConfig.brandRule === 'first_word') {
+      for (const w of words) {
+        if (!ignoreWords.includes(w)) {
+          brand = w;
+          break;
+        }
+      }
+    }
+    if (brandCategoryConfig.categoryRule === 'keyword') {
+      for (const [keyword, catValue] of Object.entries(brandCategoryConfig.categoryKeywords)) {
+        if (text.includes(keyword.toUpperCase())) {
+          category = catValue;
+          break;
+        }
+      }
+    } else if (brandCategoryConfig.categoryRule === 'first_word') {
+      for (const w of words) {
+        if (!ignoreWords.includes(w) && !brandCategoryConfig.brandKeywords.includes(w)) {
+          category = w;
+          break;
+        }
+      }
+    }
+    return { brand, category };
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFile = e.target.files?.[0];
+    if (!selectedFile) return;
+    setFile(selectedFile);
+    setLoading(true);
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const data = new Uint8Array(evt.target?.result as ArrayBuffer);
+        const workbook = XLSX.read(data, { type: 'array' });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const jsonData: any[] = XLSX.utils.sheet_to_json(sheet, { defval: '', header: 1 });
+        if (jsonData.length < 2) {
+          alert('❌ El archivo parece estar vacío.');
+          setLoading(false);
+          return;
+        }
+        const headerRowIndex = findHeaderRow(jsonData);
+        const headers = jsonData[headerRowIndex] || [];
+        const dataRows = jsonData.slice(headerRowIndex + 1).filter((row: any) => row && row.length > 0);
+        const processedColumns: ExcelColumn[] = headers.map((header: any, index: number) => {
+          const headerStr = String(header || '').trim();
+          let displayName = headerStr;
+          if (!displayName || displayName === '__EMPTY' || displayName.startsWith('__EMPTY')) {
+            displayName = `Columna ${String.fromCharCode(65 + index)}`;
+          }
+          const sampleData = dataRows.slice(0, 5).map((row: any) => row[index]);
+          return {
+            originalName: headerStr || `__EMPTY_${index}`,
+            displayName,
+            columnIndex: index,
+            sampleData
+          };
+        }).filter(col => col.sampleData.some(d => d !== undefined && d !== null && d !== ''));
+        setExcelColumns(processedColumns);
+        setAllRows(dataRows);
+        const signature = generateExcelSignature(processedColumns, dataRows.slice(0, 5));
+        setExcelSignature(signature);
+        fetchAIRecommendations(signature, processedColumns);
+        const autoMapping: MappingConfig = {};
+        processedColumns.forEach(col => {
+          const name = col.displayName.toLowerCase();
+          const samples = col.sampleData.filter(s => s !== undefined && s !== null && s !== '');
+          if (name.includes('producto') || name.includes('nombre') || name.includes('descripcion')) {
+            if (!autoMapping.name) autoMapping.name = col.displayName;
+          }
+          if (name.includes('marca') || name.includes('brand') || name.includes('fabricante')) {
+            if (!autoMapping.brand) autoMapping.brand = col.displayName;
+          }
+          if (name.includes('categoria') || name.includes('cat') || name.includes('familia')) {
+            if (!autoMapping.category) autoMapping.category = col.displayName;
+          }
+          if (name.includes('comercial') || name.includes('venta') || name.includes('pvp') || name.includes('precio')) {
+            if (!autoMapping.salePrice) autoMapping.salePrice = col.displayName;
+          }
+          if (name.includes('cantidad') || name.includes('stock') || name.includes('inventario')) {
+            if (!autoMapping.stock) autoMapping.stock = col.displayName;
+          }
+          if (name.includes('sin iva') || name.includes('costo') || name.includes('cost')) {
+            if (!autoMapping.costPrice) autoMapping.costPrice = col.displayName;
+          }
+          if (name.includes('con iva') || name.includes('total') || name.includes('ivaincluido')) {
+            if (!autoMapping.iva) autoMapping.iva = col.displayName;
+          }
+          if (name.includes('sku') || name.includes('codigo') || name.includes('código')) {
+            setAdvancedConfig(prev => ({ ...prev, useExistingSku: true }));
+            autoMapping.sku = col.displayName;
+          }
+          if (name.includes('barcode') || name.includes('barras') || name.includes('ean')) {
+            setAdvancedConfig(prev => ({ ...prev, useExistingBarcode: true }));
+            autoMapping.barcode = col.displayName;
+          }
+          if (samples.length > 0) {
+            const firstSample = String(samples[0]).trim();
+            if (!autoMapping.salePrice && (firstSample.includes('$') || (!isNaN(parseFloat(firstSample.replace(/[$,]/g, ''))) && parseFloat(firstSample.replace(/[$,]/g, '')) > 100))) {
+              autoMapping.salePrice = col.displayName;
+            }
+            if (!autoMapping.stock && (firstSample.toUpperCase().includes('AGOTADO') || (!isNaN(parseInt(firstSample)) && parseInt(firstSample) >= 0 && parseInt(firstSample) <= 10000))) {
+              autoMapping.stock = col.displayName;
+            }
+          }
+        });
+        setMapping(autoMapping);
+        setStep(2);
+      } catch (err) {
+        console.error(err);
+        alert('❌ Error al leer el archivo.');
+      } finally {
+        setLoading(false);
+      }
+    };
+    reader.readAsArrayBuffer(selectedFile);
+  };
+
+  useEffect(() => {
+    if (step === 2 && excelColumns.length > 0) {
+      generatePreview();
+    }
+  }, [mapping, step, excelColumns, advancedConfig, brandCategoryConfig]);
+
+  const generateSKU = (brand: string, category: string, name: string, index: number, template: string): string => {
+    const brandCode = (brand || 'GEN').substring(0, 3).toUpperCase().padEnd(3, 'X');
+    const categoryCode = (category || 'GEN').substring(0, 3).toUpperCase().padEnd(3, 'X');
+    const nameCode = (name || '').replace(/[^A-Z0-9]/gi, '').substring(0, 4).toUpperCase().padEnd(4, '0');
+    const num = String(index + 1).padStart(4, '0');
+    let sku = template
+      .replace('{brand:3}', brandCode)
+      .replace('{category:3}', categoryCode)
+      .replace('{name:4}', nameCode)
+      .replace('{num:4}', num);
+    return sku;
+  };
+
+  const generateBarcode = (sku: string, prefix: string): string => {
+    const clean = sku.replace(/[^0-9]/g, '').substring(0, 12 - prefix.length);
+    let barcode = prefix + clean.padEnd(12 - prefix.length, '0');
+    barcode = barcode.substring(0, 12);
+    let sum = 0;
+    for (let i = 0; i < 12; i++) {
+      const digit = parseInt(barcode[i]) || 0;
+      sum += (i % 2 === 0) ? digit : digit * 3;
+    }
+    const checkDigit = (10 - (sum % 10)) % 10;
+    return barcode + checkDigit.toString();
+  };
+
+  const generatePreview = () => {
+    const parseNumber = (val: any): number => {
+      if (!val) return 0;
+      const str = String(val).replace(/[$,\s]/g, '').trim();
+      const num = parseFloat(str.replace(',', '.'));
+      return isNaN(num) ? 0 : num;
+    };
+    const parseStock = (val: any): number => {
+      if (!val) return 0;
+      const str = String(val).toUpperCase().trim();
+      if (str.includes('AGOTADO')) return 0;
+      const num = parseInt(str.replace(/[^0-9-]/g, ''));
+      return isNaN(num) ? 0 : num;
+    };
+    const colIndexMap = new Map<string, number>();
+    excelColumns.forEach(col => {
+      colIndexMap.set(col.displayName, col.columnIndex);
+    });
+    const processed = allRows.slice(0, 10).map((row, idx) => {
+      const getData = (fieldKey: string) => {
+        const colName = mapping[fieldKey];
+        if (!colName) return undefined;
+        const colIndex = colIndexMap.get(colName);
+        if (colIndex === undefined) return undefined;
+        return row[colIndex];
+      };
+      const rawName = getData('name') || '';
+      const rawDescription = mapping.description ? getData('description') : '';
+      const { brand, category } = extractBrandAndCategory(rawName, rawDescription);
+      const rawSalePrice = getData('salePrice');
+      const rawCostPrice = getData('costPrice');
+      const rawIva = getData('iva');
+      const salePrice = parseNumber(rawSalePrice);
+      const costPrice = parseNumber(rawCostPrice);
+      let taxRate = 19;
+      if (costPrice > 0 && rawIva) {
+        const ivaTotalClean = parseNumber(rawIva);
+        if (ivaTotalClean > 0 && ivaTotalClean !== costPrice) {
+          taxRate = Math.round(((ivaTotalClean / costPrice) - 1) * 100);
+        }
+      } else if (costPrice > 0 && salePrice > costPrice) {
+        taxRate = Math.round(((salePrice / costPrice) - 1) * 100);
+      }
+      let sku = '—';
+      let barcode = '—';
+      if (advancedConfig.useExistingSku && mapping.sku) {
+        sku = getData('sku') || '—';
+      } else if (advancedConfig.generateSku) {
+        sku = generateSKU(brand, category, rawName, idx, advancedConfig.skuTemplate);
+      }
+      if (advancedConfig.useExistingBarcode && mapping.barcode) {
+        barcode = getData('barcode') || '—';
+      } else if (advancedConfig.generateBarcode && sku !== '—') {
+        barcode = generateBarcode(sku, advancedConfig.barcodePrefix);
+      }
+      return {
+        name: rawName || '—',
+        brand,
+        category,
+        salePrice,
+        taxRate,
+        stock: parseStock(getData('stock')),
+        costPrice,
+        iva: parseNumber(rawIva),
+        sku,
+        barcode,
+      };
+    });
+    setPreview(processed);
+  };
+
+  const handleImport = async () => {
+    for (const field of SYSTEM_FIELDS) {
+      if (field.required && !mapping[field.key]) {
+        alert(`❌ Error: Debes seleccionar una columna para "${field.label}".`);
+        return;
+      }
+    }
+    setLoading(true);
+    try {
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = async (evt) => {
+        const data = new Uint8Array(evt.target?.result as ArrayBuffer);
+        const workbook = XLSX.read(data, { type: 'array' });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const jsonData: any[] = XLSX.utils.sheet_to_json(sheet, { defval: '', header: 1 });
+        const headerRowIndex = findHeaderRow(jsonData);
+        const headers = jsonData[headerRowIndex] || [];
+        const dataRows = jsonData.slice(headerRowIndex + 1).filter((row: any) => row && row.length > 0);
+        const colIndexMap = new Map<string, number>();
+        excelColumns.forEach(col => {
+          colIndexMap.set(col.displayName, col.columnIndex);
+        });
+        const parseNum = (val: any) => {
+          if (!val) return 0;
+          const str = String(val).replace(/[$,\s]/g, '').replace(',', '.');
+          return parseFloat(str) || 0;
+        };
+        const getData = (row: any, fieldKey: string) => {
+          const colName = mapping[fieldKey];
+          if (!colName) return undefined;
+          const colIndex = colIndexMap.get(colName);
+          if (colIndex === undefined) return undefined;
+          return row[colIndex];
+        };
+        const finalPayload = dataRows.map((row, idx) => {
+          const rawName = getData(row, 'name') || 'Producto Sin Nombre';
+          const rawDescription = mapping.description ? getData(row, 'description') : '';
+          const { brand, category } = extractBrandAndCategory(rawName, rawDescription);
+          const salePrice = parseNum(getData(row, 'salePrice'));
+          const costPrice = parseNum(getData(row, 'costPrice'));
+          let taxRate = 19;
+          if (costPrice > 0 && salePrice > costPrice) {
+            taxRate = Math.round(((salePrice / costPrice) - 1) * 100);
+          }
+          let sku = '';
+          let barcode = '';
+          if (advancedConfig.useExistingSku && mapping.sku) {
+            sku = String(getData(row, 'sku') || '');
+          } else if (advancedConfig.generateSku) {
+            sku = generateSKU(brand, category, rawName, idx, advancedConfig.skuTemplate);
+          }
+          if (advancedConfig.useExistingBarcode && mapping.barcode) {
+            barcode = String(getData(row, 'barcode') || '');
+          } else if (advancedConfig.generateBarcode && sku) {
+            barcode = generateBarcode(sku, advancedConfig.barcodePrefix);
+          }
+          return {
+            name: rawName,
+            brandName: brand,
+            categoryName: category,
+            salePrice,
+            costPrice,
+            taxRate,
+            stock: parseInt(String(getData(row, 'stock')).replace(/[^0-9-]/g, '')) || 0,
+            sku,
+            barcode,
+          };
+        });
+        const token = localStorage.getItem('token') || localStorage.getItem('accessToken');
+        const res = await fetch('/api/v1/inventory/products/bulk', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token && { 'Authorization': `Bearer ${token}` })
+          },
+          body: JSON.stringify(finalPayload)
+        });
+        const result = await res.json();
+        if (result.success) {
+          await saveImportPattern({
+            totalProducts: dataRows.length,
+            importedProducts: result.imported
+          });
+          alert(`✅ ¡Éxito! ${result.imported} productos importados.\n🤖 El sistema aprendió de esta importación para futuras recomendaciones.`);
+          onSuccess();
+          onClose();
+        } else {
+          alert('❌ Error: ' + (result.error || 'Importación fallida'));
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    } catch (err) {
+      alert('❌ Error en la conexión.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const applyAIRecommendation = () => {
+    if (aiRecommendation) {
+      setMapping(aiRecommendation.suggestedMapping);
+      setBrandCategoryConfig(aiRecommendation.suggestedBrandCategory);
+    }
+  };
+
+
+  // ============================================
+  // FUNCIONALIDADES EMPRESARIALES CRÍTICAS (1-3)
+  // (Integradas DENTRO del componente React)
+  // ============================================
+
+  // 1. NORMALIZACIÓN DE MARCAS - Unifica variaciones comunes
+  const normalizeBrand = (brand: string): string => {
+    if (!brand) return 'Generic';
+    return brand.trim().toUpperCase()
+      .replace(/\s+/g, ' ')
+      .replace(/\.$/, '')
+      .replace(/BAJAB/g, 'BAJAJ')  // Corrección específica para tu Excel
+      .replace(/JAPANY RACER/g, 'JAPANY RACER')
+      .replace(/\s+$/g, '');
+  };
+
+  // 2. VALIDACIÓN DE UNICIDAD DE SKU
+  const detectDuplicateSKUs = (products: any[]): { duplicates: Record<string, number[]>; hasDuplicates: boolean } => {
+    const skuMap = new Map<string, number[]>();
+    products.forEach((p, i) => {
+      if (p.sku && p.sku !== '—') {
+        if (!skuMap.has(p.sku)) skuMap.set(p.sku, []);
+        skuMap.get(p.sku)!.push(i);
+      }
+    });
+    const duplicates: Record<string, number[]> = {};
+    let hasDuplicates = false;
+    skuMap.forEach((indices, sku) => {
+      if (indices.length > 1) {
+        duplicates[sku] = indices;
+        hasDuplicates = true;
+      }
+    });
+    return { duplicates, hasDuplicates };
+  };
+
+  // 3. DETECCIÓN DE PRODUCTOS DUPLICADOS (por nombre+marca+categoría)
+  const detectDuplicateProducts = (products: any[]): { duplicates: Array<{ name: string; indices: number[] }>; hasDuplicates: boolean } => {
+    const productMap = new Map<string, number[]>();
+    products.forEach((p, i) => {
+      if (p.name && p.name !== '—') {
+        // Clave única: nombre + marca normalizada + categoría
+        const key = `${normalizeBrand(p.brand)}|${p.category}|${p.name.toLowerCase().trim()}`;
+        if (!productMap.has(key)) productMap.set(key, []);
+        productMap.get(key)!.push(i);
+      }
+    });
+    const duplicates: Array<{ name: string; indices: number[] }> = [];
+    let hasDuplicates = false;
+    productMap.forEach((indices, key) => {
+      if (indices.length > 1) {
+        const [brand, category, name] = key.split('|');
+        duplicates.push({ name: `${name} (${brand})`, indices });
+        hasDuplicates = true;
+      }
+    });
+    return { duplicates, hasDuplicates };
+  };
+
+  // ============================================
+  // FUNCIONALIDADES EMPRESARIALES CRÍTICAS (4-6)
+  // (Integradas DENTRO del componente React)
+  // ============================================
+
+  // 4. VALIDACIÓN DE CHECKSUM EAN-13
+  const validateEAN13Checksum = (barcode: string): boolean => {
+    if (!barcode || barcode.length !== 13 || !/^\d+$/.test(barcode)) return false;
+    let sum = 0;
+    for (let i = 0; i < 12; i++) {
+      const digit = parseInt(barcode[i]);
+      sum += (i % 2 === 0) ? digit : digit * 3;
+    }
+    return ((10 - (sum % 10)) % 10) === parseInt(barcode[12]);
+  };
+
+  // 5. VALIDACIÓN DE COHERENCIA DE DATOS
+  interface DataValidationResult { isValid: boolean; errors: string[]; warnings: string[]; }
+  const validateProductData = (product: any, rowIndex: number): DataValidationResult => {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    if (product.salePrice < 0) errors.push(`Fila ${rowIndex + 1}: Precio negativo`);
+    if (product.costPrice > 0 && product.salePrice > 0 && product.salePrice < product.costPrice) warnings.push(`Fila ${rowIndex + 1}: Precio < Costo`);
+    if (product.stock < 0) errors.push(`Fila ${rowIndex + 1}: Stock negativo`);
+    if (!product.name || product.name.trim() === '') errors.push(`Fila ${rowIndex + 1}: Nombre vacío`);
+    if (product.barcode && product.barcode.length === 13 && !validateEAN13Checksum(product.barcode)) warnings.push(`Fila ${rowIndex + 1}: Barcode inválido`);
+    return { isValid: errors.length === 0, errors, warnings };
+  };
+
+  // 6. GENERACIÓN DE REPORTE CSV
+  const generateErrorReportCSV = (errors: Array<{ row: number; field: string; message: string }>): string => {
+    const headers = ['Fila', 'Campo', 'Error', 'Valor'];
+    const rows = errors.map(e => [e.row, e.field, e.message, '—']);
+    return [headers, ...rows].map(row => row.join(',')).join('\n');
+  };
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-7xl h-[95vh] flex flex-col overflow-hidden">
+        <div className="px-6 py-4 border-b bg-gray-50 flex justify-between items-center">
+          <div>
+            <h2 className="text-xl font-bold text-gray-800 flex items-center gap-2">
+              {step === 1 && '📥 Importar Productos'}
+              {step === 2 && '🧩 Configurar Mapeo de Columnas'}
+              {step === 3 && '🚀 Confirmar Importación'}
+            </h2>
+            <p className="text-sm text-gray-500 mt-1">
+              {step === 1 ? 'Sube tu archivo Excel (.xlsx, .xls)' : `Se detectaron ${excelColumns.length} columnas en tu archivo.`}
+            </p>
+          </div>
+          <button onClick={onClose} className="p-2 hover:bg-gray-200 rounded-full transition">
+            <X className="w-6 h-6 text-gray-500" />
+          </button>
+        </div>
+        <div className="flex-1 overflow-auto p-6 bg-gray-100">
+          {step === 1 && (
+            <div className="h-full flex flex-col items-center justify-center">
+              <div
+                className="border-2 border-dashed border-gray-300 rounded-xl p-16 text-center hover:border-blue-500 bg-white transition cursor-pointer w-full max-w-lg group"
+                onClick={() => document.getElementById('file-upload')?.click()}
+              >
+                <input id="file-upload" type="file" accept=".xlsx,.xls" className="hidden" onChange={handleFileChange} />
+                <Upload className="w-16 h-16 text-gray-400 mx-auto mb-4 group-hover:text-blue-500 transition" />
+                <p className="text-xl font-semibold text-gray-700 group-hover:text-blue-600 transition">Haz click para seleccionar tu Excel</p>
+                <p className="text-sm text-gray-400 mt-2">El sistema detectará automáticamente los encabezados y aprenderá de la estructura.</p>
+                {loading && <p className="mt-4 text-blue-600 animate-pulse font-medium">Analizando estructura...</p>}
+              </div>
+            </div>
+          )}
+          {step === 2 && (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 h-full">
+              <div className="bg-white p-5 rounded-xl shadow-sm overflow-y-auto max-h-[70vh]">
+                <div className="flex justify-between items-center mb-4">
+                  <h3 className="font-bold text-gray-800 flex items-center gap-2">
+                    <FileSpreadsheet className="w-5 h-5" />
+                    Campos del Sistema
+                  </h3>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setShowBrandCategoryConfig(!showBrandCategoryConfig)}
+                      className="text-xs text-purple-600 hover:text-purple-700 flex items-center gap-1"
+                    >
+                      <Sparkles className="w-3 h-3" />
+                      Marca/Categoría
+                    </button>
+                    <button
+                      onClick={() => setShowAdvancedConfig(!showAdvancedConfig)}
+                      className="text-xs text-blue-600 hover:text-blue-700 flex items-center gap-1"
+                    >
+                      <Settings className="w-3 h-3" />
+                      Avanzado
+                    </button>
+                  </div>
+                </div>
+                {aiRecommendation && (
+                  <div className="mb-4 p-4 bg-gradient-to-r from-blue-50 to-purple-50 border-2 border-blue-300 rounded-xl">
+                    <div className="flex items-start gap-3">
+                      <Brain className="w-6 h-6 text-blue-600 mt-1" />
+                      <div className="flex-1">
+                        <h4 className="font-bold text-blue-900 flex items-center gap-2">
+                          🤖 Recomendación Inteligente
+                          <span className="text-xs bg-blue-200 text-blue-800 px-2 py-1 rounded-full">
+                            {aiRecommendation.confidence}% confianza
+                          </span>
+                        </h4>
+                        <p className="text-sm text-blue-800 mt-1">{aiRecommendation.reason}</p>
+                        <div className="flex items-center gap-4 mt-2 text-xs text-blue-700">
+                          <span className="flex items-center gap-1">
+                            <Users className="w-3 h-3" />
+                            Usado por {aiRecommendation.usedByUsers} usuarios
+                          </span>
+                          <span className="flex items-center gap-1">
+                            <TrendingUp className="w-3 h-3" />
+                            {aiRecommendation.basedOnImports} importaciones exitosas
+                          </span>
+                        </div>
+                        <button
+                          onClick={applyAIRecommendation}
+                          className="mt-3 w-full bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-blue-700 transition"
+                        >
+                          Aplicar Recomendación Automática
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                <div className="space-y-4">
+                  {SYSTEM_FIELDS.map((field) => (
+                    <div key={field.key} className="flex flex-col gap-1 p-3 bg-gray-50 rounded-lg border border-gray-200">
+                      <label className="text-sm font-medium text-gray-700 flex items-center gap-2">
+                        <span>{field.icon}</span>
+                        <span>{field.label}</span>
+                        {field.required && <span className="text-red-500 text-xs">*</span>}
+                      </label>
+                      <p className="text-xs text-gray-500 mb-1">{field.description}</p>
+                      <select
+                        className="w-full border border-gray-300 rounded-lg p-2.5 text-sm bg-white focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition"
+                        value={mapping[field.key] || ''}
+                        onChange={(e) => setMapping({...mapping, [field.key]: e.target.value})}
+                      >
+                        <option value="">-- Seleccionar Columna del Excel --</option>
+                        {excelColumns.map(col => (
+                          <option key={col.displayName} value={col.displayName}>
+                            {col.displayName} {col.originalName !== col.displayName ? `(${col.originalName})` : ''}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+                {showBrandCategoryConfig && (
+                  <div className="mt-6 p-4 bg-purple-50 rounded-lg border border-purple-200">
+                    <h4 className="font-bold text-purple-900 mb-3 flex items-center gap-2">
+                      <Sparkles className="w-4 h-4" />
+                      Extracción de Marca y Categoría
+                    </h4>
+                    <div className="space-y-3 text-sm">
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={brandCategoryConfig.extractFromName}
+                          onChange={(e) => setBrandCategoryConfig({...brandCategoryConfig, extractFromName: e.target.checked})}
+                          className="text-purple-600"
+                        />
+                        Extraer del Nombre del Producto
+                      </label>
+                      {mapping.description && (
+                        <label className="flex items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={brandCategoryConfig.extractFromDescription}
+                            onChange={(e) => setBrandCategoryConfig({...brandCategoryConfig, extractFromDescription: e.target.checked})}
+                            className="text-purple-600"
+                          />
+                          También usar la Descripción ({mapping.description})
+                        </label>
+                      )}
+                      <div className="mt-3 pt-3 border-t border-purple-200">
+                        <p className="font-medium text-purple-800 mb-2">Regla para Marca:</p>
+                        <select
+                          value={brandCategoryConfig.brandRule}
+                          onChange={(e) => setBrandCategoryConfig({...brandCategoryConfig, brandRule: e.target.value as any})}
+                          className="w-full p-2 border rounded text-xs"
+                        >
+                          <option value="keyword">Buscar por palabras clave (BAJAJ, CASTROL, etc.)</option>
+                          <option value="first_word">Primera palabra del nombre</option>
+                        </select>
+                      </div>
+                      <div className="mt-3">
+                        <p className="font-medium text-purple-800 mb-2">Regla para Categoría:</p>
+                        <select
+                          value={brandCategoryConfig.categoryRule}
+                          onChange={(e) => setBrandCategoryConfig({...brandCategoryConfig, categoryRule: e.target.value as any})}
+                          className="w-full p-2 border rounded text-xs"
+                        >
+                          <option value="keyword">Buscar por palabras clave (aceite→Aceites, filtro→Filtros)</option>
+                          <option value="first_word">Primera palabra no ignorada</option>
+                        </select>
+                      </div>
+                      <div className="mt-3 text-xs text-purple-600 bg-purple-100 p-2 rounded">
+                        <p className="font-medium">🔍 Ejemplo:</p>
+                        <p>"ACEITE BAJAJ 1.2 LTS" → Marca: BAJAJ, Categoría: Aceites</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {showAdvancedConfig && (
+                  <div className="mt-6 p-4 bg-blue-50 rounded-lg border border-blue-200">
+                    <h4 className="font-bold text-blue-900 mb-3 flex items-center gap-2">
+                      <Settings className="w-4 h-4" />
+                      Configuración de SKU y Barcode
+                    </h4>
+                    <div className="mb-4">
+                      <label className="text-sm font-medium text-blue-800 block mb-2">📝 Generación de SKU</label>
+                      <div className="space-y-2">
+                        <label className="flex items-center gap-2 text-sm">
+                          <input
+                            type="radio"
+                            checked={!advancedConfig.useExistingSku && advancedConfig.generateSku}
+                            onChange={() => setAdvancedConfig({...advancedConfig, generateSku: true, useExistingSku: false})}
+                            className="text-blue-600"
+                          />
+                          Generar automáticamente
+                        </label>
+                        {advancedConfig.generateSku && !advancedConfig.useExistingSku && (
+                          <div className="ml-6 mt-2 space-y-2">
+                            <input
+                              type="text"
+                              value={advancedConfig.skuTemplate}
+                              onChange={(e) => setAdvancedConfig({...advancedConfig, skuTemplate: e.target.value})}
+                              className="w-full text-xs p-2 border rounded font-mono"
+                              placeholder="{brand:3}-{category:3}-{num:4}"
+                            />
+                            <p className="text-xs text-blue-600">
+                              Variables: {'{brand:3}'}, {'{category:3}'}, {'{name:4}'}, {'{num:4}'}
+                            </p>
+                            <p className="text-xs text-gray-500">
+                              Ejemplo: ACE-BAJ-0001
+                            </p>
+                          </div>
+                        )}
+                        <label className="flex items-center gap-2 text-sm">
+                          <input
+                            type="radio"
+                            checked={advancedConfig.useExistingSku}
+                            onChange={() => setAdvancedConfig({...advancedConfig, useExistingSku: true, generateSku: false})}
+                            className="text-blue-600"
+                            disabled={!mapping.sku}
+                          />
+                          Usar columna existente del Excel {mapping.sku && `(${mapping.sku})`}
+                        </label>
+                      </div>
+                    </div>
+                    <div>
+                      <label className="text-sm font-medium text-blue-800 block mb-2">🔲 Generación de Barcode (EAN-13)</label>
+                      <div className="space-y-2">
+                        <label className="flex items-center gap-2 text-sm">
+                          <input
+                            type="radio"
+                            checked={!advancedConfig.useExistingBarcode && advancedConfig.generateBarcode}
+                            onChange={() => setAdvancedConfig({...advancedConfig, generateBarcode: true, useExistingBarcode: false})}
+                            className="text-blue-600"
+                          />
+                          Generar automáticamente
+                        </label>
+                        {advancedConfig.generateBarcode && !advancedConfig.useExistingBarcode && (
+                          <div className="ml-6 mt-2">
+                            <label className="text-xs text-gray-600 block mb-1">Prefijo de país:</label>
+                            <select
+                              value={advancedConfig.barcodePrefix}
+                              onChange={(e) => setAdvancedConfig({...advancedConfig, barcodePrefix: e.target.value})}
+                              className="w-full text-xs p-2 border rounded"
+                            >
+                              <option value="770">770 - Colombia</option>
+                              <option value="771">771 - Colombia</option>
+                              <option value="773">773 - Colombia</option>
+                              <option value="775">775 - Perú</option>
+                              <option value="777">777 - Bolivia</option>
+                              <option value="779">779 - Argentina</option>
+                              <option value="780">780 - Chile</option>
+                              <option value="786">786 - Ecuador</option>
+                              <option value="789">789 - Brasil</option>
+                            </select>
+                          </div>
+                        )}
+                        <label className="flex items-center gap-2 text-sm">
+                          <input
+                            type="radio"
+                            checked={advancedConfig.useExistingBarcode}
+                            onChange={() => setAdvancedConfig({...advancedConfig, useExistingBarcode: true, generateBarcode: false})}
+                            className="text-blue-600"
+                            disabled={!mapping.barcode}
+                          />
+                          Usar columna existente del Excel {mapping.barcode && `(${mapping.barcode})`}
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="bg-white p-5 rounded-xl shadow-sm flex flex-col max-h-[70vh]">
+                <div className="flex justify-between items-center mb-4">
+                  <h3 className="font-bold text-gray-800 flex items-center gap-2">
+                    <Eye className="w-5 h-5 text-blue-500" />
+                    Vista Previa de Datos ({excelColumns.length} columnas detectadas)
+                  </h3>
+                </div>
+                <div className="overflow-auto flex-1 border rounded-lg bg-gray-50">
+                  <table className="w-full text-xs text-left">
+                    <thead className="bg-gray-200 text-gray-600 uppercase sticky top-0 z-10">
+                      <tr>
+                        {excelColumns.map(col => (
+                          <th key={col.displayName} className="px-2 py-2 border-r border-gray-300 min-w-[100px]">
+                            {col.displayName}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-200 bg-white">
+                      {allRows.slice(0, 10).map((row, i) => (
+                        <tr key={i} className="hover:bg-blue-50 transition">
+                          {excelColumns.map(col => (
+                            <td key={col.displayName} className="px-2 py-2 border-r border-gray-200 truncate max-w-[150px]">
+                              {row[col.columnIndex] !== undefined ? String(row[col.columnIndex]) : '—'}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="mt-2 text-xs text-gray-500">
+                  Mostrando las primeras 10 filas de {allRows.length} totales
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="px-6 py-4 border-t bg-white flex justify-between items-center">
+          {step === 2 && (
+            <button
+              onClick={() => setStep(1)}
+              className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg font-medium transition"
+            >
+              ← Atrás
+            </button>
+          )}
+          <div className="flex gap-3 ml-auto">
+            {step === 2 && (
+              <button
+                onClick={() => setStep(3)}
+                disabled={!mapping.name || !mapping.salePrice}
+                className="px-6 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg transition flex items-center gap-2"
+              >
+                Ver Resumen <ChevronRight className="w-4 h-4" />
+              </button>
+            )}
+            {step === 3 && (
+              <>
+                <button
+                  onClick={() => setStep(2)}
+                  className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg font-medium transition"
+                >
+                  Editar Mapeo
+                </button>
+                <button
+                  onClick={handleImport}
+                  disabled={loading}
+                  className="px-6 py-2 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700 shadow-lg transition flex items-center gap-2"
+                >
+                  {loading ? (
+                    <>Importando...</>
+                  ) : (
+                    <>
+                      <CheckCircle2 className="w-5 h-5" /> Confirmar e Importar
+                    </>
+                  )}
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};

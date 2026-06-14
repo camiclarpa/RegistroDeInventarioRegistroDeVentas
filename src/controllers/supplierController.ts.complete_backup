@@ -1,0 +1,195 @@
+import { Request, Response } from 'express';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+const ok = (res: Response, data: unknown, status = 200) =>
+  res.status(status).json({ success: true, data });
+
+const fail = (res: Response, error: string, status = 400) =>
+  res.status(status).json({ success: false, error });
+
+// ─── GET /api/v1/purchases/suppliers ─────────────────────────────────────────
+export async function getSuppliers(req: Request, res: Response): Promise<Response> {
+  try {
+    const suppliers = await prisma.supplier.findMany({
+      orderBy: { name: 'asc' }
+    });
+    return ok(res, suppliers);
+  } catch (err) {
+    logger.error('[supplierController] getSuppliers', err);
+    return fail(res, 'Error al obtener proveedores', 500);
+  }
+}
+
+// ─── POST /api/v1/purchases/suppliers ────────────────────────────────────────
+export async function createSupplier(req: Request, res: Response): Promise<Response> {
+  try {
+    const { name, email, phone, address, taxId } = req.body;
+    const supplier = await prisma.supplier.create({
+      data: { name, email, phone, address, taxId }
+    });
+    return ok(res, supplier, 201);
+  } catch (err) {
+    logger.error('[supplierController] createSupplier', err);
+    return fail(res, 'Error al crear proveedor', 500);
+  }
+}
+
+// ─── GET /api/v1/purchases/suppliers/:id ─────────────────────────────────────
+export async function getSupplierById(req: Request, res: Response): Promise<Response> {
+  try {
+    const { id } = req.params;
+    const supplier = await prisma.supplier.findUnique({
+      where: { id: id as string }
+    });
+    if (!supplier) return fail(res, 'Proveedor no encontrado', 404);
+    return ok(res, supplier);
+  } catch (err) {
+    logger.error('[supplierController] getSupplierById', err);
+    return fail(res, 'Error al obtener proveedor', 500);
+  }
+}
+
+export async function deactivateSupplierHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const id = req.params.id as string;
+    const { reason } = req.body;
+
+    // 1. Validar motivo obligatorio
+    if (!reason || reason.trim().length < 5) {
+      return res.status(400).json({ success: false, error: 'El motivo de desactivación es obligatorio (mínimo 5 caracteres).' });
+    }
+
+    // 2. Validar existencia y verificar órdenes PENDIENTES
+    const supplier = await prisma.supplier.findUnique({
+      where: { id },
+      include: {
+        purchaseOrders: {
+          where: { status: 'PENDING' },
+          select: { id: true, orderNumber: true }
+        }
+      }
+    });
+
+    if (!supplier) {
+      return res.status(404).json({ success: false, error: 'Proveedor no encontrado' });
+    }
+
+    // 3. Bloquear si hay órdenes pendientes (Integridad Operativa)
+    if (supplier.purchaseOrders.length > 0) {
+      const orderNumbers = supplier.purchaseOrders.map((o: any) => o.orderNumber).join(', ');
+      return res.status(400).json({
+        success: false,
+        error: `No se puede desactivar: El proveedor tiene órdenes de compra PENDIENTES (${orderNumbers}). Recíbalas o cancélelas primero.`
+      });
+    }
+
+    // 4. Obtener usuario autenticado (o 'Sistema' por defecto)
+    const userId = (req as any).user?.id || 'Sistema';
+
+    // 5. Soft Delete con Auditoría Completa
+    await prisma.supplier.update({
+      where: { id },
+      data: {
+        isActive: false,
+        deactivationReason: reason,
+        deactivatedAt: new Date(),
+        deactivatedBy: userId
+      }
+    });
+
+    logger.info(`[supplierController] Proveedor desactivado: ${supplier.name} (${id}) por ${userId}. Motivo: ${reason}`);
+    return res.json({ success: true, message: 'Proveedor desactivado exitosamente' });
+  } catch (error: any) {
+    logger.error('[supplierController] deactivateSupplierHandler', error);
+    return res.status(500).json({ success: false, error: 'Error al desactivar el proveedor' });
+  }
+}
+
+export async function reactivateSupplierHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const id = req.params.id as string;
+    const supplier = await prisma.supplier.findUnique({ where: { id } });
+    
+    if (!supplier) return res.status(404).json({ success: false, error: 'Proveedor no encontrado' });
+    if (supplier.isActive) return res.status(400).json({ success: false, error: 'El proveedor ya está activo' });
+
+    await prisma.supplier.update({
+      where: { id },
+      data: { 
+        isActive: true, 
+        deactivationReason: null, 
+        deactivatedAt: null, 
+        deactivatedBy: null 
+      }
+    });
+
+    logger.info(`[supplierController] Proveedor reactivado: ${supplier.name} (${id})`);
+    return res.json({ success: true, message: 'Proveedor reactivado exitosamente' });
+  } catch (error: any) {
+    logger.error('[supplierController] reactivateSupplierHandler', error);
+    return res.status(500).json({ success: false, error: 'Error al reactivar el proveedor' });
+  }
+}
+
+// ─── GET /api/v1/purchases/suppliers/:id/stats ─────────────────────────────
+export async function getSupplierStats(req: Request, res: Response): Promise<Response> {
+  try {
+    const id = req.params.id as string;
+    
+    // Verificar que el proveedor existe
+    const supplier = await prisma.supplier.findUnique({ where: { id } });
+    if (!supplier) {
+      return res.status(404).json({ success: false, error: 'Proveedor no encontrado' });
+    }
+
+    // Obtener todas las órdenes de compra del proveedor
+    const orders = await prisma.purchaseOrder.findMany({
+      where: { supplierId: id },
+      select: {
+        id: true,
+        orderNumber: true,
+        status: true,
+        totalAmount: true,
+        createdAt: true,
+        receivedDate: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    // Calcular estadísticas
+    const totalOrders = orders.length;
+    const totalAmount = orders.reduce((sum, o) => sum + Number(o.totalAmount || 0), 0);
+    const lastOrder = orders[0]; // Ya está ordenado por createdAt desc
+
+    // Contar órdenes por estado
+    const ordersByStatus = {
+      PENDING: orders.filter(o => o.status === 'PENDING').length,
+      PARTIALLY_RECEIVED: orders.filter(o => o.status === 'PARTIALLY_RECEIVED').length,
+      RECEIVED: orders.filter(o => o.status === 'RECEIVED').length,
+      CANCELLED: orders.filter(o => o.status === 'CANCELLED').length,
+    };
+
+    // Última orden con fecha
+    const lastOrderDate = lastOrder ? lastOrder.createdAt.toISOString() : null;
+    const lastOrderNumber = lastOrder ? lastOrder.orderNumber : null;
+    const lastOrderStatus = lastOrder ? lastOrder.status : null;
+
+    logger.info(`[supplierController] Stats para proveedor ${id}: ${totalOrders} órdenes, $${totalAmount}`);
+
+    return res.json({
+      success: true,
+      data: {
+        totalOrders,
+        totalAmount: parseFloat(totalAmount.toFixed(2)),
+        lastOrderDate,
+        lastOrderNumber,
+        lastOrderStatus,
+        ordersByStatus,
+      },
+    });
+  } catch (error: any) {
+    logger.error('[supplierController] getSupplierStats', error);
+    return res.status(500).json({ success: false, error: 'Error al obtener estadísticas del proveedor' });
+  }
+}

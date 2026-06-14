@@ -1,0 +1,1038 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ENUMS
+// ═══════════════════════════════════════════════════════════════════════════
+
+enum MovementType {
+  ENTRY           // Compra / recepción de mercancía
+  EXIT            // Salida por venta o despacho
+  ADJUSTMENT_POS  // Ajuste positivo (conteo físico)
+  ADJUSTMENT_NEG  // Ajuste negativo (conteo físico)
+  MERMA           // Pérdida / daño irrecuperable
+  RETURN          // Devolución de cliente o proveedor
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  TRANSFER
+  MIXED
+  CREDIT       // Venta/compra a crédito — genera CxC o CxP
+  NEQUI        // Billetera digital
+  DAVIPLATA    // Billetera digital
+}
+
+// ─── Tesorería: estados y categorías ─────────────────────────────────────────
+
+enum DepositStatus {
+  PENDING      // Preparado para llevar al banco
+  IN_TRANSIT   // Enviado al banco, pendiente confirmación
+  RECONCILED   // Confirmado en extracto bancario
+}
+
+enum WithholdingType {
+  RETEFUENTE_35  // Retención en la fuente servicios 3.5%
+  RETEFUENTE_10  // Retención en la fuente honorarios 10%
+  RETEIVA_15     // Retención de IVA 15%
+  RETEICA_01     // Retención de ICA ~ 0.01%
+}
+
+enum ExpenseCategory {
+  OPERATIVO    // Servicios públicos, arriendo, suministros, nómina
+  FINANCIERO   // Comisiones bancarias, intereses de mora
+  IMPUESTO     // Retenciones, declaraciones tributarias
+  INVERSION    // Activos fijos, maquinaria, herramientas
+  VARIOS       // Otros gastos no clasificados
+}
+
+enum CashCountType {
+  OPENING    // Conteo de apertura de turno
+  CLOSING    // Conteo de cierre (CIEGO — cajero no ve saldo esperado)
+  SURPRISE   // Arqueo sorpresa solicitado por administrador
+  MIDDAY     // Conteo parcial en horario de operación
+}
+
+enum SaleStatus {
+  COMPLETED
+  CANCELLED
+  REFUNDED
+}
+
+enum PurchaseOrderStatus {
+  PENDING             // Creada, sin recibir nada
+  PARTIALLY_RECEIVED  // Se recibió parte
+  RECEIVED            // Completamente recibida
+  CANCELLED           // Cancelada (solo desde PENDING)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MÓDULO 1 — INVENTARIO
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Brand {
+  id        String    @id @default(cuid())
+  name      String    @unique
+  logoUrl   String?
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  products  Product[]
+
+  @@map("brands")
+}
+
+model Category {
+  id               String    @id @default(cuid())
+  name             String    @unique
+  slug             String    @unique
+  codePrefix       String    @db.VarChar(6)
+  marginPercentage Decimal   @default(30.00) @db.Decimal(5, 2)
+  isActive         Boolean   @default(true)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  products         Product[]
+
+  @@map("categories")
+}
+
+model Product {
+  id              String   @id @default(cuid())
+
+  skuInternal     String   @unique
+  barcodeExternal String?  @unique
+  partNumberOEM   String
+
+  brandId         String
+  categoryId      String
+  brand           Brand    @relation(fields: [brandId], references: [id])
+  category        Category @relation(fields: [categoryId], references: [id])
+
+  nameCommercial   String
+  descriptionTech  String?
+  compatibleModels Json    @default("[]")
+  imageKey         String?
+
+  locationBin     String
+
+  costPriceAvg    Decimal  @default(0.00) @db.Decimal(12, 4) // 4 decimales para costo promedio ponderado
+  salePriceBase   Decimal  @default(0.00) @db.Decimal(12, 2)
+  taxRate         Decimal  @default(19.00) @db.Decimal(5, 2)
+
+  stockQuantity   Int      @default(0)
+  minStockLevel   Int      @default(5)
+  maxStockLevel   Int?
+
+  warrantyDays    Int      @default(0)       // días de garantía (0 = sin garantía)
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  movements           InventoryMovement[]
+  auditLogs           ProductAuditLog[]
+  saleItems           SaleItem[]
+  purchaseOrderItems  PurchaseOrderItem[] // ← relación con Módulo 3
+
+  @@index([skuInternal])
+  @@index([barcodeExternal])
+  @@index([brandId, categoryId])
+  @@map("products")
+}
+
+model InventoryMovement {
+  id                String       @id @default(cuid())
+  productId         String
+  product           Product      @relation(fields: [productId], references: [id])
+
+  type              MovementType
+  quantity          Int
+  unitCostAtMoment  Decimal      @db.Decimal(12, 4)
+
+  referenceDoc      String?
+  reason            String?
+  performedByUserId String?
+
+  timestamp         DateTime     @default(now())
+
+  @@index([productId, timestamp])
+  @@map("inventory_movements")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MÓDULO 2 — VENTAS / POS
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Customer {
+  id                   String    @id @default(cuid())
+  name                 String
+  phone                String?   @unique
+  email                String?
+  identificationNumber String?   @unique
+  address              String?
+  isActive             Boolean   @default(true)
+
+  // ── CRM: Fidelización ──────────────────────────────────────────
+  preferences    String?
+  notes          String?
+  tags           String[]  @default([])
+  loyaltyPoints  Int       @default(0)
+  loyaltyTier    String    @default("BRONZE")    // BRONZE | SILVER | GOLD
+  totalSpent     Decimal   @default(0)  @db.Decimal(15, 2)
+  lastPurchaseAt DateTime?
+  purchaseCount  Int       @default(0)
+  creditLimit    Decimal?  @db.Decimal(15, 2)    // null = sin límite
+
+  // ── CRM Pro: RFM & Riesgo ─────────────────────────────────────
+  assignedUserId      String?  @map("assigned_user_id")
+  recencyDays         Int      @default(0) @map("recency_days")
+  frequency6m         Int      @default(0) @map("frequency_6m")
+  monetary6m          Decimal  @default(0) @db.Decimal(12,2) @map("monetary_6m")
+  rfmSegment          String   @default("REGULAR") @map("rfm_segment")
+  creditRiskScore     Int      @default(50) @map("credit_risk_score")
+  lastCommunicationAt DateTime? @map("last_communication_at")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sales              Sale[]
+  accountsReceivable AccountReceivable[]
+  motorcycles        Motorcycle[]
+  warranties         Warranty[]
+  logs               CommunicationLog[]
+  reminders          Reminder[]
+  communications     Communication[]
+  tickets            Ticket[]
+  quotes             Quote[]
+  workshopVisits     WorkshopVisit[]
+
+  @@index([phone])
+  @@index([name])
+  @@index([identificationNumber])
+  @@index([loyaltyTier])
+  @@index([rfmSegment])
+  @@index([creditRiskScore])
+  @@map("customers")
+}
+
+model Sale {
+  id             String        @id @default(cuid())
+  saleNumber     String        @unique
+
+  customerId     String?
+  customer       Customer?     @relation(fields: [customerId], references: [id])
+
+  userId         String
+
+  subtotal       Decimal       @db.Decimal(12, 2)
+  discountAmount Decimal       @default(0.00) @db.Decimal(12, 2)
+  taxAmount      Decimal       @db.Decimal(12, 2)
+  totalAmount    Decimal       @db.Decimal(12, 2)
+
+  paymentMethod  PaymentMethod
+  status         SaleStatus    @default(COMPLETED)
+  notes          String?
+
+  motorcycleId   String?       @map("motorcycle_id")
+  motorcycle     Motorcycle?   @relation(fields: [motorcycleId], references: [id])
+
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  items             SaleItem[]
+  accountReceivable AccountReceivable?
+
+  @@index([saleNumber])
+  @@index([customerId])
+  @@index([userId])
+  @@index([status, createdAt])
+  @@map("sales")
+}
+
+model SaleItem {
+  id      String @id @default(cuid())
+  saleId  String
+  sale    Sale   @relation(fields: [saleId], references: [id], onDelete: Cascade)
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+
+  productNameSnapshot String
+  skuSnapshot         String
+
+  quantity        Int
+  unitPrice       Decimal @db.Decimal(12, 2)
+  discountPerItem Decimal @default(0.00) @db.Decimal(12, 2)
+  lineTotal       Decimal @db.Decimal(12, 2)
+
+  @@index([saleId])
+  @@index([productId])
+  @@map("sale_items")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MÓDULO 3 — COMPRAS Y PROVEEDORES
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Supplier {
+  id            String   @id @default(cuid())
+  name          String
+  nit           String?  @unique
+  phone         String?
+  email         String?
+  address       String?
+  contactPerson String?
+  // Condiciones de pago acordadas, ej: "30 días", "Contado", "15 días"
+  paymentTerms  String?
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  purchaseOrders  PurchaseOrder[]
+  accountsPayable AccountPayable[]
+
+  @@index([nit])
+  @@index([name])
+  @@map("suppliers")
+}
+
+model PurchaseOrder {
+  id          String              @id @default(cuid())
+  // Consecutivo legible: OC-2026-00001
+  orderNumber String              @unique
+
+  supplierId  String
+  supplier    Supplier            @relation(fields: [supplierId], references: [id])
+
+  // Responsable de la compra (vinculado al módulo de Auth futuro)
+  userId      String
+
+  status      PurchaseOrderStatus @default(PENDING)
+
+  subtotal    Decimal             @db.Decimal(12, 2)
+  taxAmount   Decimal             @db.Decimal(12, 2)
+  totalAmount Decimal             @db.Decimal(12, 2)
+
+  // Fecha estimada de llegada (planificación)
+  expectedDate  DateTime?
+  // Fecha real de recepción completa (se asigna cuando status = RECEIVED)
+  receivedDate  DateTime?
+
+  notes       String?
+
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  items          PurchaseOrderItem[]
+  accountPayable AccountPayable?
+
+  @@index([orderNumber])
+  @@index([supplierId])
+  @@index([status, createdAt])
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderItem {
+  id              String        @id @default(cuid())
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+
+  // Snapshot del producto al momento de crear la OC
+  productNameSnapshot String
+  skuSnapshot         String
+
+  quantityOrdered  Int
+  // Acumulado de recepciones parciales. quantityOrdered - quantityReceived = pendiente
+  quantityReceived Int     @default(0)
+
+  // Costo acordado con el proveedor para esta OC
+  unitCost  Decimal @db.Decimal(12, 4)
+  // unitCost * quantityOrdered
+  lineTotal Decimal @db.Decimal(12, 2)
+
+  @@index([purchaseOrderId])
+  @@index([productId])
+  @@map("purchase_order_items")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MÓDULO 5 — USUARIOS, SEGURIDAD Y AUDITORÍA (RBAC)
+// ═══════════════════════════════════════════════════════════════════════════
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  name      String
+  roleId    String
+  role      Role     @relation(fields: [roleId], references: [id])
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  auditLogs             AuditLog[]
+  openedRegisters       CashRegister[]         @relation("CashRegisterOpenedBy")
+  closedRegisters       CashRegister[]         @relation("CashRegisterClosedBy")
+  financialTransactions FinancialTransaction[] @relation("FinTxPerformedBy")
+  approvedTransactions  FinancialTransaction[] @relation("FinTxApprovedBy")
+  paymentRecords        PaymentRecord[]        @relation("PaymentPerformedBy")
+  // Tesorería avanzada
+  cashCountsMade        CashCount[]            @relation("CashCountPerformedBy")
+  cashCountsApproved    CashCount[]            @relation("CashCountApprovedBy")
+  bankDepositsCreated   BankDeposit[]          @relation("BankDepositCreatedBy")
+  bankDepositsApproved  BankDeposit[]          @relation("BankDepositApprovedBy")
+  bankTransfers         BankTransfer[]         @relation("BankTransferCreatedBy")
+  budgets               Budget[]               @relation("BudgetCreatedBy")
+
+  @@index([email])
+  @@map("users")
+}
+
+model Role {
+  id          String           @id @default(cuid())
+  name        String           @unique
+  description String
+  users       User[]
+  permissions RolePermission[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String           @id @default(cuid())
+  name        String           @unique
+  description String
+  roles       RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  action    String
+  entity    String
+  entityId  String?
+  details   Json     @default("{}")
+  ipAddress String?
+  timestamp DateTime @default(now())
+
+  @@index([userId])
+  @@index([entity, entityId])
+  @@index([timestamp])
+  @@map("audit_logs")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MÓDULO 6 — GESTIÓN FINANCIERA, CAJA Y CUENTAS POR COBRAR/PAGAR
+// ═══════════════════════════════════════════════════════════════════════════
+
+enum CashRegisterStatus {
+  OPEN
+  CLOSED
+}
+
+enum TransactionType {
+  INCOME            // Entrada genérica (ej: venta de contado)
+  EXPENSE           // Gasto operativo (luz, agua, almuerzo)
+  WITHDRAWAL        // Retiro del dueño
+  DEPOSIT           // Depósito bancario desde caja
+  PAYMENT_RECEIVED  // Abono de cliente a su deuda (CxC)
+  PAYMENT_MADE      // Pago a proveedor (CxP)
+}
+
+enum AccountStatus {
+  PENDING          // Deuda sin ningún abono
+  PARTIALLY_PAID   // Con abonos pero saldo pendiente
+  PAID             // Saldada completamente
+  OVERDUE          // Vencida (dueDate superado y no pagada)
+}
+
+model CashRegister {
+  id                     String              @id @default(cuid())
+  openedByUserId         String
+  closedByUserId         String?
+  openedBy               User                @relation("CashRegisterOpenedBy", fields: [openedByUserId], references: [id])
+  closedBy               User?               @relation("CashRegisterClosedBy", fields: [closedByUserId], references: [id])
+
+  openingBalance         Decimal             @db.Decimal(12, 2)
+  closingBalance         Decimal?            @db.Decimal(12, 2)  // Conteo físico al cerrar (ciego)
+  expectedClosingBalance Decimal?            @db.Decimal(12, 2)  // Calculado por el sistema
+  difference             Decimal?            @db.Decimal(12, 2)  // closing - expected (negativo = falta plata)
+  differenceStatus       String?             // CUADRADO | SOBRANTE | FALTANTE
+
+  // Control de riesgo
+  requiresAdminReview    Boolean             @default(false)  // diff > umbral configurable
+  approvedByUserId       String?
+
+  status                 CashRegisterStatus  @default(OPEN)
+  openedAt               DateTime            @default(now())
+  closedAt               DateTime?
+  notes                  String?
+
+  transactions  FinancialTransaction[]
+  cashCounts    CashCount[]
+  bankDeposits  BankDeposit[]
+
+  @@index([status])
+  @@index([openedByUserId])
+  @@map("cash_registers")
+}
+
+model FinancialTransaction {
+  id              String          @id @default(cuid())
+  cashRegisterId  String
+  cashRegister    CashRegister    @relation(fields: [cashRegisterId], references: [id])
+
+  type            TransactionType
+  amount          Decimal         @db.Decimal(12, 2)
+  description     String
+  category        String          // "Venta", "Pago Proveedor", "Servicios", "Retiro Dueño"
+
+  // Clasificación de gastos (Pilar 5)
+  expenseCategory ExpenseCategory?
+
+  referenceType   String?         // "SALE", "PURCHASE_ORDER", "PAYMENT_RECORD"
+  referenceId     String?         // UUID del documento origen
+
+  paymentMethod   PaymentMethod   @default(CASH)
+
+  // Comisión bancaria calculada automáticamente (Pilar 3)
+  bankingCommission Decimal?      @db.Decimal(12, 2)
+
+  // Flujo de aprobaciones por límite (Pilar 5)
+  requiresApproval  Boolean       @default(false)
+  approvedByUserId  String?
+  approvedBy        User?         @relation("FinTxApprovedBy", fields: [approvedByUserId], references: [id])
+  approvedAt        DateTime?
+
+  performedByUserId String
+  performedBy       User          @relation("FinTxPerformedBy", fields: [performedByUserId], references: [id])
+
+  timestamp         DateTime      @default(now())
+
+  // Retención en la fuente asociada (Pilar 4)
+  taxWithholding    TaxWithholding?
+
+  @@index([cashRegisterId])
+  @@index([type])
+  @@index([timestamp])
+  @@index([expenseCategory])
+  @@map("financial_transactions")
+}
+
+model AccountReceivable {
+  id               String        @id @default(cuid())
+  saleId           String        @unique
+  sale             Sale          @relation(fields: [saleId], references: [id])
+  customerId       String
+  customer         Customer      @relation(fields: [customerId], references: [id])
+
+  totalDebt        Decimal       @db.Decimal(12, 2)
+  paidAmount       Decimal       @default(0.00) @db.Decimal(12, 2)
+  remainingBalance Decimal       @db.Decimal(12, 2)
+
+  dueDate          DateTime?
+  status           AccountStatus @default(PENDING)
+  daysOverdue      Int           @default(0) @map("days_overdue")
+  agingBucket      String        @default("CURRENT") @map("aging_bucket")
+
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  payments         PaymentRecord[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([dueDate])
+  @@index([agingBucket])
+  @@map("accounts_receivable")
+}
+
+model AccountPayable {
+  id               String        @id @default(cuid())
+  purchaseOrderId  String        @unique
+  purchaseOrder    PurchaseOrder @relation(fields: [purchaseOrderId], references: [id])
+  supplierId       String
+  supplier         Supplier      @relation(fields: [supplierId], references: [id])
+
+  totalDebt        Decimal       @db.Decimal(12, 2)
+  paidAmount       Decimal       @default(0.00) @db.Decimal(12, 2)
+  remainingBalance Decimal       @db.Decimal(12, 2)
+
+  dueDate          DateTime?
+  status           AccountStatus @default(PENDING)
+
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  payments         PaymentRecord[]
+
+  @@index([supplierId])
+  @@index([status])
+  @@index([dueDate])
+  @@map("accounts_payable")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MÓDULO 8 — CONFIGURACIÓN DEL NEGOCIO (singleton)
+// ═══════════════════════════════════════════════════════════════════════════
+
+model BusinessConfig {
+  id             String   @id @default("main")
+  businessName   String   @default("TALLER Y REPUESTOS CLAVIJOS MOTOS")
+  nit            String   @default("900.XXX.XXX-X")
+  address        String   @default("CRA 16 6-40 AGUACHICA CESAR")
+  phone          String   @default("3117379097")
+  email          String?
+  logoKey        String?
+  taxRate        Decimal  @default(19.00) @db.Decimal(5, 2)
+  resolutionDian String?
+  footer         String   @default("¡Gracias por su compra! Garantía según política de fábrica.")
+  updatedAt      DateTime @updatedAt
+
+  @@map("business_config")
+}
+
+model PaymentRecord {
+  id                   String             @id @default(cuid())
+  accountReceivableId  String?
+  accountReceivable    AccountReceivable? @relation(fields: [accountReceivableId], references: [id])
+  accountPayableId     String?
+  accountPayable       AccountPayable?    @relation(fields: [accountPayableId], references: [id])
+
+  amount               Decimal            @db.Decimal(12, 2)
+  paymentMethod        PaymentMethod      @default(CASH)
+  referenceDoc         String?            // Número de comprobante / recibo
+  note                 String?
+
+  performedByUserId    String
+  performedBy          User               @relation("PaymentPerformedBy", fields: [performedByUserId], references: [id])
+
+  timestamp            DateTime           @default(now())
+
+  @@index([accountReceivableId])
+  @@index([accountPayableId])
+  @@map("payment_records")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MÓDULO 7 — TESORERÍA BANCARIA (8 Pilares)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Pilar 1: Conteo Ciego (Blind Count Anti-Fraude) ─────────────────────────
+
+model CashCount {
+  id              String        @id @default(cuid())
+  cashRegisterId  String
+  cashRegister    CashRegister  @relation(fields: [cashRegisterId], references: [id])
+
+  countedByUserId  String
+  countedBy        User          @relation("CashCountPerformedBy", fields: [countedByUserId], references: [id])
+
+  approvedByUserId String?
+  approvedBy       User?         @relation("CashCountApprovedBy", fields: [approvedByUserId], references: [id])
+
+  type             CashCountType @default(CLOSING)
+
+  // Conteo detallado por denominaciones: [{denom: 50000, qty: 10, subtotal: 500000}]
+  denominations    Json          @default("[]")
+  totalCounted     Decimal       @db.Decimal(12, 2)
+
+  // Sistema revela saldo DESPUÉS del conteo (anti-fraude)
+  systemExpected   Decimal       @db.Decimal(12, 2)
+  difference       Decimal       @db.Decimal(12, 2)  // totalCounted - systemExpected
+  differenceStatus String?       // CUADRADO | SOBRANTE | FALTANTE
+
+  // CIEGO: cajero NO vio el saldo esperado antes de contar
+  isBlindCount     Boolean       @default(true)
+  requiresApproval Boolean       @default(false) // diff > THRESHOLD configurable
+
+  observations     String?
+  countedAt        DateTime      @default(now())
+
+  @@index([cashRegisterId])
+  @@index([countedAt])
+  @@index([type])
+  @@map("cash_counts")
+}
+
+// ─── Pilar 2: Depósitos Bancarios ────────────────────────────────────────────
+
+model BankDeposit {
+  id              String        @id @default(cuid())
+  cashRegisterId  String?
+  cashRegister    CashRegister? @relation(fields: [cashRegisterId], references: [id])
+
+  amount          Decimal       @db.Decimal(12, 2)
+  bankName        String        // Bancolombia | Davivienda | Nequi | Daviplata | Efecty
+  accountNumber   String?       // Últimos 4 dígitos de la cuenta
+  reference       String?       // Número de comprobante / voucher
+  receiptImageKey String?       // Clave S3 / imagen del recibo
+
+  status          DepositStatus @default(PENDING)
+  depositDate     DateTime
+  reconciledAt    DateTime?     // Cuando se confirma en extracto
+
+  notes           String?
+
+  createdByUserId  String
+  createdBy        User          @relation("BankDepositCreatedBy", fields: [createdByUserId], references: [id])
+
+  approvedByUserId String?
+  approvedBy       User?         @relation("BankDepositApprovedBy", fields: [approvedByUserId], references: [id])
+
+  createdAt       DateTime      @default(now())
+
+  @@index([status])
+  @@index([depositDate])
+  @@index([bankName])
+  @@map("bank_deposits")
+}
+
+// ─── Pilar 2: Transferencias Interbancarias (no son gastos) ──────────────────
+
+model BankTransfer {
+  id             String   @id @default(cuid())
+  fromAccount    String   // "Bancolombia 001" | "Caja" | "Nequi"
+  toAccount      String   // "Davivienda" | "Nequi" | "Caja"
+  amount         Decimal  @db.Decimal(12, 2)
+  reference      String?
+  description    String
+
+  createdByUserId String
+  createdBy       User    @relation("BankTransferCreatedBy", fields: [createdByUserId], references: [id])
+
+  transferDate   DateTime @default(now())
+  createdAt      DateTime @default(now())
+
+  @@index([transferDate])
+  @@map("bank_transfers")
+}
+
+// ─── Pilar 4: Retenciones en la Fuente ───────────────────────────────────────
+
+model TaxWithholding {
+  id                String              @id @default(cuid())
+  transactionId     String              @unique
+  transaction       FinancialTransaction @relation(fields: [transactionId], references: [id])
+
+  type              WithholdingType
+  percentage        Decimal             @db.Decimal(5, 2)   // 3.5 | 10 | 15 | 1
+  baseAmount        Decimal             @db.Decimal(12, 2)  // Monto bruto del gasto
+  withholdingAmount Decimal             @db.Decimal(12, 2)  // baseAmount * percentage/100
+  netAmount         Decimal             @db.Decimal(12, 2)  // baseAmount - withholdingAmount (sale de caja)
+
+  createdAt         DateTime            @default(now())
+
+  @@map("tax_withholdings")
+}
+
+// ─── Pilar 5: Presupuesto por Categoría (Budget vs Real) ─────────────────────
+
+model Budget {
+  id          String          @id @default(cuid())
+  category    ExpenseCategory
+  amount      Decimal         @db.Decimal(12, 2)  // Presupuesto mensual
+  month       Int             // 1-12
+  year        Int
+  alertAt     Int             @default(80)         // % de ejecución que dispara alerta
+
+  createdByUserId String
+  createdBy       User    @relation("BudgetCreatedBy", fields: [createdByUserId], references: [id])
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([category, month, year])
+  @@index([month, year])
+  @@map("budgets")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MÓDULO 6-CRM — FIDELIZACIÓN Y GESTIÓN DE CLIENTES
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Motorcycle {
+  id         String   @id @default(cuid())
+  plate      String   @unique
+  brand      String
+  model      String
+  year       Int?
+  lastKm     Int?
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  sales          Sale[]
+  workshopVisits WorkshopVisit[]
+  createdAt  DateTime @default(now())
+
+  @@index([customerId])
+  @@index([plate])
+  @@map("motorcycles")
+}
+
+model Warranty {
+  id          String   @id @default(cuid())
+  customerId  String
+  customer    Customer @relation(fields: [customerId], references: [id])
+  saleItemId  String
+  productName String
+  days        Int
+  expiresAt   DateTime
+  status      String   @default("ACTIVE")   // ACTIVE | CLAIMED | EXPIRED
+  claimNotes  String?
+  createdAt   DateTime @default(now())
+
+  @@index([customerId])
+  @@index([status, expiresAt])
+  @@map("warranties")
+}
+
+model CommunicationLog {
+  id          String   @id @default(cuid())
+  customerId  String
+  customer    Customer @relation(fields: [customerId], references: [id])
+  type        String   // NOTE | PAYMENT_RECEIVED | CREDIT_CREATED | INVOICE_SENT | CALL | VISIT
+  message     String
+  performedBy String   // userId del usuario que registró la interacción
+  createdAt   DateTime @default(now())
+
+  @@index([customerId])
+  @@index([type])
+  @@map("communication_logs")
+}
+
+model Reminder {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+  type       String   // PAYMENT_DUE | WARRANTY_EXPIRY | FOLLOW_UP | OIL_CHANGE
+  message    String
+  dueDate    DateTime
+  isSent     Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  @@index([customerId])
+  @@index([isSent, dueDate])
+  @@map("reminders")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MÓDULO CRM PRO — Comunicaciones, Tickets, Cotizaciones, Taller
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Communication {
+  id           String   @id @default(cuid())
+  customerId   String   @map("customer_id")
+  customer     Customer @relation(fields: [customerId], references: [id])
+  direction    String   @default("OUTBOUND") @map("direction")
+  channel      String   @map("channel")
+  message      String   @map("message")
+  status       String   @default("SENT") @map("status")
+  isRead       Boolean  @default(false) @map("is_read")
+  readAt       DateTime? @map("read_at")
+  sentByUserId String   @map("sent_by_user_id")
+  metadata     Json?    @map("metadata")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([customerId, channel, status])
+  @@index([createdAt])
+  @@map("communications")
+}
+
+model Ticket {
+  id          String   @id @default(cuid())
+  customerId  String   @map("customer_id")
+  customer    Customer @relation(fields: [customerId], references: [id])
+  subject     String   @map("subject")
+  description String   @map("description")
+  status      String   @default("OPEN") @map("status")
+  priority    String   @default("MEDIUM") @map("priority")
+  assignedTo  String?  @map("assigned_to")
+  resolvedAt  DateTime? @map("resolved_at")
+  resolvedBy  String?  @map("resolved_by")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@index([customerId, status])
+  @@index([assignedTo, status])
+  @@map("tickets")
+}
+
+model Quote {
+  id          String   @id @default(cuid())
+  customerId  String   @map("customer_id")
+  customer    Customer @relation(fields: [customerId], references: [id])
+  items       Json     @default("[]") @map("items")
+  subtotal    Decimal  @db.Decimal(12,2) @map("subtotal")
+  discount    Decimal  @default(0.00) @db.Decimal(12,2) @map("discount")
+  total       Decimal  @db.Decimal(12,2) @map("total")
+  status      String   @default("DRAFT") @map("status")
+  expiresAt   DateTime? @map("expires_at")
+  notes       String?  @map("notes")
+  createdById String   @map("created_by_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  deliveries  QuoteDelivery[]
+
+  @@index([customerId, status])
+  @@index([createdAt])
+  @@map("quotes")
+}
+
+model QuoteDelivery {
+  id          String   @id @default(cuid())
+  quoteId     String   @map("quote_id")
+  quote       Quote    @relation(fields: [quoteId], references: [id])
+  channel     String   @map("channel")
+  status      String   @default("PENDING") @map("status")
+  link        String?  @map("link")
+  sentAt      DateTime? @map("sent_at")
+  attemptedBy String   @map("attempted_by")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([quoteId, status])
+  @@map("quote_deliveries")
+}
+
+model WorkshopVisit {
+  id              String      @id @default(cuid())
+  customerId      String      @map("customer_id")
+  customer        Customer    @relation(fields: [customerId], references: [id])
+  motorcycleId    String?     @map("motorcycle_id")
+  motorcycle      Motorcycle? @relation(fields: [motorcycleId], references: [id])
+  kmReal          Int?        @map("km_real")
+  services        String[]    @default([]) @map("services")
+  technician      String?     @map("technician")
+  totalCost       Decimal     @db.Decimal(12,2) @map("total_cost")
+  status          String      @default("COMPLETED") @map("status")
+  notes           String?     @map("notes")
+  nextServiceKm   Int?        @map("next_service_km")
+  nextServiceDate DateTime?   @map("next_service_date")
+  createdAt       DateTime    @default(now()) @map("created_at")
+
+  @@index([customerId, createdAt])
+  @@index([motorcycleId])
+  @@map("workshop_visits")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MÓDULO ADMIN — Notificaciones, Respaldos, Auditoría de Sistema
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  type      String   @map("type")
+  title     String   @map("title")
+  message   String   @map("message")
+  isRead    Boolean  @default(false) @map("is_read")
+  readAt    DateTime? @map("read_at")
+  metadata  Json?    @map("metadata")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId, isRead, createdAt])
+  @@map("notifications")
+}
+
+model SystemBackup {
+  id          String   @id @default(cuid())
+  type        String   @default("FULL") @map("type")
+  status      String   @default("PENDING") @map("status")
+  size        Decimal? @map("size")
+  checksum    String?  @map("checksum")
+  storageUrl  String?  @map("storage_url")
+  triggeredBy String   @map("triggered_by")
+  startedAt   DateTime? @map("started_at")
+  completedAt DateTime? @map("completed_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([status, createdAt])
+  @@map("system_backups")
+}
+
+model SystemAudit {
+  id        String   @id @default(cuid())
+  userId    String?  @map("user_id")
+  action    String   @map("action")
+  entity    String   @map("entity")
+  entityId  String?  @map("entity_id")
+  ipAddress String?  @map("ip_address")
+  userAgent String?  @map("user_agent")
+  metadata  Json?    @map("metadata")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId, action, createdAt])
+  @@map("system_audits")
+}
+
+model ProductAuditLog {
+  id          String   @id @default(cuid())
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id])
+  userId      String?
+  userName    String   @default("Sistema")
+  userEmail   String   @default("")
+  fieldName   String
+  oldValue    String?
+  newValue    String?
+  changeType  String   @default("UPDATE")
+  reason      String?
+  ipAddress   String?
+  createdAt   DateTime @default(now())
+
+  @@index([productId, createdAt])
+  @@index([createdAt])
+  @@map("product_audit_logs")
+}
+
+// ─── CONFIGURACIÓN DEL NEGOCIO ─────────────────────────────────────
+model BusinessSettings {
+  id                    String   @id @default(cuid())
+  
+  // Información básica
+  businessName          String   @default("Mi Negocio")
+  nit                   String?
+  address               String?
+  phone                 String?
+  email                 String?
+  
+  // Configuración fiscal
+  defaultIva            Float    @default(19.0)
+  dianResolution        String?  // Número de resolución DIAN
+  dianResolutionDate    DateTime?
+  
+  // Configuración de documentos
+  ticketFooter          String?  @default("Gracias por su compra")
+  invoicePrefix         String?  @default("FAC")
+  
+  // Logo y branding
+  logoPath              String?
+  
+  // Metadatos
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  
+  @@map("business_settings")
+}

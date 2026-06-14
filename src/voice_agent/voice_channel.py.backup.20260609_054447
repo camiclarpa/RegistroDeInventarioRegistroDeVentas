@@ -1,0 +1,113 @@
+"""
+Voice Channel - Manejador principal de sesiones de voz
+Integra STT → Multi-Agent → TTS
+"""
+import asyncio
+import json
+from typing import Dict, Any
+from fastapi import WebSocket, WebSocketDisconnect
+
+from .stt.groq_whisper import GroqWhisperSTT
+from .tts.piper_engine import PiperTTS
+from .agents.orchestrator import VoiceMultiAgentOrchestrator
+from .audio.vad import SileroVAD
+
+class VoiceChannel:
+    """Canal de voz completo para SIGC-Motos"""
+    
+    def __init__(self):
+        self.stt = GroqWhisperSTT()
+        self.tts = PiperTTS()
+        self.orchestrator = VoiceMultiAgentOrchestrator()
+        self.vad = SileroVAD()
+        
+        # Estado de la sesión
+        self.session_data: Dict[str, Any] = {
+            "product_data": {},
+            "current_field": None,
+            "fields_completed": []
+        }
+    
+    async def handle_voice_session(self, websocket: WebSocket):
+        """
+        Maneja una sesión de voz completa vía WebSocket
+        
+        Flujo:
+        1. Saludar y explicar el proceso
+        2. Preguntar por cada campo (nombre, categoría, marca, precio, cantidad)
+        3. Confirmar datos
+        4. Guardar producto
+        """
+        await websocket.accept()
+        
+        audio_buffer = []
+        is_speaking = False
+        
+        try:
+            # Saludo inicial
+            greeting = "Hola, soy el asistente de voz para compras. Voy a ayudarte a registrar un nuevo producto. Empecemos: ¿Cuál es el nombre del producto?"
+            await self._send_tts_response(websocket, greeting)
+            
+            while True:
+                try:
+                    # Recibir audio del cliente
+                    audio_chunk = await websocket.receive_bytes()
+                    
+                    # Detectar si hay voz
+                    if await self.vad.is_speech(audio_chunk):
+                        audio_buffer.append(audio_chunk)
+                        is_speaking = True
+                    elif is_speaking:
+                        # Fin del enunciado - procesar
+                        is_speaking = False
+                        
+                        if audio_buffer:
+                            await self._process_user_utterance(
+                                audio_buffer,
+                                websocket
+                            )
+                            audio_buffer = []
+                
+                except WebSocketDisconnect:
+                    print("Cliente desconectado")
+                    break
+        
+        except Exception as e:
+            print(f"Error en sesión de voz: {e}")
+            await websocket.close()
+    
+    async def _process_user_utterance(self, audio_chunks: list, websocket: WebSocket):
+        """
+        Procesa un enunciado completo del usuario
+        """
+        # 1. Speech-to-Text
+        combined_audio = b"".join(audio_chunks)
+        user_text = await self.stt.transcribe(combined_audio)
+        
+        if not user_text.strip():
+            return
+        
+        print(f"🎤 Usuario: {user_text}")
+        
+        # 2. Procesar con Multi-Agente
+        agent_result = await self.orchestrator.process(
+            user_text,
+            context={"product_data": self.session_data["product_data"]}
+        )
+        
+        response_text = agent_result["response"]
+        print(f"🤖 Agente: {response_text}")
+        
+        # Actualizar estado
+        if "product_data" in agent_result:
+            self.session_data["product_data"].update(agent_result["product_data"])
+        
+        # 3. Text-to-Speech y enviar respuesta
+        await self._send_tts_response(websocket, response_text)
+    
+    async def _send_tts_response(self, websocket: WebSocket, text: str):
+        """
+        Sintetiza texto a voz y lo envía por WebSocket
+        """
+        async for audio_chunk in self.tts.synthesize_stream(text):
+            await websocket.send_bytes(audio_chunk)

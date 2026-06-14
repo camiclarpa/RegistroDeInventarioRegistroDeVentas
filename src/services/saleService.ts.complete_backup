@@ -1,0 +1,406 @@
+import { Prisma } from '@prisma/client';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+import { generateSaleNumber } from '../utils/saleNumberGenerator';
+import type { CreateSaleInput, ListSalesQuery, CancelSaleInput } from '../utils/validators';
+import { refreshCustomerRfm } from './crmAnalyticsService';
+
+// ─── Tipos internos ──────────────────────────────────────────────────────────
+
+// Cliente de transacción interactiva de Prisma
+type PrismaTx = Omit<
+  typeof prisma,
+  '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'
+>;
+
+// Error tipado para stock insuficiente — permite identificarlo en el controller
+export class InsufficientStockError extends Error {
+  constructor(
+    public readonly productName: string,
+    public readonly available: number,
+    public readonly requested: number,
+  ) {
+    super(
+      `Stock insuficiente para "${productName}". Disponible: ${available}, solicitado: ${requested}.`,
+    );
+    this.name = 'InsufficientStockError';
+  }
+}
+
+// ─── Lógica interna de ítems ─────────────────────────────────────────────────
+
+interface ProcessedItem {
+  productId: string;
+  productNameSnapshot: string;
+  skuSnapshot: string;
+  quantity: number;
+  unitPrice: string;
+  discountPerItem: string;
+  lineTotal: string;
+}
+
+/**
+ * Procesa cada ítem dentro de la transacción:
+ *  1. Lee el producto (con lock implícito en la fila por la transacción)
+ *  2. Valida que hay stock suficiente
+ *  3. Descuenta el stock del producto
+ *  4. Crea el movimiento de inventario tipo EXIT
+ *  5. Devuelve el objeto listo para insertar en SaleItem
+ */
+async function processItem(
+  tx: PrismaTx,
+  rawItem: CreateSaleInput['items'][number],
+  saleNumber: string,
+  userId: string,
+): Promise<{ item: ProcessedItem; lineSubtotal: number }> {
+  const product = await tx.product.findUnique({
+    where: { id: rawItem.productId },
+    select: {
+      id: true,
+      nameCommercial: true,
+      skuInternal: true,
+      costPriceAvg: true,
+      salePriceBase: true,
+      stockQuantity: true,
+      isActive: true,
+    },
+  });
+
+  if (!product) {
+    throw new Error(`Producto con id "${rawItem.productId}" no encontrado.`);
+  }
+  if (!product.isActive) {
+    throw new Error(`El producto "${product.nameCommercial}" está desactivado y no se puede vender.`);
+  }
+  if (product.stockQuantity < rawItem.quantity) {
+    throw new InsufficientStockError(
+      product.nameCommercial,
+      product.stockQuantity,
+      rawItem.quantity,
+    );
+  }
+
+  const unitPrice = rawItem.unitPrice ?? Number(product.salePriceBase);
+  const discountPerItem = rawItem.discountPerItem;
+  // lineTotal = precio × cantidad - descuento por ítem
+  const lineTotal = parseFloat(
+    (unitPrice * rawItem.quantity - discountPerItem).toFixed(2),
+  );
+
+  const newStock = product.stockQuantity - rawItem.quantity;
+
+  // Descontar stock
+  await tx.product.update({
+    where: { id: rawItem.productId },
+    data: { stockQuantity: newStock },
+  });
+
+  // Registrar movimiento EXIT en inventario (trazabilidad completa)
+  await tx.inventoryMovement.create({
+    data: {
+      productId: rawItem.productId,
+      type: 'EXIT',
+      quantity: rawItem.quantity,
+      unitCostAtMoment: product.costPriceAvg,
+      referenceDoc: saleNumber,
+      reason: `SALE-${saleNumber}`,
+      performedByUserId: userId,
+    },
+  });
+
+  return {
+    item: {
+      productId: rawItem.productId,
+      productNameSnapshot: product.nameCommercial,
+      skuSnapshot: product.skuInternal,
+      quantity: rawItem.quantity,
+      unitPrice: String(unitPrice),
+      discountPerItem: String(discountPerItem),
+      lineTotal: String(lineTotal),
+    },
+    lineSubtotal: lineTotal,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SERVICIO PRINCIPAL
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Crea una venta completa en una única transacción atómica.
+ *
+ * Si cualquier ítem no tiene stock suficiente, toda la transacción se revierte:
+ * ni el stock ni los movimientos ni la venta quedan parcialmente guardados.
+ */
+export async function createSale(data: CreateSaleInput, userId: string) {
+  logger.info('Starting sale creation transaction', {
+    userId,
+    itemCount: data.items.length,
+    paymentMethod: data.paymentMethod,
+  });
+
+  const sale = await prisma.$transaction(async (tx) => {
+    // 1. Número de venta consecutivo (dentro de la TX para evitar race conditions)
+    const saleNumber = await generateSaleNumber(tx as unknown as Parameters<typeof generateSaleNumber>[0]);
+
+    // 2. Procesar ítems: valida stock, descuenta, crea movimientos
+    let subtotal = 0;
+    const processedItems: ProcessedItem[] = [];
+
+    for (const rawItem of data.items) {
+      const { item, lineSubtotal } = await processItem(tx as PrismaTx, rawItem, saleNumber, userId);
+      processedItems.push(item);
+      subtotal += lineSubtotal;
+    }
+
+    // 3. Calcular totales financieros
+    const discountAmount = data.discountAmount;
+    // Base gravable = subtotal - descuento global
+    const taxableBase = Math.max(0, subtotal - discountAmount);
+    // IVA 19% sobre la base gravable
+    const taxAmount = parseFloat((taxableBase * 0.19).toFixed(2));
+    const totalAmount = parseFloat((taxableBase + taxAmount).toFixed(2));
+
+    // 4. Crear la venta con sus ítems en una sola escritura
+    const created = await (tx as PrismaTx).sale.create({
+      data: {
+        saleNumber,
+        customerId: data.customerId ?? null,
+        customerName: data.customerName ?? null,
+        customerIdentification: data.customerIdentification ?? null,
+        userId,
+        subtotal: String(parseFloat(subtotal.toFixed(2))),
+        discountAmount: String(discountAmount),
+        taxAmount: String(taxAmount),
+        totalAmount: String(totalAmount),
+        paymentMethod: data.paymentMethod,
+        status: 'COMPLETED',
+        notes: data.notes,
+        items: { create: processedItems },
+      },
+      include: {
+        items: true,
+        customer: true,
+      },
+    });
+
+    logger.info('Sale created successfully', {
+      saleId: created.id,
+      saleNumber: created.invoiceNumber,
+      total: totalAmount,
+    });
+
+    return created;
+  });
+
+  // Actualizar estadísticas del cliente y crear garantías (fuera de la transacción)
+  if (sale.customerId) {
+    await updateCustomerAfterSale(sale.customerId, sale.id, Number(sale.totalAmount));
+  }
+
+  return sale;
+}
+
+export async function getSaleById(id: string) {
+  return prisma.sales.findFirst({
+    where: { OR: [{ id }, { saleNumber: id }] },
+    include: {
+      customer: true,
+      items: {
+        include: {
+          product: {
+            select: {
+              id: true,
+              skuInternal: true,
+              nameCommercial: true,
+              locationBin: true,
+              isActive: true,
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
+/**
+ * Cancela una venta COMPLETED:
+ *  - Cambia status a CANCELLED
+ *  - Revierte el stock de cada ítem (RETURN movement)
+ * Todo en una transacción atómica.
+ */
+export async function cancelSale(
+  id: string,
+  data: CancelSaleInput,
+  userId: string,
+) {
+  const sale = await prisma.sales.findUnique({
+    where: { id },
+    include: { items: true },
+  });
+
+  if (!sale) throw new Error('Venta no encontrada.');
+  if (sale.status !== SaleStatus.COMPLETED) {
+    throw new Error(`No se puede cancelar una venta en estado "${sale.status}".`);
+  }
+
+  await prisma.$transaction(async (tx) => {
+    // Revertir stock e inventario por cada ítem
+    for (const item of sale.items) {
+      const product = await (tx as PrismaTx).product.findUnique({
+        where: { id: item.productId },
+        select: { stockQuantity: true, costPriceAvg: true },
+      });
+
+      if (product) {
+        await (tx as PrismaTx).product.update({
+          where: { id: item.productId },
+          data: { stockQuantity: product.stockQuantity + item.quantity },
+        });
+
+        await (tx as PrismaTx).inventoryMovement.create({
+          data: {
+            productId: item.productId,
+            type: 'RETURN',
+            quantity: item.quantity,
+            unitCostAtMoment: product.costPriceAvg,
+            referenceDoc: sale.invoiceNumber,
+            reason: `CANCEL-${sale.invoiceNumber}: ${data.reason}`,
+            performedByUserId: userId,
+          },
+        });
+      }
+    }
+
+    // Marcar la venta como cancelada
+    await (tx as PrismaTx).sale.update({
+      where: { id },
+      data: { status: 'CANCELLED', notes: `[CANCELADA] ${data.reason}` },
+    });
+  });
+
+  logger.info('Sale cancelled', { saleId: id, saleNumber: sale.invoiceNumber, userId });
+
+  return { saleNumber: sale.invoiceNumber, status: 'CANCELLED' };
+}
+
+export async function getSales(query: ListSalesQuery) {
+  const {
+    page,
+    limit,
+    startDate,
+    endDate,
+    customerId,
+    status,
+    paymentMethod,
+    sortBy,
+  } = query;
+
+  const skip = (page - 1) * limit;
+  const [sortField, sortDir] = sortBy.split(':') as [string, 'asc' | 'desc'];
+
+  const where: Prisma.SaleWhereInput = {
+    ...(customerId && { customerId }),
+    ...(status && { status }),
+    ...(paymentMethod && { paymentMethod }),
+    ...((startDate ?? endDate) && {
+      createdAt: {
+        ...(startDate && { gte: new Date(startDate) }),
+        ...(endDate && { lte: new Date(endDate) }),
+      },
+    }),
+  };
+
+  const [sales, total] = await prisma.$transaction([
+    prisma.sales.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy: { [sortField]: sortDir },
+      include: {
+        customer: {
+          select: { id: true, name: true, phone: true, identificationNumber: true },
+        },
+        items: { select: { id: true, productNameSnapshot: true, quantity: true, lineTotal: true } },
+      },
+    }),
+    prisma.sales.count({ where }),
+  ]);
+
+  return {
+    data: sales,
+    meta: { total, page, limit, totalPages: Math.ceil(total / limit) },
+  };
+}
+
+// ─── Actualizar estadísticas del cliente y crear garantías después de venta ──
+async function updateCustomerAfterSale(customerId: string | null, saleId: string, totalAmount: number) {
+  if (!customerId) {
+    logger.info('No customer ID provided, skipping customer update');
+    return;
+  }
+
+  try {
+    // 1. Actualizar estadísticas del cliente
+    const pointsEarned = Math.floor(totalAmount / 10000); // 1 punto por cada $10,000 COP
+    
+    await prisma.customers.update({
+      where: { id: customerId },
+      data: {
+        totalSpent: { increment: totalAmount },
+        purchaseCount: { increment: 1 },
+        lastPurchaseAt: new Date(),
+        loyaltyPoints: { increment: pointsEarned },
+      },
+    });
+
+    logger.info(`Customer ${customerId} updated: +$${totalAmount}, +${pointsEarned} points`);
+
+    // 2. Crear garantías para productos con warrantyDays > 0
+    const saleItems = await prisma.sale_items.findMany({
+      where: { saleId },
+      include: {
+        product: {
+          select: {
+            id: true,
+            nameCommercial: true,
+            warrantyDays: true,
+          },
+        },
+      },
+    });
+
+    for (const item of saleItems) {
+      if (item.product.warrantyDays && item.product.warrantyDays > 0) {
+        const expiresAt = new Date();
+        expiresAt.setDate(expiresAt.getDate() + item.product.warrantyDays);
+
+        await prisma.warranties.create({
+          data: {
+            customerId,
+            saleItemId: item.id,
+            productName: item.product.nameCommercial,
+            days: item.product.warrantyDays,
+            expiresAt,
+            status: 'ACTIVE',
+          },
+        });
+
+        logger.info(`Warranty created for customer ${customerId}: ${item.product.nameCommercial} (${item.product.warrantyDays} days)`);
+      }
+    }
+
+    // 3. Actualizar segmentación RFM del cliente
+    try {
+      const rfmResult = await refreshCustomerRfm(customerId);
+      if (rfmResult) {
+        logger.info(`Customer ${customerId} RFM updated: segment=${rfmResult.rfmSegment}, recency=${rfmResult.recencyDays}d, freq=${rfmResult.frequency6m}, monetary=$${rfmResult.monetary6m}`);
+      }
+    } catch (rfmError) {
+      logger.error('Error updating RFM for customer', { customerId, error: rfmError });
+    }
+  } catch (error) {
+    logger.error('Error updating customer after sale', { customerId, saleId, error });
+    // No lanzar error para no afectar la venta
+  }
+}

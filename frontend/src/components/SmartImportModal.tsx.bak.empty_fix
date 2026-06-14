@@ -1,0 +1,401 @@
+import React, { useState, useEffect } from 'react';
+import * as XLSX from 'xlsx';
+import { X, ChevronRight, CheckCircle2, AlertCircle, FileSpreadsheet, Upload } from 'lucide-react';
+
+interface SmartImportModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onSuccess: () => void;
+}
+
+// Definición de los campos que TU sistema necesita
+const SYSTEM_FIELDS = [
+  { key: 'name', label: 'Nombre del Producto', required: true, icon: '📝' },
+  { key: 'brand', label: 'Marca', required: true, icon: '🏷️' },
+  { key: 'category', label: 'Categoría', required: true, icon: '📁' },
+  { key: 'salePrice', label: 'Precio de Venta', required: true, icon: '💰' },
+  { key: 'stock', label: 'Stock (Cantidad)', required: true, icon: '📦' },
+  { key: 'costPrice', label: 'Costo (Sin IVA)', required: false, icon: '📉' },
+  { key: 'iva', label: 'IVA (Valor Total)', required: false, icon: '🧾' },
+];
+
+interface MappingConfig {
+  [key: string]: string; // Mapeo: Campo del Sistema -> Nombre Columna Excel
+}
+
+export const SmartImportModal: React.FC<SmartImportModalProps> = ({ isOpen, onClose, onSuccess }) => {
+  const [step, setStep] = useState(1);
+  const [loading, setLoading] = useState(false);
+  const [file, setFile] = useState<File | null>(null);
+  
+  // Datos crudos del Excel
+  const [headers, setHeaders] = useState<string[]>([]);
+  const [sampleData, setSampleData] = useState<any[]>([]);
+  
+  // Configuración del usuario (El corazón de la solución)
+  const [mapping, setMapping] = useState<MappingConfig>({});
+  const [preview, setPreview] = useState<any[]>([]);
+
+  // Resetear al cerrar
+  useEffect(() => {
+    if (!isOpen) {
+      setStep(1);
+      setMapping({});
+      setHeaders([]);
+      setSampleData([]);
+      setFile(null);
+    }
+  }, [isOpen]);
+
+  // ============================================
+  // PASO 1: LECTURA Y DETECCIÓN INTELIGENTE
+  // ============================================
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFile = e.target.files?.[0];
+    if (!selectedFile) return;
+
+    setFile(selectedFile);
+    setLoading(true);
+
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const data = new Uint8Array(evt.target?.result as ArrayBuffer);
+        const workbook = XLSX.read(data, { type: 'array' });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const jsonData: any[] = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+
+        if (jsonData.length < 2) {
+          alert('❌ El archivo parece estar vacío.');
+          setLoading(false);
+          return;
+        }
+
+        const excelHeaders = Object.keys(jsonData[0]);
+        setHeaders(excelHeaders);
+        setSampleData(jsonData.slice(0, 5)); // Guardamos 5 filas para vista previa
+
+        // 🧠 Intentar auto-mapear basado en nombres comunes (ayuda al usuario)
+        const autoMapping: MappingConfig = {};
+        excelHeaders.forEach(h => {
+          const hLower = h.toLowerCase();
+          if (hLower.includes('producto') || hLower.includes('nombre')) autoMapping.name = h;
+          if (hLower.includes('marca') || hLower.includes('brand')) autoMapping.brand = h;
+          if (hLower.includes('categoria') || hLower.includes('cat')) autoMapping.category = h;
+          if (hLower.includes('comercial') || hLower.includes('venta') || hLower.includes('pvp')) autoMapping.salePrice = h;
+          if (hLower.includes('cantidad') || hLower.includes('stock')) autoMapping.stock = h;
+          if (hLower.includes('sin iva') || hLower.includes('costo')) autoMapping.costPrice = h;
+          if (hLower.includes('con iva') || hLower.includes('total')) autoMapping.iva = h;
+        });
+
+        setMapping(autoMapping);
+        setStep(2); // Ir al paso de mapeo
+      } catch (err) {
+        console.error(err);
+        alert('❌ Error al leer el archivo.');
+      } finally {
+        setLoading(false);
+      }
+    };
+    reader.readAsArrayBuffer(selectedFile);
+  };
+
+  // ============================================
+  // PASO 2: GENERAR VISTA PREVIA EN TIEMPO REAL
+  // ============================================
+  useEffect(() => {
+    if (step === 2) {
+      generatePreview();
+    }
+  }, [mapping, step]);
+
+  const generatePreview = () => {
+    // Función para limpiar números complejos ("$ 34,700.00" -> 34700)
+    const parseNumber = (val: any): number => {
+      if (!val) return 0;
+      const str = String(val).replace(/[$,\s]/g, '').trim();
+      const num = parseFloat(str.replace(',', '.')); // Manejo básico de coma/punto
+      return isNaN(num) ? 0 : num;
+    };
+
+    // Función para limpiar Stock ("AGOTADO" -> 0)
+    const parseStock = (val: any): number => {
+      if (!val) return 0;
+      const str = String(val).toUpperCase().trim();
+      if (str.includes('AGOTADO')) return 0;
+      const num = parseInt(str.replace(/[^0-9-]/g, ''));
+      return isNaN(num) ? 0 : num;
+    };
+
+    const processed = sampleData.map((row) => {
+      // Obtenemos el valor usando la columna mapeada por el usuario
+      const rawSalePrice = mapping.salePrice ? row[mapping.salePrice] : 0;
+      const rawCostPrice = mapping.costPrice ? row[mapping.costPrice] : 0;
+      const rawIva = mapping.iva ? row[mapping.iva] : 0;
+      
+      const salePrice = parseNumber(rawSalePrice);
+      const costPrice = parseNumber(rawCostPrice);
+      
+      // Calcular IVA dinámicamente si es posible
+      let taxRate = 19;
+      if (costPrice > 0 && salePrice > costPrice) {
+        taxRate = Math.round(((salePrice / costPrice) - 1) * 100);
+      }
+
+      return {
+        name: mapping.name ? row[mapping.name] : '—',
+        brand: mapping.brand ? row[mapping.brand] : '—',
+        category: mapping.category ? row[mapping.category] : '—',
+        salePrice: salePrice,
+        taxRate: taxRate,
+        stock: mapping.stock ? parseStock(row[mapping.stock]) : 0,
+      };
+    });
+    setPreview(processed);
+  };
+
+  // ============================================
+  // PASO 3: IMPORTACIÓN FINAL (Procesa TODO el archivo)
+  // ============================================
+  const handleImport = async () => {
+    // Validar campos requeridos
+    for (const field of SYSTEM_FIELDS) {
+      if (field.required && !mapping[field.key]) {
+        alert(`❌ Error: Debes seleccionar una columna del Excel para el campo "${field.label}".`);
+        return;
+      }
+    }
+
+    setLoading(true);
+    try {
+      if (!file) return;
+      
+      // Reler archivo para procesar todas las filas
+      const reader = new FileReader();
+      reader.onload = async (evt) => {
+        const data = new Uint8Array(evt.target?.result as ArrayBuffer);
+        const workbook = XLSX.read(data, { type: 'array' });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const jsonData: any[] = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+
+        // Parseo robusto de números
+        const parseNum = (val: any) => {
+          if (!val) return 0;
+          const str = String(val).replace(/[$,\s]/g, '').replace(',', '.');
+          return parseFloat(str) || 0;
+        };
+
+        const finalPayload = jsonData.map(row => {
+          const salePrice = parseNum(row[mapping.salePrice]);
+          const costPrice = parseNum(row[mapping.costPrice]);
+          
+          let taxRate = 19;
+          if (costPrice > 0 && salePrice > costPrice) {
+            taxRate = Math.round(((salePrice / costPrice) - 1) * 100);
+          }
+
+          return {
+            name: row[mapping.name] || 'Producto Sin Nombre',
+            brandName: row[mapping.brand] || 'Generic',
+            categoryName: row[mapping.category] || 'General',
+            salePrice: salePrice,
+            costPrice: costPrice,
+            taxRate: taxRate,
+            stock: parseInt(String(row[mapping.stock]).replace(/[^0-9-]/g, '')) || 0,
+          };
+        });
+
+        const token = localStorage.getItem('token') || localStorage.getItem('accessToken');
+        const res = await fetch('/api/v1/inventory/products/bulk', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token && { 'Authorization': `Bearer ${token}` })
+          },
+          body: JSON.stringify(finalPayload)
+        });
+
+        const result = await res.json();
+        if (result.success) {
+          alert(`✅ ¡Éxito! ${result.imported} productos importados.`);
+          onSuccess();
+          onClose();
+        } else {
+          alert('❌ Error: ' + (result.error || 'Importación fallida'));
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    } catch (err) {
+      alert('❌ Error en la conexión con el servidor.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-6xl h-[90vh] flex flex-col overflow-hidden">
+        
+        {/* Header del Modal */}
+        <div className="px-6 py-4 border-b bg-gray-50 flex justify-between items-center">
+          <div>
+            <h2 className="text-xl font-bold text-gray-800 flex items-center gap-2">
+              {step === 1 && '📥 Importar Productos'}
+              {step === 2 && '🧩 Configurar Mapeo de Columnas'}
+              {step === 3 && '🚀 Confirmar Importación'}
+            </h2>
+            <p className="text-sm text-gray-500 mt-1">
+              {step === 1 ? 'Sube tu archivo Excel (.xlsx, .xls)' : 'Verifica que cada campo coincida con tu archivo.'}
+            </p>
+          </div>
+          <button onClick={onClose} className="p-2 hover:bg-gray-200 rounded-full transition">
+            <X className="w-6 h-6 text-gray-500" />
+          </button>
+        </div>
+
+        {/* Cuerpo del Modal */}
+        <div className="flex-1 overflow-auto p-6 bg-gray-100">
+          
+          {/* PASO 1: SUBIR ARCHIVO */}
+          {step === 1 && (
+            <div className="h-full flex flex-col items-center justify-center">
+              <div 
+                className="border-2 border-dashed border-gray-300 rounded-xl p-16 text-center hover:border-blue-500 bg-white transition cursor-pointer w-full max-w-lg group"
+                onClick={() => document.getElementById('file-upload')?.click()}
+              >
+                <input id="file-upload" type="file" accept=".xlsx,.xls" className="hidden" onChange={handleFileChange} />
+                <Upload className="w-16 h-16 text-gray-400 mx-auto mb-4 group-hover:text-blue-500 transition" />
+                <p className="text-xl font-semibold text-gray-700 group-hover:text-blue-600 transition">Haz click para seleccionar tu Excel</p>
+                <p className="text-sm text-gray-400 mt-2">El sistema analizará la estructura automáticamente.</p>
+                {loading && <p className="mt-4 text-blue-600 animate-pulse font-medium">Analizando columnas...</p>}
+              </div>
+            </div>
+          )}
+
+          {/* PASO 2: MAPEO INTERACTIVO (La solución al problema) */}
+          {step === 2 && (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 h-full">
+              
+              {/* Panel Izquierdo: Configuración de Campos */}
+              <div className="bg-white p-5 rounded-xl shadow-sm overflow-y-auto max-h-[70vh]">
+                <h3 className="font-bold text-gray-800 mb-4 border-b pb-2 flex items-center gap-2">
+                  <FileSpreadsheet className="w-5 h-5" />
+                  Campos del Sistema
+                </h3>
+                <div className="space-y-4">
+                  {SYSTEM_FIELDS.map((field) => (
+                    <div key={field.key} className="flex flex-col gap-1">
+                      <label className="text-sm font-medium text-gray-700 flex items-center gap-2">
+                        <span>{field.icon}</span> {field.label}
+                        {field.required && <span className="text-red-500 text-xs">*</span>}
+                      </label>
+                      <select 
+                        className="w-full border border-gray-300 rounded-lg p-2.5 text-sm bg-gray-50 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition"
+                        value={mapping[field.key] || ''}
+                        onChange={(e) => setMapping({...mapping, [field.key]: e.target.value})}
+                      >
+                        <option value="">-- Seleccionar Columna del Excel --</option>
+                        {headers.map(h => (
+                          <option key={h} value={h}>{h}</option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Panel Derecho: Vista Previa en Tiempo Real */}
+              <div className="bg-white p-5 rounded-xl shadow-sm flex flex-col max-h-[70vh]">
+                <div className="flex justify-between items-center mb-4">
+                  <h3 className="font-bold text-gray-800 flex items-center gap-2">
+                    <AlertCircle className="w-5 h-5 text-blue-500" />
+                    Vista Previa de Datos
+                  </h3>
+                </div>
+                <div className="overflow-auto flex-1 border rounded-lg bg-gray-50">
+                  <table className="w-full text-sm text-left">
+                    <thead className="bg-gray-200 text-gray-600 uppercase sticky top-0 z-10">
+                      <tr>
+                        <th className="px-4 py-3">Producto</th>
+                        <th className="px-4 py-3">Marca</th>
+                        <th className="px-4 py-3 text-right">Precio</th>
+                        <th className="px-4 py-3 text-right">Stock</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-200 bg-white">
+                      {preview.map((row, i) => (
+                        <tr key={i} className="hover:bg-blue-50 transition">
+                          <td className="px-4 py-3 truncate max-w-[150px] font-medium text-gray-800">{row.name}</td>
+                          <td className="px-4 py-3 text-gray-600">{row.brand}</td>
+                          <td className="px-4 py-3 text-right font-mono text-green-700 font-bold">
+                            {row.salePrice > 0 ? `$${row.salePrice.toLocaleString('es-CO')}` : '—'}
+                          </td>
+                          <td className="px-4 py-3 text-right font-bold text-gray-800">
+                            {row.stock}
+                          </td>
+                        </tr>
+                      ))}
+                      {preview.length === 0 && (
+                        <tr><td colSpan={4} className="p-8 text-center text-gray-400 italic">Selecciona las columnas para ver la previsualización aquí</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Footer con Botones de Acción */}
+        <div className="px-6 py-4 border-t bg-white flex justify-between items-center">
+          {step === 2 && (
+            <button 
+              onClick={() => setStep(1)}
+              className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg font-medium transition"
+            >
+              ← Atrás
+            </button>
+          )}
+          
+          <div className="flex gap-3 ml-auto">
+            {step === 2 && (
+              <button 
+                onClick={() => setStep(3)}
+                disabled={!mapping.name || !mapping.salePrice}
+                className="px-6 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg transition flex items-center gap-2"
+              >
+                Siguiente <ChevronRight className="w-4 h-4" />
+              </button>
+            )}
+
+            {step === 3 && (
+              <>
+                <button 
+                  onClick={() => setStep(2)}
+                  className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg font-medium transition"
+                >
+                  Editar Mapeo
+                </button>
+                <button 
+                  onClick={handleImport}
+                  disabled={loading}
+                  className="px-6 py-2 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700 shadow-lg transition flex items-center gap-2"
+                >
+                  {loading ? (
+                    <>Importando...</>
+                  ) : (
+                    <>
+                      <CheckCircle2 className="w-5 h-5" /> Confirmar e Importar
+                    </>
+                  )}
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};

@@ -1,0 +1,85 @@
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+export async function logAction(
+  userId: string | null,
+  action: string,
+  entity: string,
+  entityId?: string | null,
+  details: Record<string, unknown> = {},
+  ipAddress?: string | null,
+): Promise<void> {
+  try {
+    await prisma.audit_logs.create({
+      data: {
+        userId: userId ?? undefined,
+        action,
+        entity,
+        entityId: entityId ?? undefined,
+        details: details as any,
+        ipAddress: ipAddress ?? undefined,
+      } as any,
+    });
+  } catch (error) {
+    logger.error('[auditService] Error al registrar log de auditoría', { action, entity, error });
+  }
+}
+
+export async function getAuditLogs(filters: {
+  userId?: string;
+  entity?: string;
+  action?: string;
+  from?: Date;
+  to?: Date;
+  limit?: number;
+}) {
+  const where: any = {};
+  if (filters.userId) where.userId = filters.userId;
+  if (filters.entity) where.entity = filters.entity;
+  if (filters.action) where.action = { contains: filters.action, mode: 'insensitive' };
+  if (filters.from || filters.to) {
+    where.created_at = {};
+    if (filters.from) where.created_at.gte = filters.from;
+    if (filters.to) where.created_at.lte = filters.to;
+  }
+
+  const logs = await prisma.audit_logs.findMany({
+    where,
+    orderBy: { timestamp: 'desc' },
+    take: filters.limit ?? 100,
+  });
+
+  return logs;
+}
+
+export async function getAuditLogsPaginated(filters: {
+  cursor?: string;
+  limit?: number;
+  userId?: string;
+  entity?: string;
+  action?: string;
+  from?: Date;
+  to?: Date;
+}) {
+  const take = Math.min(filters.limit ?? 50, 200);
+  const where: any = {};
+
+  if (filters.userId) where.userId = filters.userId;
+  if (filters.entity) where.entity = { contains: filters.entity, mode: 'insensitive' };
+  if (filters.action) where.action = { contains: filters.action, mode: 'insensitive' };
+  if (filters.from || filters.to) {
+    where.created_at = {};
+    if (filters.from) where.created_at.gte = filters.from;
+    if (filters.to) where.created_at.lte = filters.to;
+  }
+
+  const logs = await prisma.audit_logs.findMany({
+    where,
+    orderBy: { timestamp: 'desc' },
+    take,
+    ...(filters.cursor ? { cursor: { id: filters.cursor }, skip: 1 } : {}),
+  });
+
+  return logs;
+}
+

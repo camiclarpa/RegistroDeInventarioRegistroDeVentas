@@ -1,0 +1,105 @@
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+export interface BusinessSettingsInput {
+  businessName?: string;
+  nit?: string;
+  address?: string;
+  phone?: string;
+  email?: string;
+  defaultIva?: number;
+  dianResolution?: string;
+  dianResolutionDate?: string;
+  ticketFooter?: string;
+  invoicePrefix?: string;
+  logoPath?: string;
+}
+
+/**
+ * Obtiene la configuración actual del negocio
+ */
+export async function getBusinessSettings() {
+  logger.info('[settingsService] getBusinessSettings');
+  
+  const settings = await prisma.business_settings.findFirst({
+    orderBy: { createdAt: 'desc' },
+  });
+  
+  return settings || null;
+}
+
+/**
+ * Actualiza o crea la configuración del negocio
+ */
+export async function updateBusinessSettings(data: BusinessSettingsInput) {
+  logger.info('[settingsService] updateBusinessSettings', { data });
+  
+  // Verificar si ya existe configuración
+  const existing = await prisma.business_settings.findFirst({
+    orderBy: { createdAt: 'desc' },
+  });
+  
+  if (existing) {
+    // Actualizar existente
+    return prisma.business_settings.update({
+      where: { id: existing.id },
+      data: {
+        ...(data.businessName !== undefined && { businessName: data.businessName }),
+        ...(data.nit !== undefined && { nit: data.nit }),
+        ...(data.address !== undefined && { address: data.address }),
+        ...(data.phone !== undefined && { phone: data.phone }),
+        ...(data.email !== undefined && { email: data.email }),
+        ...(data.defaultIva !== undefined && { defaultIva: data.defaultIva }),
+        ...(data.dianResolution !== undefined && { dianResolution: data.dianResolution }),
+        ...(data.dianResolutionDate !== undefined && { 
+          dianResolutionDate: data.dianResolutionDate ? new Date(data.dianResolutionDate) : undefined 
+        }),
+        ...(data.ticketFooter !== undefined && { ticketFooter: data.ticketFooter }),
+        ...(data.invoicePrefix !== undefined && { invoicePrefix: data.invoicePrefix }),
+        ...(data.logoPath !== undefined && { logoPath: data.logoPath }),
+      },
+    });
+  } else {
+    // Crear nueva
+    return prisma.business_settings.create({
+      data: {
+        businessName: data.businessName || 'Mi Negocio',
+        nit: data.nit || null,
+        address: data.address || null,
+        phone: data.phone || null,
+        email: data.email || null,
+        defaultIva: data.defaultIva || 19,
+        dianResolution: data.dianResolution || null,
+        dianResolutionDate: data.dianResolutionDate ? new Date(data.dianResolutionDate) : null,
+        ticketFooter: data.ticketFooter || 'Gracias por su compra',
+        invoicePrefix: data.invoicePrefix || 'FAC',
+        logoPath: data.logoPath || null,
+      },
+    });
+  }
+}
+
+/**
+ * Sube o actualiza el logo del negocio
+ */
+export async function updateLogo(logoPath: string) {
+  logger.info('[settingsService] updateLogo', { logoPath });
+  
+  const existing = await prisma.business_settings.findFirst({
+    orderBy: { createdAt: 'desc' },
+  });
+  
+  if (existing) {
+    return prisma.business_settings.update({
+      where: { id: existing.id },
+      data: { logoPath },
+    });
+  } else {
+    return prisma.business_settings.create({
+      data: {
+        businessName: 'Mi Negocio',
+        logoPath,
+      },
+    });
+  }
+}

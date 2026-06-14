@@ -1,0 +1,1559 @@
+import time
+"""
+Voice Agent - Multi-agent orchestration for purchases
+FASE 1 + FASE 2 COMPLETA:
+FASE 1:
+- VAD del servidor (energia RMS, sin torch)
+- Barge-in detection (interrupciones)
+- Validacion cruzada de datos
+- Streaming LLM->TTS
+- Transcripciones en tiempo real
+FASE 2:
+- Busqueda en BD (autocompletar categoria/marca)
+- Manejo de silencios (timeout inteligente)
+- Repeticion inteligente (baja confianza STT)
+- Numeros complejos en espanol
+"""
+import os
+import re
+import struct
+import asyncio
+import tempfile
+import subprocess
+from typing import Dict, Optional, List, Any, Tuple
+from groq import Groq
+from fastapi import WebSocket
+import psycopg2
+import psycopg2.extras
+import redis
+import json as json_lib
+
+
+class VoiceAgent:
+    def __init__(self):
+        self.api_key = os.getenv("GROQ_API_KEY")
+        if not self.api_key or self.api_key == "your_groq_api_key_here":
+            print("WARNING: GROQ_API_KEY no configurada")
+            self.client = None
+        else:
+            self.client = Groq(api_key=self.api_key)
+            print("GROQ API configurada correctamente")
+
+        self.piper_model = "/app/models/es_ES-sharvard-medium.onnx"
+        self.sessions: Dict[str, Dict] = {}
+        
+        # VAD config
+        self.vad_threshold = 100.0
+        self.min_voice_duration_ms = 500
+        
+        # FASE 2: Configuracion de silencios
+        self.silence_warning_seconds = 10  # Preguntar "sigues ahi?"
+        self.silence_timeout_seconds = 30   # Cerrar sesion
+        
+        # FASE 2: Configuracion de BD
+        self.db_url = os.getenv("DATABASE_URL")
+        if self.db_url:
+            print(f"DATABASE_URL configurada")
+        else:
+            print("WARNING: DATABASE_URL no configurada, busqueda en BD deshabilitada")
+
+        # FASE 3: Configuracion de Redis para contexto persistente
+        self.redis_url = os.getenv("REDIS_URL", "redis://sigc_redis:6379")
+        try:
+            self.redis_client = redis.from_url(self.redis_url, decode_responses=True)
+            self.redis_client.ping()
+            print("Redis conectado correctamente")
+        except Exception as e:
+            print(f"WARNING: Redis no disponible: {e}")
+            self.redis_client = None
+
+        # FASE 3: Emociones detectadas
+        self.emotion_keywords = {
+            "angry": ["estoy enojado", "molesto", "furioso", "rabia", "odio", "no me sirve", "basura", "pésimo"],
+            "frustrated": ["no entiendo", "confundido", "complicado", "difícil", "no puedo", "ayuda", "no sé"],
+            "happy": ["excelente", "genial", "perfecto", "gracias", "feliz", "contento", "maravilloso"],
+            "confused": ["qué", "cómo", "no entiendo", "explícame", "repites", "duda"],
+            "urgent": ["urgente", "rápido", "ya", "ahora", "pronto", "inmediato", "emergencia"]
+        }
+
+    def get_agents_list(self) -> List[str]:
+        return [
+            "greeting_agent",
+            "product_info_agent",
+            "category_agent",
+            "brand_agent",
+            "price_agent",
+            "quantity_agent",
+            "confirmation_agent",
+        ]
+
+    # ═══════════════════════════════════════════════════════════
+    # FASE 2: CONEXION A BASE DE DATOS
+    # ═══════════════════════════════════════════════════════════
+    def _get_db_connection(self):
+        """Obtiene conexion a la base de datos"""
+        if not self.db_url:
+            return None
+        try:
+            conn = psycopg2.connect(self.db_url)
+            conn.autocommit = True
+            return conn
+        except Exception as e:
+            print(f"Error conectando a BD: {e}")
+            return None
+
+    def _search_products_by_name(self, name: str, limit: int = 5) -> List[Dict]:
+        """Busca productos por nombre en la BD"""
+        conn = self._get_db_connection()
+        if not conn:
+            return []
+        
+        try:
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            query = """
+                SELECT p.id, p."nameCommercial", p."brandId", p."categoryId",
+                       b.name as brand_name, c.name as category_name
+                FROM products p
+                LEFT JOIN brands b ON p."brandId" = b.id
+                LEFT JOIN categories c ON p."categoryId" = c.id
+                WHERE p."nameCommercial" ILIKE %s
+                  AND p."isActive" = true
+                ORDER BY 
+                  CASE 
+                    WHEN p."nameCommercial" ILIKE %s THEN 1
+                    WHEN p."nameCommercial" ILIKE %s THEN 2
+                    ELSE 3
+                  END,
+                  p."nameCommercial"
+                LIMIT %s
+            """
+            search_term = f"%{name}%"
+            exact_start = f"{name}%"
+            contains = f"%{name}%"
+            cursor.execute(query, (search_term, exact_start, contains, limit))
+            results = cursor.fetchall()
+            return [dict(row) for row in results]
+        except Exception as e:
+            print(f"Error buscando productos: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def _search_brands_by_name(self, name: str, limit: int = 5) -> List[Dict]:
+        """Busca marcas por nombre en la BD"""
+        conn = self._get_db_connection()
+        if not conn:
+            return []
+        
+        try:
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            query = """
+                SELECT id, name FROM brands
+                WHERE name ILIKE %s AND "isActive" = true
+                ORDER BY 
+                  CASE 
+                    WHEN name ILIKE %s THEN 1
+                    WHEN name ILIKE %s THEN 2
+                    ELSE 3
+                  END
+                LIMIT %s
+            """
+            search_term = f"%{name}%"
+            exact_start = f"{name}%"
+            contains = f"%{name}%"
+            cursor.execute(query, (search_term, exact_start, contains, limit))
+            results = cursor.fetchall()
+            return [dict(row) for row in results]
+        except Exception as e:
+            print(f"Error buscando marcas: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def _search_categories_by_name(self, name: str, limit: int = 5) -> List[Dict]:
+        """Busca categorias por nombre en la BD"""
+        conn = self._get_db_connection()
+        if not conn:
+            return []
+        
+        try:
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            query = """
+                SELECT id, name, "codePrefix", "marginPercentage" FROM categories
+                WHERE name ILIKE %s AND "isActive" = true
+                ORDER BY 
+                  CASE 
+                    WHEN name ILIKE %s THEN 1
+                    WHEN name ILIKE %s THEN 2
+                    ELSE 3
+                  END
+                LIMIT %s
+            """
+            search_term = f"%{name}%"
+            exact_start = f"{name}%"
+            contains = f"%{name}%"
+            cursor.execute(query, (search_term, exact_start, contains, limit))
+            results = cursor.fetchall()
+            return [dict(row) for row in results]
+        except Exception as e:
+            print(f"Error buscando categorias: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    # ═══════════════════════════════════════════════════════════
+    # FASE 2: NORMALIZACION AVANZADA DE NUMEROS
+    # ═══════════════════════════════════════════════════════════
+    def _normalize_complex_numbers(self, text: str) -> str:
+        """
+        Convierte numeros complejos en espanol a digitos.
+        Ejemplos:
+        - "un millon doscientos mil" -> "1200000"
+        - "veinticinco mil trescientos" -> "25300"
+        - "mil doscientos" -> "1200"
+        - "tres millones" -> "3000000"
+        """
+        text_lower = text.lower()
+        
+        # Diccionario de unidades
+        units = {
+            'cero': 0, 'uno': 1, 'un': 1, 'una': 1, 'dos': 2, 'tres': 3,
+            'cuatro': 4, 'cinco': 5, 'seis': 6, 'siete': 7, 'ocho': 8,
+            'nueve': 9, 'diez': 10, 'once': 11, 'doce': 12, 'trece': 13,
+            'catorce': 14, 'quince': 15, 'dieciseis': 16, 'diecisiete': 17,
+            'dieciocho': 18, 'diecinueve': 19, 'veinte': 20, 'veintiuno': 21,
+            'veintidos': 22, 'veintitres': 23, 'veinticuatro': 24,
+            'veinticinco': 25, 'veintiseis': 26, 'veintisiete': 27,
+            'veintiocho': 28, 'veintinueve': 29
+        }
+        
+        # Decenas
+        tens = {
+            'treinta': 30, 'cuarenta': 40, 'cincuenta': 50,
+            'sesenta': 60, 'setenta': 70, 'ochenta': 80, 'noventa': 90
+        }
+        
+        # Centenas
+        hundreds = {
+            'cien': 100, 'ciento': 100, 'doscientos': 200, 'doscientas': 200,
+            'trescientos': 300, 'trescientas': 300, 'cuatrocientos': 400,
+            'cuatrocientas': 400, 'quinientos': 500, 'quinientas': 500,
+            'seiscientos': 600, 'seiscientas': 600, 'setecientos': 700,
+            'setecientas': 700, 'ochocientos': 800, 'ochocientas': 800,
+            'novecientos': 900, 'novecientas': 900
+        }
+        
+        # Primero, reemplazar "mil" y "millon/millones" con marcadores
+        # para procesarlos despues
+        
+        # Reemplazar patrones simples primero
+        replacements = [
+            (r'\bun millon\b', '1000000'),
+            (r'\bmillon\b', '1000000'),
+            (r'\bdos millones\b', '2000000'),
+            (r'\btres millones\b', '3000000'),
+            (r'\bcuatro millones\b', '4000000'),
+            (r'\bcinco millones\b', '5000000'),
+            (r'\bmillones\b', '000000'),
+        ]
+        
+        for pattern, replacement in replacements:
+            text_lower = re.sub(pattern, replacement, text_lower)
+        
+        # Procesar "X mil"
+        def replace_x_mil(match):
+            num_str = match.group(1)
+            if num_str in units:
+                return str(units[num_str] * 1000)
+            elif num_str in tens:
+                return str(tens[num_str] * 1000)
+            elif num_str in hundreds:
+                return str(hundreds[num_str] * 1000)
+            elif num_str.isdigit():
+                return str(int(num_str) * 1000)
+            return match.group(0)
+        
+        text_lower = re.sub(r'\b(\w+)\s+mil\b', replace_x_mil, text_lower)
+        text_lower = re.sub(r'\bmil\b', '1000', text_lower)
+        
+        # Reemplazar palabras por numeros
+        for word, value in {**units, **tens, **hundreds}.items():
+            text_lower = re.sub(rf'\b{word}\b', str(value), text_lower)
+        
+        # Sumar numeros adyacentes (ej: "25 1000" -> "25000")
+        def sum_adjacent_numbers(match):
+            nums = [int(n) for n in match.group(0).split() if n.isdigit()]
+            if len(nums) >= 2:
+                # Si el segundo numero es menor que 1000, sumarlos
+                if nums[-1] < 1000 and nums[0] >= 1000:
+                    return str(nums[0] + nums[-1])
+                # Si ambos son menores que 100, multiplicar
+                elif nums[0] < 100 and nums[1] < 100:
+                    return str(nums[0] + nums[1])
+            return match.group(0)
+        
+        text_lower = re.sub(r'\b\d+(?:\s+\d+)+\b', sum_adjacent_numbers, text_lower)
+        
+        return text_lower
+
+    # ═══════════════════════════════════════════════════════════
+    # VAD: DETECCION DE ACTIVIDAD DE VOZ (SIN TORCH)
+    # ═══════════════════════════════════════════════════════════
+    def _calculate_rms(self, audio_data: bytes) -> float:
+        """Calcula RMS (Root Mean Square) del audio PCM16"""
+        if len(audio_data) < 100:
+            return 0.0
+        
+        try:
+            num_samples = len(audio_data) // 2
+            samples = struct.unpack(f'<{num_samples}h', audio_data[:num_samples * 2])
+            
+            if not samples:
+                return 0.0
+            
+            sum_squares = sum(s * s for s in samples)
+            rms = (sum_squares / len(samples)) ** 0.5
+            return rms
+        except Exception as e:
+            print(f"Error calculando RMS: {e}")
+            return 0.0
+
+    def _is_voice_activity(self, audio_data: bytes) -> Tuple[bool, float]:
+        """Detecta si hay voz en el audio usando energia RMS"""
+        rms = self._calculate_rms(audio_data)
+        is_voice = rms > self.vad_threshold
+        return is_voice, rms
+
+
+    # ═══════════════════════════════════════════════════════════
+    # FASE 3: DETECCION DE EMOCIONES
+    # ═══════════════════════════════════════════════════════════
+    def _detect_emotion(self, text: str) -> str:
+        """
+        Detecta emocion del usuario basado en palabras clave y LLM.
+        Retorna: neutral, happy, frustrated, angry, confused, urgent
+        """
+        text_lower = text.lower()
+        
+        # Primero, busqueda rapida por palabras clave
+        for emotion, keywords in self.emotion_keywords.items():
+            for keyword in keywords:
+                if keyword in text_lower:
+                    return emotion
+        
+        # Si no hay match por keywords, usar LLM para analisis mas preciso
+        if self.client:
+            try:
+                prompt = f"""
+Analiza el tono emocional del siguiente texto del usuario.
+Clasifica en UNA de estas emociones:
+- neutral: tono normal, sin emocion particular
+- happy: feliz, contento, agradecido
+- frustrated: frustrado, confundido, tiene dificultades
+- angry: enojado, molesto, furioso
+- confused: confundido, no entiende, necesita aclaracion
+- urgent: urgencia, prisa, necesita atencion inmediata
+
+Texto: "{text}"
+
+Responde SOLO con la emocion (una palabra): neutral|happy|frustrated|angry|confused|urgent
+"""
+                completion = self.client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=10,
+                    temperature=0.1,
+                )
+                emotion = completion.choices[0].message.content.strip().lower()
+                valid_emotions = ["neutral", "happy", "frustrated", "angry", "confused", "urgent"]
+                if emotion in valid_emotions:
+                    return emotion
+            except Exception as e:
+                print(f"Error detectando emocion con LLM: {e}")
+        
+        return "neutral"
+
+    def _get_emotion_response_adaptation(self, emotion: str, base_response: str) -> str:
+        """Adapta la respuesta segun la emocion detectada"""
+        if emotion == "angry":
+            return f"Entiendo tu molestia, disculpa. {base_response}"
+        elif emotion == "frustrated":
+            return f"Comprendo que puede ser confuso. Vamos paso a paso. {base_response}"
+        elif emotion == "happy":
+            return f"Me alegra que estemos avanzando bien. {base_response}"
+        elif emotion == "confused":
+            return f"Claro, te explico mejor. {base_response}"
+        elif emotion == "urgent":
+            return f"Entendido, vamos rapido. {base_response}"
+        return base_response
+
+    # ═══════════════════════════════════════════════════════════
+    # FASE 3: CONTEXTO PERSISTENTE CON REDIS
+    # ═══════════════════════════════════════════════════════════
+    def _save_session_to_redis(self, session_id: str, session_data: Dict):
+        """Guarda estado de sesion en Redis para persistencia"""
+        if not self.redis_client:
+            return
+        
+        try:
+            key = f"voice_session:{session_id}"
+            # Serializar datos (excluyendo objetos no serializables)
+            serializable_data = {
+                "customer_name": session_data.get("customer_name"),
+                "product_data": session_data.get("product_data", {}),
+                "current_field": session_data.get("current_field"),
+                "conversation_history": session_data.get("conversation_history", []),
+                "state": session_data.get("state"),
+                "last_emotion": session_data.get("last_emotion", "neutral"),
+                "created_at": session_data.get("created_at"),
+                "last_activity": session_data.get("last_activity")
+            }
+            self.redis_client.setex(
+                key,
+                1800,  # TTL 30 minutos
+                json_lib.dumps(serializable_data)
+            )
+        except Exception as e:
+            print(f"Error guardando sesion en Redis: {e}")
+
+    def _load_session_from_redis(self, session_id: str) -> Optional[Dict]:
+        """Carga estado de sesion desde Redis"""
+        if not self.redis_client:
+            return None
+        
+        try:
+            key = f"voice_session:{session_id}"
+            data = self.redis_client.get(key)
+            if data:
+                return json_lib.loads(data)
+        except Exception as e:
+            print(f"Error cargando sesion de Redis: {e}")
+        return None
+
+    def _delete_session_from_redis(self, session_id: str):
+        """Elimina sesion de Redis"""
+        if not self.redis_client:
+            return
+        
+        try:
+            key = f"voice_session:{session_id}"
+            self.redis_client.delete(key)
+        except Exception as e:
+            print(f"Error eliminando sesion de Redis: {e}")
+
+    def get_active_sessions(self) -> List[str]:
+        """Lista sesiones activas en Redis"""
+        if not self.redis_client:
+            return []
+        
+        try:
+            keys = self.redis_client.keys("voice_session:*")
+            return [k.replace("voice_session:", "") for k in keys]
+        except Exception as e:
+            print(f"Error listando sesiones: {e}")
+            return []
+
+
+    # ═══════════════════════════════════════════════════════════
+    # FASE MULTI-PRODUCTO: NAVEGACION ENTRE PRODUCTOS
+    # ═══════════════════════════════════════════════════════════
+    def _set_product_queue(self, session_id: str, products: List[Dict]):
+        """Establece la lista de productos a procesar por voz"""
+        session = self.sessions.get(session_id)
+        if not session:
+            return False
+        
+        session["product_queue"] = products
+        session["total_products"] = len(products)
+        session["current_product_index"] = 0
+        session["completed_products"] = []
+        
+        # Cargar datos del primer producto
+        if products:
+            self._load_current_product_to_session(session)
+        
+        return True
+
+    def _load_current_product_to_session(self, session: Dict):
+        """Carga los datos del producto actual a la sesión"""
+        idx = session.get("current_product_index", 0)
+        queue = session.get("product_queue", [])
+        
+        if idx < len(queue):
+            product = queue[idx]
+            # Preservar barcode y datos existentes
+            session["current_product"] = {
+                "barcode": product.get("barcode", ""),
+                "sku": product.get("sku", ""),
+                "existing_name": product.get("name", ""),
+            }
+            # Resetear product_data para el nuevo producto
+            session["product_data"] = {
+                "name": product.get("name"),
+                "category": product.get("category"),
+                "brand": product.get("brand"),
+                "sale_price": product.get("sale_price"),
+                "quantity": product.get("quantity", 1),
+            }
+            session["current_field"] = "name" if not product.get("name") else "category"
+            session["state"] = "collecting"
+            session["conversation_history"] = []
+
+    def _advance_to_next_product(self, session_id: str) -> Optional[Dict]:
+        """Avanza al siguiente producto en la cola. Retorna el producto completado o None"""
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        
+        idx = session.get("current_product_index", 0)
+        queue = session.get("product_queue", [])
+        
+        if idx >= len(queue):
+            return None
+        
+        # Guardar producto completado
+        completed = {
+            **queue[idx],
+            **session.get("product_data", {}),
+            "completed": True
+        }
+        session["completed_products"].append(completed)
+        
+        # Avanzar al siguiente
+        session["current_product_index"] = idx + 1
+        
+        if session["current_product_index"] < len(queue):
+            # Cargar siguiente producto
+            self._load_current_product_to_session(session)
+            return {"status": "next", "product": completed, "remaining": len(queue) - idx - 1}
+        else:
+            # Todos completados
+            session["state"] = "all_complete"
+            return {"status": "all_done", "product": completed, "completed_list": session["completed_products"]}
+
+    def _go_to_previous_product(self, session_id: str) -> bool:
+        """Retrocede al producto anterior"""
+        session = self.sessions.get(session_id)
+        if not session:
+            return False
+        
+        idx = session.get("current_product_index", 0)
+        if idx > 0:
+            session["current_product_index"] = idx - 1
+            # Remover el último de completados si existe
+            if session.get("completed_products"):
+                session["completed_products"].pop()
+            self._load_current_product_to_session(session)
+            return True
+        return False
+
+    def _get_progress_info(self, session_id: str) -> Dict:
+        """Retorna información de progreso"""
+        session = self.sessions.get(session_id)
+        if not session:
+            return {}
+        
+        return {
+            "current_index": session.get("current_product_index", 0),
+            "total": session.get("total_products", 0),
+            "completed": len(session.get("completed_products", [])),
+            "current_product": session.get("current_product", {}),
+            "state": session.get("state", "collecting")
+        }
+
+    # ═══════════════════════════════════════════════════════════
+    # FLUJO PRINCIPAL DE LA SESION
+    # ═══════════════════════════════════════════════════════════
+    async def handle_session(self, websocket: WebSocket):
+        """Maneja una sesion de voz completa"""
+        await websocket.accept()
+        session_id = str(id(websocket))
+
+        # FASE 3: Intentar cargar sesion previa desde Redis
+        saved_session = self._load_session_from_redis(session_id)
+        if saved_session:
+            print(f"Sesion {session_id} recuperada de Redis")
+            self.sessions[session_id] = {
+                "customer_name": saved_session.get("customer_name"),
+                "product_data": saved_session.get("product_data", {
+                    "name": None, "category": None, "brand": None,
+                    "sale_price": None, "quantity": 1,
+                }),
+                "current_field": saved_session.get("current_field", "greeting"),
+                "conversation_history": saved_session.get("conversation_history", []),
+                "state": saved_session.get("state", "collecting"),
+                "is_tts_playing": False,
+                "audio_buffer": b"",
+                "voice_frames": 0,
+                "silence_frames": 0,
+                "silence_start_time": None,
+                "last_warning_time": None,
+                "consecutive_empty_stt": 0,
+                "last_emotion": saved_session.get("last_emotion", "neutral"),
+                "created_at": saved_session.get("created_at"),
+                "last_activity": time.time(),
+                "resumed_from_redis": True,
+            }
+        else:
+            self.sessions[session_id] = {
+                "customer_name": None,
+                "product_data": {
+                    "name": None,
+                    "category": None,
+                    "brand": None,
+                    "sale_price": None,
+                    "quantity": 1,
+                },
+                "current_field": "greeting",
+                "conversation_history": [],
+                "state": "collecting",
+                "is_tts_playing": False,
+                "audio_buffer": b"",
+                "voice_frames": 0,
+                "silence_frames": 0,
+                "silence_start_time": None,
+                "last_warning_time": None,
+                "consecutive_empty_stt": 0,
+                "last_emotion": "neutral",
+                "created_at": time.time(),
+                "last_activity": time.time(),
+                "resumed_from_redis": False,
+            }
+
+        try:
+            # Saludo inicial
+            greeting = (
+                "Hola! Bienvenido a Clavijos Motos. "
+                "Soy tu asistente virtual. "
+                "Como te llamas?"
+            )
+            await self._send_audio_response(websocket, greeting, session_id)
+            await self._send_field_updates(websocket, session_id)
+
+            while True:
+                try:
+                    # FASE 2: Verificar timeout de silencio
+                    await self._check_silence_timeout(session_id, websocket)
+                    
+                    message = await asyncio.wait_for(
+                        websocket.receive(),
+                        timeout=1.0  # Timeout corto para verificar silencio periodicamente
+                    )
+                    
+                    if "bytes" in message:
+                        audio_chunk = message["bytes"]
+                        await self._handle_audio_chunk(
+                            audio_chunk, session_id, websocket
+                        )
+                    elif "text" in message:
+                        await self._handle_text_message(
+                            message["text"], session_id, websocket
+                        )
+
+                    if self.sessions.get(session_id, {}).get("state") == "complete":
+                        break
+
+                except asyncio.TimeoutError:
+                    # Timeout normal, continuar loop para verificar silencio
+                    continue
+                except Exception as e:
+                    if "disconnect" in str(e).lower():
+                        break
+                    print(f"Error en sesion: {e}")
+
+        finally:
+            # FASE 3: Si la sesion se completo, eliminar de Redis
+            session = self.sessions.get(session_id)
+            if session and session.get("state") == "complete":
+                self._delete_session_from_redis(session_id)
+            self.sessions.pop(session_id, None)
+
+    # ═══════════════════════════════════════════════════════════
+    # FASE 2: MANEJO DE SILENCIOS
+    # ═══════════════════════════════════════════════════════════
+    async def _check_silence_timeout(self, session_id: str, websocket: WebSocket):
+        """Verifica si ha pasado mucho tiempo sin voz"""
+        import time
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+        
+        # Solo verificar si estamos esperando respuesta del usuario
+        if session.get("is_tts_playing", False):
+            return
+        
+        current_time = time.time()
+        
+        # Si no hay audio en buffer y no hay voz reciente
+        if not session.get("audio_buffer") and session.get("silence_start_time"):
+            silence_duration = current_time - session["silence_start_time"]
+            
+            # FASE 2: Advertencia despues de 10 segundos
+            if silence_duration >= self.silence_warning_seconds:
+                last_warning = session.get("last_warning_time")
+                if not last_warning or (current_time - last_warning) >= self.silence_warning_seconds:
+                    session["last_warning_time"] = current_time
+                    await self._send_audio_response(
+                        websocket,
+                        "Sigues ahi? Estoy esperando tu respuesta.",
+                        session_id
+                    )
+                    await websocket.send_json({
+                        "type": "silence_warning",
+                        "duration_seconds": int(silence_duration)
+                    })
+            
+            # FASE 2: Cerrar sesion despues de 30 segundos
+            if silence_duration >= self.silence_timeout_seconds:
+                await self._send_audio_response(
+                    websocket,
+                    "No he escuchado respuesta. Voy a cerrar la sesion. Puedes volver a iniciar cuando quieras.",
+                    session_id
+                )
+                await websocket.send_json({
+                    "type": "silence_timeout",
+                    "duration_seconds": int(silence_duration)
+                })
+                session["state"] = "complete"
+
+    # ═══════════════════════════════════════════════════════════
+    # MENSAJES DE TEXTO DEL FRONTEND
+    # ═══════════════════════════════════════════════════════════
+    async def _handle_text_message(self, text: str, session_id: str, websocket: WebSocket):
+        """Maneja mensajes de texto del frontend (barge-in, etc)"""
+        import json
+        try:
+            msg = json.loads(text)
+            msg_type = msg.get("type")
+            
+            if msg_type == "barge_in":
+                print("BARGE-IN detectado! Deteniendo TTS...")
+                session = self.sessions.get(session_id)
+                if session:
+                    session["is_tts_playing"] = False
+                    session["audio_buffer"] = b""
+                    session["voice_frames"] = 0
+                    session["silence_frames"] = 0
+                    
+                    await websocket.send_json({
+                        "type": "barge_in_ack",
+                        "message": "Interrupcion recibida"
+                    })
+            
+            elif msg_type == "vad_config":
+                threshold = msg.get("threshold", 300.0)
+                self.vad_threshold = threshold
+                print(f"Umbral VAD actualizado: {threshold}")
+                
+        except Exception as e:
+            print(f"Error procesando mensaje de texto: {e}")
+
+    # ═══════════════════════════════════════════════════════════
+    # MANEJO DE CHUNKS DE AUDIO CON VAD
+    # ═══════════════════════════════════════════════════════════
+    async def _handle_audio_chunk(self, audio_chunk: bytes, session_id: str, websocket: WebSocket):
+        """Maneja chunks de audio con VAD"""
+        import time
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+
+        # 1. VAD: Detectar si hay voz
+        is_voice, rms = self._is_voice_activity(audio_chunk)
+        
+        # Enviar metricas VAD al frontend
+        await websocket.send_json({
+            "type": "vad_metrics",
+            "rms": round(rms, 2),
+            "is_voice": is_voice,
+            "threshold": self.vad_threshold
+        })
+
+        # 2. Si no hay voz, resetear buffer
+        if not is_voice:
+            session["silence_frames"] += 1
+            session["voice_frames"] = 0
+            
+            # FASE 2: Registrar inicio de silencio
+            if not session.get("silence_start_time"):
+                session["silence_start_time"] = time.time()
+            
+            # Si hay audio acumulado y silencio prolongado, procesar
+            if session["audio_buffer"] and session["silence_frames"] > 10:
+                await self._process_audio(
+                    session["audio_buffer"], session_id, websocket
+                )
+                session["audio_buffer"] = b""
+                session["silence_frames"] = 0
+            return
+
+        # 3. Hay voz: resetear contador de silencio y acumular
+        session["silence_start_time"] = None
+        session["last_warning_time"] = None
+        session["voice_frames"] += 1
+        session["silence_frames"] = 0
+        session["audio_buffer"] += audio_chunk
+
+    # ═══════════════════════════════════════════════════════════
+    # PROCESAMIENTO DE AUDIO COMPLETO
+    # ═══════════════════════════════════════════════════════════
+    async def _process_audio(self, audio_data: bytes, session_id: str, websocket: WebSocket):
+        """Procesa audio completo del usuario"""
+        session = self.sessions.get(session_id)
+        if not session or not self.client:
+            return
+
+        # Verificar duracion minima
+        duration_ms = (len(audio_data) / 32000) * 1000
+        if duration_ms < self.min_voice_duration_ms:
+            return
+
+        # 1. STT
+        user_text = await self._stt_transcribe(audio_data)
+        
+        # FASE 2: Repeticion inteligente si STT falla
+        if not user_text or len(user_text.strip()) < 2:
+            session["consecutive_empty_stt"] = session.get("consecutive_empty_stt", 0) + 1
+            
+            if session["consecutive_empty_stt"] >= 3:
+                # Despues de 3 fallos seguidos, sugerir hablar mas claro
+                await self._send_audio_response(
+                    websocket,
+                    "No estoy escuchando bien. Puedes hablar un poco mas fuerte o claro?",
+                    session_id
+                )
+                session["consecutive_empty_stt"] = 0
+                await websocket.send_json({
+                    "type": "stt_low_confidence",
+                    "consecutive_failures": session["consecutive_empty_stt"]
+                })
+            return
+        
+        # Reset contador de fallos
+        session["consecutive_empty_stt"] = 0
+
+        # 2. FASE 2: Normalizacion avanzada de numeros
+        user_text = self._normalize_complex_numbers(user_text)
+        
+        # 3. Normalizacion basica
+        user_text = self._normalize_transcription(user_text)
+        print(f"Cliente: {user_text}")
+
+        # 4. Enviar transcripcion al frontend
+        await websocket.send_json({
+            "type": "transcription",
+            "speaker": "user",
+            "text": user_text
+        })
+
+        # 5. Agregar al historial
+        session["conversation_history"].append({
+            "role": "user",
+            "content": user_text
+        })
+
+        # 6. Detectar intencion
+        intent = await self._detect_intent(user_text, session)
+        print(f"Intencion: {intent}")
+
+        # 7. Procesar segun intencion
+        if intent["type"] == "correction":
+            await self._handle_correction(user_text, intent, session, websocket)
+        elif intent["type"] == "confirmation_yes":
+            await self._handle_confirmation_yes(session, websocket)
+        elif intent["type"] == "confirmation_no":
+            await self._handle_confirmation_no(session, websocket)
+        elif intent["type"] == "answer":
+            await self._handle_answer(user_text, session, websocket)
+
+        # 8. FASE 3: Detectar emocion del usuario
+        emotion = self._detect_emotion(user_text)
+        session["last_emotion"] = emotion
+        session["last_activity"] = time.time()
+        
+        # Enviar emocion al frontend
+        await websocket.send_json({
+            "type": "emotion_detected",
+            "emotion": emotion,
+            "text": user_text
+        })
+        
+        # 9. FASE 3: Guardar sesion en Redis
+        self._save_session_to_redis(session_id, session)
+        
+        # 10. Actualizar frontend
+        await self._send_field_updates(websocket, session_id)
+        
+        # 11. FASE MULTI-PRODUCTO: Enviar progreso
+        progress = self._get_progress_info(session_id)
+        if progress.get("total", 0) > 0:
+            await websocket.send_json({
+                "type": "progress_update",
+                "data": progress
+            })
+
+        # 9. Agregar respuesta al historial
+        last_response = session.get("last_response", "")
+        if last_response:
+            session["conversation_history"].append({
+                "role": "assistant",
+                "content": last_response
+            })
+
+    # ═══════════════════════════════════════════════════════════
+    # NORMALIZACION POST-STT
+    # ═══════════════════════════════════════════════════════════
+    def _normalize_transcription(self, text: str) -> str:
+        """Normaliza texto transcrito"""
+        number_map = {
+            "cero": "0", "uno": "1", "dos": "2", "tres": "3", "cuatro": "4",
+            "cinco": "5", "seis": "6", "siete": "7", "ocho": "8", "nueve": "9",
+            "diez": "10", "veinte": "20", "treinta": "30", "cuarenta": "40",
+            "cincuenta": "50", "sesenta": "60", "setenta": "70", "ochenta": "80",
+            "noventa": "90", "cien": "100", "mil": "1000"
+        }
+        
+        for word, number in number_map.items():
+            text = re.sub(rf'\b{word}\b', number, text, flags=re.IGNORECASE)
+        
+        text = re.sub(r'(\d+)\s*mil', lambda m: str(int(m.group(1)) * 1000), text)
+        text = re.sub(r'\b(este|eh|o sea|mmm|um)\b', '', text, flags=re.IGNORECASE)
+        
+        return text.strip()
+
+    # ═══════════════════════════════════════════════════════════
+    # DETECCION DE INTENCION
+    # ═══════════════════════════════════════════════════════════
+    async def _detect_intent(self, user_text: str, session: Dict) -> Dict:
+        """Detecta intencion del usuario"""
+        state = session["state"]
+        
+        if state == "confirming":
+            prompt = f"""
+El usuario esta en confirmacion final de un producto.
+Campos actuales:
+- Nombre: {session['product_data']['name']}
+- Categoria: {session['product_data']['category']}
+- Marca: {session['product_data']['brand']}
+- Precio: {session['product_data']['sale_price']}
+- Cantidad: {session['product_data']['quantity']}
+
+El usuario dice: "{user_text}"
+
+Clasifica la intencion:
+- confirmation_yes: si dice si, correcto, esta bien, perfecto, guardar
+- confirmation_no: si dice no, incorrecto, esta mal, cambiar
+- correction: si quiere corregir un campo especifico
+
+Si es correction, indica que campo: name, category, brand, sale_price, quantity
+
+Responde SOLO en JSON:
+{{"type": "confirmation_yes|confirmation_no|correction", "field": "name|category|brand|sale_price|quantity|null"}}
+"""
+        else:
+            prompt = f"""
+El usuario esta registrando un producto. Campo actual: {session['current_field']}
+El usuario dice: "{user_text}"
+
+Clasifica la intencion:
+- answer: si esta respondiendo al campo actual
+- correction: si quiere corregir un campo anterior
+
+Si es correction, indica que campo: name, category, brand, sale_price, quantity
+
+Responde SOLO en JSON:
+{{"type": "answer|correction", "field": "name|category|brand|sale_price|quantity|null"}}
+"""
+
+        try:
+            completion = self.client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=100,
+                temperature=0.1,
+            )
+            
+            response_text = completion.choices[0].message.content.strip()
+            json_match = re.search(r'\{[^}]+\}', response_text)
+            if json_match:
+                import json
+                return json.loads(json_match.group())
+            
+            return {"type": "answer", "field": None}
+        except Exception as e:
+            print(f"Error detectando intencion: {e}")
+            return {"type": "answer", "field": None}
+
+    # ═══════════════════════════════════════════════════════════
+    # VALIDACION CRUZADA DE DATOS
+    # ═══════════════════════════════════════════════════════════
+    async def _validate_data_consistency(self, session: Dict, websocket: WebSocket) -> Optional[str]:
+        """Valida consistencia de los datos capturados"""
+        data = session["product_data"]
+        
+        if not data.get("name") or not data.get("category"):
+            return None
+        
+        prompt = f"""
+Eres un experto en repuestos de motos. Analiza si estos datos son consistentes:
+
+Producto: "{data.get('name')}"
+Categoria: "{data.get('category')}"
+Marca: "{data.get('brand')}"
+
+Responde SOLO con un JSON:
+{{"consistent": true/false, "reason": "razon breve si es inconsistente"}}
+"""
+        
+        try:
+            completion = self.client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=150,
+                temperature=0.2,
+            )
+            
+            response_text = completion.choices[0].message.content.strip()
+            json_match = re.search(r'\{[^}]+\}', response_text)
+            
+            if json_match:
+                import json
+                validation = json.loads(json_match.group())
+                
+                if not validation.get("consistent", True):
+                    reason = validation.get("reason", "Datos inconsistentes")
+                    warning_msg = f"Oye, noto algo raro: {reason}. Quieres corregir algun campo?"
+                    
+                    await websocket.send_json({
+                        "type": "validation_warning",
+                        "consistent": False,
+                        "reason": reason,
+                        "message": warning_msg
+                    })
+                    
+                    return warning_msg
+            
+            return None
+        except Exception as e:
+            print(f"Error en validacion: {e}")
+            return None
+
+    # ═══════════════════════════════════════════════════════════
+    # FASE 2: BUSQUEDA EN BD Y AUTOCOMPLETADO
+    # ═══════════════════════════════════════════════════════════
+    async def _search_and_autocomplete(self, product_name: str, session: Dict, websocket: WebSocket) -> Optional[str]:
+        """
+        Busca el producto en la BD y autocompleta categoria y marca.
+        Retorna mensaje con sugerencias si encuentra coincidencias.
+        """
+        if not self.db_url:
+            return None
+        
+        # Buscar productos similares
+        products = self._search_products_by_name(product_name, limit=3)
+        
+        if not products:
+            return None
+        
+        # Si hay una coincidencia exacta o muy cercana
+        best_match = products[0]
+        brand_name = best_match.get('brand_name')
+        category_name = best_match.get('category_name')
+        
+        # Autocompletar si tenemos categoria y marca
+        if brand_name and category_name:
+            # Actualizar session con los datos encontrados
+            if not session["product_data"].get("category"):
+                session["product_data"]["category"] = category_name
+            if not session["product_data"].get("brand"):
+                session["product_data"]["brand"] = brand_name
+            
+            # Enviar actualizacion al frontend
+            await self._send_field_updates(websocket, list(self.sessions.keys())[0] if self.sessions else "")
+            
+            # Construir mensaje de sugerencia
+            if len(products) == 1:
+                msg = f"Encontre un producto similar: {best_match['nameCommercial']}, de marca {brand_name} en la categoria {category_name}. Es el mismo producto?"
+            else:
+                msg = f"Encontre {len(products)} productos similares. El primero es {best_match['nameCommercial']}, de {brand_name}. Es este?"
+            
+            await websocket.send_json({
+                "type": "product_suggestion",
+                "products": products,
+                "autocompleted": {
+                    "category": category_name,
+                    "brand": brand_name
+                }
+            })
+            
+            return msg
+        
+        return None
+
+    # ═══════════════════════════════════════════════════════════
+    # MANEJO DE INTENCIONES
+    # ═══════════════════════════════════════════════════════════
+    async def _handle_correction(self, user_text: str, intent: Dict, session: Dict, websocket: WebSocket):
+        """Maneja correccion de campo"""
+        field = intent.get("field")
+        valid_fields = ["name", "category", "brand", "sale_price", "quantity"]
+        
+        if not field or field not in valid_fields:
+            response = "Que campo quieres corregir? Puede ser nombre, categoria, marca, precio o cantidad."
+            session["last_response"] = response
+            await self._send_audio_response(websocket, response, str(id(websocket)))
+            return
+
+        session["current_field"] = field
+        session["state"] = "collecting"
+        
+        field_names = {
+            "name": "nombre",
+            "category": "categoria",
+            "brand": "marca",
+            "sale_price": "precio",
+            "quantity": "cantidad"
+        }
+        
+        response = f"Entendido, vamos a corregir el {field_names[field]}. Cual es el nuevo valor?"
+        session["last_response"] = response
+        await self._send_audio_response(websocket, response, str(id(websocket)))
+
+    async def _handle_confirmation_yes(self, session: Dict, websocket: WebSocket):
+        """Maneja confirmacion positiva"""
+        session_id = str(id(websocket))
+        
+        # FASE MULTI-PRODUCTO: Si hay cola de productos, avanzar al siguiente
+        if session.get("product_queue") and len(session["product_queue"]) > 0:
+            result = self._advance_to_next_product(session_id)
+            if result:
+                if result["status"] == "next":
+                    remaining = result.get("remaining", 0)
+                    response = f"Perfecto! Producto registrado. Faltan {remaining} productos."
+                    session["last_response"] = response
+                    await self._send_audio_response(websocket, response, session_id)
+                    
+                    # Anunciar siguiente producto
+                    progress = self._get_progress_info(session_id)
+                    current = progress.get("current_product", {})
+                    idx = progress.get("current_index", 0)
+                    total = progress.get("total", 0)
+                    
+                    await websocket.send_json({
+                        "type": "product_advanced",
+                        "data": result
+                    })
+                    
+                    await self._send_audio_response(
+                        websocket,
+                        f"Producto {idx + 1} de {total}. Codigo: {current.get('barcode', 'sin codigo')}. Cual es el nombre?",
+                        session_id
+                    )
+                    
+                    await self._send_field_updates(websocket, session_id)
+                    return
+                
+                elif result["status"] == "all_done":
+                    completed_count = len(self.sessions[session_id]["completed_products"])
+                    response = f"Excelente! Hemos completado los {completed_count} productos. Todos han sido registrados exitosamente."
+                    session["state"] = "complete"
+                    session["last_response"] = response
+                    await self._send_audio_response(websocket, response, session_id)
+                    
+                    await websocket.send_json({
+                        "type": "all_products_complete",
+                        "data": result
+                    })
+                    return
+        
+        # Flujo normal (un solo producto)
+        session["state"] = "complete"
+        response = "Perfecto! Producto registrado exitosamente."
+        session["last_response"] = response
+        await self._send_audio_response(websocket, response, session_id)
+        
+        await websocket.send_json({
+            "type": "product_complete",
+            "data": session["product_data"]
+        })
+
+    async def _handle_confirmation_no(self, session: Dict, websocket: WebSocket):
+        """Maneja confirmacion negativa"""
+        session["state"] = "collecting"
+        response = "Entendido. Que campo quieres corregir? Puede ser nombre, categoria, marca, precio o cantidad."
+        session["last_response"] = response
+        await self._send_audio_response(websocket, response, str(id(websocket)))
+
+    async def _handle_answer(self, user_text: str, session: Dict, websocket: WebSocket):
+        """Maneja respuesta normal al campo actual"""
+        current_field = session["current_field"]
+        
+        value = await self._extract_field_value(user_text, current_field, session)
+        
+        if not value:
+            # FASE 2: Repeticion inteligente
+            response = "No entendi bien. Puedes repetir?"
+            session["last_response"] = response
+            await self._send_audio_response(websocket, response, str(id(websocket)))
+            await websocket.send_json({
+                "type": "stt_low_confidence",
+                "field": current_field
+            })
+            return
+        
+        # Actualizar campo
+        if current_field == "greeting":
+            session["customer_name"] = value
+            session["current_field"] = "name"
+            response = f"Mucho gusto {value}. Cual es el nombre del producto que deseas registrar?"
+        else:
+            session["product_data"][current_field] = value
+            
+            # FASE 2: Busqueda en BD y autocompletado cuando se captura el nombre
+            if current_field == "name":
+                suggestion_msg = await self._search_and_autocomplete(value, session, websocket)
+                if suggestion_msg:
+                    # Si encontramos sugerencia, preguntar al usuario
+                    session["last_response"] = suggestion_msg
+                    await self._send_audio_response(websocket, suggestion_msg, str(id(websocket)))
+                    # Avanzar a categoria (ya fue autocompletada si existia)
+                    session["current_field"] = "category"
+                    return
+            
+            # Validacion cruzada
+            validation_warning = await self._validate_data_consistency(session, websocket)
+            if validation_warning:
+                response = validation_warning
+                session["last_response"] = response
+                await self._send_audio_response(websocket, response, str(id(websocket)))
+                return
+            
+            # Avanzar al siguiente campo
+            field_order = ["name", "category", "brand", "sale_price", "quantity"]
+            current_idx = field_order.index(current_field)
+            
+            if current_idx < len(field_order) - 1:
+                next_field = field_order[current_idx + 1]
+                session["current_field"] = next_field
+                response = self._get_next_question(next_field, value)
+            else:
+                session["state"] = "confirming"
+                response = await self._build_confirmation_message(session)
+        
+        session["last_response"] = response
+        
+        # FASE 3: Adaptar respuesta segun emocion
+        emotion = session.get("last_emotion", "neutral")
+        response = self._get_emotion_response_adaptation(emotion, response)
+        
+        # Usar streaming para respuestas largas
+        if len(response) > 50:
+            prompt = f"""
+Eres un asistente de voz amable de Clavijos Motos.
+Responde de forma conversacional y breve (menos de 80 palabras).
+NO uses listas, vinetas ni formato Markdown.
+
+Tu respuesta debe ser: {response}
+
+Genera tu respuesta ahora:"""
+            
+            await self._generate_response_streaming(prompt, websocket, str(id(websocket)))
+        else:
+            await self._send_audio_response(websocket, response, str(id(websocket)))
+
+    async def _extract_field_value(self, user_text: str, field: str, session: Dict) -> Optional[str]:
+        """Extrae valor de un campo usando LLM"""
+        if field == "greeting":
+            prompt = f"""
+El usuario esta saludando y dice su nombre: "{user_text}"
+Extrae SOLO el nombre de la persona.
+Responde SOLO con el nombre, nada mas.
+"""
+        else:
+            prompt = f"""
+El usuario esta registrando un producto.
+Campo actual: {field}
+El usuario dice: "{user_text}"
+
+Extrae SOLO el valor para el campo '{field}':
+- name: nombre completo del producto
+- category: categoria (aceites, frenos, cadenas, llantas, filtros, baterias)
+- brand: marca (Bajaj, Yamaha, Honda, Suzuki, AKT, Motul, etc.)
+- sale_price: SOLO el numero en pesos (ej: 25000)
+- quantity: SOLO el numero entero (ej: 1, 5, 10)
+
+Responde SOLO con el valor extraido, nada mas.
+"""
+
+        try:
+            completion = self.client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=50,
+                temperature=0.3,
+            )
+            
+            value = completion.choices[0].message.content.strip()
+            
+            if field in ["sale_price", "quantity"]:
+                numbers = re.findall(r'\d+', value)
+                if numbers:
+                    return numbers[0]
+                return None
+            
+            return value if value else None
+        except Exception as e:
+            print(f"Error extrayendo valor: {e}")
+            return None
+
+    def _get_next_question(self, next_field: str, previous_value: str) -> str:
+        """Genera siguiente pregunta"""
+        questions = {
+            "name": f"Perfecto, {previous_value}. Cual es el nombre del producto?",
+            "category": "Excelente. A que categoria pertenece? Por ejemplo: aceites, frenos, cadenas, llantas, filtros, baterias.",
+            "brand": "Muy bien. Que marca es? Por ejemplo: Bajaj, Yamaha, Honda, Suzuki, AKT, Motul, o generico.",
+            "sale_price": "Perfecto. Cual es el precio de venta en pesos colombianos?",
+            "quantity": "Entendido. Cuantas unidades estas registrando?"
+        }
+        return questions.get(next_field, "Continuemos.")
+
+    async def _build_confirmation_message(self, session: Dict) -> str:
+        """Construye mensaje de confirmacion"""
+        data = session["product_data"]
+        return (
+            f"Perfecto, dejame confirmar los datos del producto. "
+            f"Nombre: {data['name']}. "
+            f"Categoria: {data['category']}. "
+            f"Marca: {data['brand']}. "
+            f"Precio de venta: {data['sale_price']} pesos. "
+            f"Cantidad: {data['quantity']}. "
+            f"Estan correctos todos los valores? Responde si o no."
+        )
+
+    # ═══════════════════════════════════════════════════════════
+    # COMUNICACION CON FRONTEND
+    # ═══════════════════════════════════════════════════════════
+    async def _send_field_updates(self, websocket: WebSocket, session_id: str):
+        """Envia actualizaciones de campos al frontend"""
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+
+        await websocket.send_json({
+            "type": "field_update",
+            "data": {
+                "customer_name": session.get("customer_name"),
+                "product_data": session["product_data"],
+                "current_field": session["current_field"],
+                "state": session["state"]
+            }
+        })
+
+    # ═══════════════════════════════════════════════════════════
+    # STT: SPEECH-TO-TEXT
+    # ═══════════════════════════════════════════════════════════
+
+    def _add_wav_header(self, pcm_data: bytes, sample_rate: int = 16000, channels: int = 1, bits_per_sample: int = 16) -> bytes:
+        """Agrega header WAV de 44 bytes a datos PCM16 raw"""
+        import struct
+        
+        data_size = len(pcm_data)
+        byte_rate = sample_rate * channels * bits_per_sample // 8
+        block_align = channels * bits_per_sample // 8
+        
+        # Construir header WAV (44 bytes)
+        header = struct.pack(
+            '<4sI4s4sIHHIIHH4sI',
+            b'RIFF',                    # ChunkID
+            36 + data_size,             # ChunkSize (file size - 8)
+            b'WAVE',                    # Format
+            b'fmt ',                    # Subchunk1ID
+            16,                         # Subchunk1Size (16 for PCM)
+            1,                          # AudioFormat (1 = PCM)
+            channels,                   # NumChannels
+            sample_rate,                # SampleRate
+            byte_rate,                  # ByteRate
+            block_align,                # BlockAlign
+            bits_per_sample,            # BitsPerSample
+            b'data',                    # Subchunk2ID
+            data_size                   # Subchunk2Size
+        )
+        
+        return header + pcm_data
+
+    async def _stt_transcribe(self, audio_data: bytes) -> str:
+        """Transcribe audio usando Groq Whisper"""
+        # Agregar header WAV si el audio es PCM16 raw
+        wav_data = self._add_wav_header(audio_data, sample_rate=16000, channels=1, bits_per_sample=16)
+        
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(wav_data)
+            temp_path = f.name
+
+        try:
+            print(f"📤 Enviando audio a Groq: {len(wav_data)} bytes (header WAV + {len(audio_data)} bytes PCM16)")
+            with open(temp_path, "rb") as audio_file:
+                transcription = self.client.audio.transcriptions.create(
+                    file=audio_file,
+                    model="whisper-large-v3-turbo",
+                    language="es",
+                    response_format="text",
+                )
+            print(f"✅ STT transcribió: '{transcription.strip()}'")
+            return transcription.strip()
+        except Exception as e:
+            print(f"STT error: {e}")
+            return ""
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    # ═══════════════════════════════════════════════════════════
+    # STREAMING LLM -> TTS
+    # ═══════════════════════════════════════════════════════════
+    async def _generate_response_streaming(self, prompt: str, websocket: WebSocket, session_id: str):
+        """Genera respuesta del LLM en streaming y envia al TTS por oraciones"""
+        if not self.client:
+            return
+        
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+        
+        sentence_buffer = []
+        full_response = []
+        
+        try:
+            stream = self.client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200,
+                temperature=0.8,
+                stream=True,
+            )
+            
+            for chunk in stream:
+                if not session.get("is_tts_playing", True) and session.get("state") != "collecting":
+                    break
+                
+                token = chunk.choices[0].delta.content
+                if token:
+                    sentence_buffer.append(token)
+                    full_response.append(token)
+                    
+                    if self._is_sentence_boundary(token):
+                        sentence = "".join(sentence_buffer).strip()
+                        if sentence:
+                            await self._send_audio_response(websocket, sentence, session_id)
+                        sentence_buffer = []
+            
+            if sentence_buffer:
+                sentence = "".join(sentence_buffer).strip()
+                if sentence:
+                    await self._send_audio_response(websocket, sentence, session_id)
+            
+            full_text = "".join(full_response)
+            session["last_response"] = full_text
+            
+            await websocket.send_json({
+                "type": "transcription",
+                "speaker": "agent",
+                "text": full_text
+            })
+            
+        except Exception as e:
+            print(f"Error en streaming LLM: {e}")
+            fallback = await self._generate_response_fallback(prompt)
+            session["last_response"] = fallback
+            await self._send_audio_response(websocket, fallback, session_id)
+
+    def _is_sentence_boundary(self, token: str) -> bool:
+        """Detecta si un token termina una oracion"""
+        sentence_endings = ['.', '!', '?', '...', '\n']
+        return any(token.strip().endswith(ending) for ending in sentence_endings)
+
+    async def _generate_response_fallback(self, prompt: str) -> str:
+        """Fallback si falla el streaming"""
+        try:
+            completion = self.client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200,
+                temperature=0.7,
+            )
+            return completion.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"Error en fallback LLM: {e}")
+            return "Disculpa, tuve un problema. Puedes repetir?"
+
+    # ═══════════════════════════════════════════════════════════
+    # TTS: TEXT-TO-SPEECH
+    # ═══════════════════════════════════════════════════════════
+    async def _send_audio_response(self, websocket: WebSocket, text: str, session_id: str):
+        """Sintetiza texto y envia audio"""
+        session = self.sessions.get(session_id) if session_id else None
+        
+        try:
+            if session:
+                session["is_tts_playing"] = True
+            
+            await websocket.send_json({
+                "type": "transcription",
+                "speaker": "agent",
+                "text": text
+            })
+            
+            audio = await self.tts_synthesize(text)
+            if audio:
+                await websocket.send_bytes(audio)
+            else:
+                await websocket.send_json({"type": "text", "content": text})
+        except Exception as e:
+            print(f"TTS error: {e}")
+            await websocket.send_json({"type": "text", "content": text})
+        finally:
+            if session:
+                session["is_tts_playing"] = False
+
+    async def tts_synthesize(self, text: str) -> bytes:
+        """Sintetiza texto usando Piper TTS"""
+        if not os.path.exists(self.piper_model):
+            print(f"Modelo Piper no encontrado en {self.piper_model}")
+            return b""
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            output_path = f.name
+
+        try:
+            cmd = [
+                "/usr/local/bin/piper/piper",
+                "-m", self.piper_model,
+                "-f", output_path
+            ]
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            stdout, stderr = process.communicate(input=text.encode("utf-8"), timeout=5)
+
+            if process.returncode != 0:
+                print(f"Piper error: {stderr.decode()}")
+                return b""
+
+            with open(output_path, "rb") as f:
+                audio = f.read()
+            return audio
+        except subprocess.TimeoutExpired:
+            print("TTS timeout")
+            return b""
+        except Exception as e:
+            print(f"TTS error: {e}")
+            return b""
+        finally:
+            if os.path.exists(output_path):
+                os.unlink(output_path)

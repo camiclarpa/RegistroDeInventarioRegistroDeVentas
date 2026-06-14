@@ -1,0 +1,324 @@
+import React from 'react';
+import Barcode from 'react-barcode';
+
+interface LabelPrintModalProps {
+  productName: string;
+  sku: string;
+  barcode: string;
+  quantity: number;
+  price?: number;
+  onClose: () => void;
+}
+
+export const LabelPrintModal: React.FC<LabelPrintModalProps> = ({
+  productName,
+  sku,
+  barcode,
+  quantity,
+  price,
+  onClose
+}) => {
+  const handlePrint = () => {
+    const printWindow = window.open('', '_blank', 'width=400,height=600');
+    if (!printWindow) {
+      alert('❌ Permite las ventanas emergentes para imprimir');
+      return;
+    }
+
+    // Generar HTML con UNA etiqueta por página, tamaño EXACTO 32x25mm
+    let labelsHTML = '';
+    for (let i = 0; i < quantity; i++) {
+      labelsHTML += `
+        <div class="label-page">
+          <div class="label">
+            <div class="label-header">Taller y Repuestos Clavijos</div>
+            <div class="label-name">${productName}</div>
+            ${price ? `<div class="label-price">$${price.toLocaleString('es-CO')}</div>` : ''}
+            <div class="label-barcode">
+              <svg id="barcode-${i}"></svg>
+              <div class="barcode-text">${barcode}</div>
+            </div>
+            <div class="label-sku">SKU: ${sku}</div>
+          </div>
+        </div>
+      `;
+    }
+
+    const printHTML = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>Etiquetas - ${productName}</title>
+          <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"></script>
+          <style>
+            @page {
+              size: 32mm 25mm;
+              margin: 0;
+            }
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            html, body {
+              width: 32mm;
+              font-family: Arial, Helvetica, sans-serif;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+            }
+            body { background: white; }
+
+            .label-page {
+              width: 32mm;
+              height: 25mm;
+              page-break-after: always;
+              break-after: page;
+              overflow: hidden;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+            }
+            .label-page:last-child {
+              page-break-after: auto;
+              break-after: auto;
+            }
+
+            .label {
+              width: 30mm;
+              height: 23mm;
+              display: flex;
+              flex-direction: column;
+              align-items: center;
+              justify-content: space-between;
+              padding: 0.5mm;
+              overflow: hidden;
+            }
+
+            .label-header {
+              font-size: 5px;
+              font-weight: 700;
+              text-transform: uppercase;
+              letter-spacing: 0.2px;
+              color: #000;
+              border-bottom: 0.3px solid #000;
+              width: 100%;
+              text-align: center;
+              padding-bottom: 0.3mm;
+              white-space: nowrap;
+              overflow: hidden;
+            }
+
+            .label-name {
+              font-size: 6px;
+              font-weight: 600;
+              text-align: center;
+              line-height: 1.1;
+              color: #000;
+              flex-grow: 1;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              word-break: break-word;
+              overflow: hidden;
+              max-height: 7mm;
+              padding: 0 0.5mm;
+            }
+
+            .label-price {
+              font-size: 9px;
+              font-weight: 900;
+              color: #000;
+              text-align: center;
+              margin: 0.3mm 0;
+            }
+
+            .label-barcode {
+              text-align: center;
+              width: 100%;
+            }
+
+            .label-barcode svg {
+              max-width: 26mm;
+              max-height: 8mm;
+              height: auto;
+              display: block;
+              margin: 0 auto;
+            }
+
+            .barcode-text {
+              font-size: 4.5px;
+              font-family: 'Courier New', monospace;
+              color: #000;
+              letter-spacing: 0.3px;
+              margin-top: 0.2mm;
+            }
+
+            .label-sku {
+              font-size: 4.5px;
+              font-family: 'Courier New', monospace;
+              font-weight: 700;
+              color: #000;
+              text-align: center;
+            }
+
+            /* UI de control - no se imprime */
+            .toolbar {
+              background: #0f172a;
+              color: white;
+              padding: 16px;
+              text-align: center;
+              position: sticky;
+              top: 0;
+              z-index: 100;
+            }
+            .toolbar h1 { font-size: 16px; margin-bottom: 4px; }
+            .toolbar p { font-size: 12px; opacity: 0.8; }
+
+            .actions {
+              padding: 12px;
+              background: white;
+              border-bottom: 2px solid #e2e8f0;
+              text-align: center;
+              display: flex;
+              gap: 8px;
+              justify-content: center;
+            }
+            .btn {
+              padding: 10px 24px;
+              border-radius: 6px;
+              font-size: 14px;
+              font-weight: 600;
+              cursor: pointer;
+              border: none;
+            }
+            .btn-cancel { background: #e2e8f0; color: #334155; }
+            .btn-print { background: #0284c7; color: white; }
+
+            .info-box {
+              margin: 16px;
+              padding: 12px;
+              background: #fef3c7;
+              border-left: 4px solid #f59e0b;
+              border-radius: 4px;
+              font-size: 12px;
+              color: #78350f;
+            }
+            .info-box strong { display: block; margin-bottom: 4px; }
+            .info-box ol { margin-left: 20px; margin-top: 4px; }
+            .info-box li { margin-bottom: 4px; }
+
+            @media print {
+              .no-print { display: none !important; }
+              body { background: white; }
+            }
+          </style>
+        </head>
+        <body>
+          <div class="toolbar no-print">
+            <h1>🏷️ Impresión de Etiquetas</h1>
+            <p>${productName}</p>
+            <p><strong>${quantity}</strong> etiquetas · 32mm × 25mm</p>
+          </div>
+
+          <div class="info-box no-print">
+            <strong>⚙️ CONFIGURACIÓN DE IMPRESIÓN (MUY IMPORTANTE):</strong>
+            <ol>
+              <li>En el diálogo de impresión, selecciona tu impresora <strong>SAT Q22T / TT460</strong></li>
+              <li>En "Tamaño de papel" elige <strong>32x25mm</strong> (si no existe, créalo en Preferencias de impresora)</li>
+              <li>En "Márgenes" selecciona <strong>Ninguno</strong></li>
+              <li>Desactiva "Encoger al ajustar" / "Escalar al imprimir" (escala 100%)</li>
+              <li>Haz clic en <strong>Imprimir</strong></li>
+            </ol>
+          </div>
+
+          <div class="actions no-print">
+            <button class="btn btn-cancel" onclick="window.close()">Cancelar</button>
+            <button class="btn btn-print" onclick="window.print()">🖨️ Imprimir ${quantity} Etiquetas</button>
+          </div>
+
+          ${labelsHTML}
+
+          <script>
+            // Generar códigos de barras con JsBarcode
+            window.addEventListener('DOMContentLoaded', function() {
+              for (let i = 0; i < ${quantity}; i++) {
+                try {
+                  JsBarcode("#barcode-" + i, "${barcode}", {
+                    format: "CODE128",
+                    width: 1.5,
+                    height: 30,
+                    displayValue: false,
+                    margin: 0
+                  });
+                } catch(e) {
+                  console.error('Error generando barcode:', e);
+                }
+              }
+            });
+          </script>
+        </body>
+      </html>
+    `;
+
+    printWindow.document.write(printHTML);
+    printWindow.document.close();
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg overflow-hidden">
+        {/* Header */}
+        <div className="px-6 py-4 border-b border-gray-100 flex justify-between items-center bg-gray-50/50">
+          <h3 className="text-lg font-bold text-gray-800">Vista Previa de Etiqueta</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1 rounded-full hover:bg-gray-100">
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Cuerpo - Vista previa */}
+        <div className="p-8 flex flex-col items-center bg-gray-100/50">
+          <div className="bg-white rounded border-2 border-dashed border-gray-400 shadow-md flex flex-col items-center justify-between" style={{ width: '32mm', height: '25mm', padding: '0.5mm' }}>
+            <div className="w-full text-center border-b border-gray-900 pb-0.5">
+              <span className="text-[5px] font-bold uppercase tracking-widest text-gray-900">
+                Taller y Repuestos Clavijos
+              </span>
+            </div>
+            <div className="w-full text-center font-semibold text-gray-800 flex-grow flex items-center justify-center px-0.5 leading-tight overflow-hidden" style={{ fontSize: '6px', maxHeight: '7mm' }}>
+              {productName}
+            </div>
+            {price && (
+              <div className="text-[9px] font-black text-gray-900">
+                ${price.toLocaleString('es-CO')}
+              </div>
+            )}
+            <div className="w-full flex flex-col items-center">
+              <Barcode value={barcode} format="CODE128" width={1} height={14} displayValue={false} margin={0} />
+              <span className="text-[4.5px] font-mono text-gray-600 tracking-wider">{barcode}</span>
+            </div>
+            <div className="text-[4.5px] font-mono font-bold text-gray-700">
+              SKU: {sku}
+            </div>
+          </div>
+
+          <div className="mt-6 text-center">
+            <p className="text-sm text-gray-600">
+              Se imprimirán <strong className="text-sky-600">{quantity}</strong> etiquetas
+            </p>
+            <p className="text-xs text-gray-400 mt-1">Formato: 32mm × 25mm (térmico)</p>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="px-6 py-4 border-t border-gray-100 flex justify-between items-center bg-gray-50">
+          <button onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-200 rounded-lg">
+            Cancelar
+          </button>
+          <button
+            onClick={handlePrint}
+            className="px-6 py-2 text-sm font-semibold text-white bg-sky-600 hover:bg-sky-700 rounded-lg shadow-sm flex items-center gap-2"
+          >
+            🖨️ Imprimir {quantity} Etiquetas
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};

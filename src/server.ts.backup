@@ -1,0 +1,35 @@
+import 'dotenv/config';
+import helmet from 'helmet';
+import cookieParser from 'cookie-parser';
+import app from './app';
+import { logger } from './config/logger';
+import { prisma } from './config/prisma';
+
+const PORT = process.env.PORT || 3000;
+
+async function bootstrap() {
+  await prisma.$connect();
+  logger.info('Database connected');
+
+  app.listen(PORT, () => {
+    logger.info(`SIGC-Motos API running on port ${PORT}`);
+  });
+}
+
+bootstrap().catch((err) => {
+  logger.error('Fatal startup error', { err });
+  process.exit(1);
+});
+
+// Rate limiting
+import rateLimit from 'express-rate-limit';
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 100, // 100 peticiones por IP
+  message: { success: false, error: 'Demasiadas peticiones, intente más tarde' }
+});
+app.use('/api/', limiter);
+
+// Helmet.js para headers de seguridad
+import helmet from 'helmet';
+app.use(helmet());

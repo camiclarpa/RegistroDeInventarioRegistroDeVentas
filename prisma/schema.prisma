@@ -1,0 +1,958 @@
+generator client {
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url = env("DATABASE_URL")
+}
+
+model accounts_payable {
+  id               String            @id
+  purchaseOrderId  String            @unique
+  supplierId       String
+  totalDebt        Decimal           @db.Decimal(12, 2)
+  paidAmount       Decimal           @default(0.00) @db.Decimal(12, 2)
+  remainingBalance Decimal           @db.Decimal(12, 2)
+  dueDate          DateTime?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime
+  status           AccountStatus?    @default(PENDING)
+  purchase_orders  purchase_orders   @relation(fields: [purchaseOrderId], references: [id])
+  suppliers        suppliers         @relation(fields: [supplierId], references: [id])
+  payment_records  payment_records[]
+
+  @@index([dueDate])
+  @@index([supplierId])
+}
+
+model accounts_receivable {
+  id               String            @id
+  saleId           String?           @unique
+  customerId       String?
+  totalDebt        Decimal?          @db.Decimal(12, 2)
+  paidAmount       Decimal?          @default(0) @db.Decimal(12, 2)
+  remainingBalance Decimal?          @db.Decimal(12, 2)
+  dueDate          DateTime?         @db.Timestamp(6)
+  status           AccountStatus?    @default(PENDING)
+  createdAt        DateTime?         @default(now()) @db.Timestamp(6)
+  updatedAt        DateTime?         @default(now()) @db.Timestamp(6)
+  days_overdue     Int?
+  aging_bucket     String?
+  customers        customers?        @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  sales            sales?            @relation(fields: [saleId], references: [id], onDelete: Restrict)
+  payment_records  payment_records[]
+
+  @@index([aging_bucket])
+  @@index([customerId])
+  @@index([dueDate])
+  @@index([status])
+}
+
+model audit_logs {
+  id        String    @id
+  userId    String?
+  action    String?
+  entity    String?
+  entityId  String?
+  details   Json?     @default("{}")
+  ipAddress String?
+  timestamp DateTime? @default(now()) @db.Timestamp(6)
+
+  @@index([entity, entityId])
+  @@index([timestamp])
+  @@index([userId])
+}
+
+model bank_deposits {
+  id                                          String          @id
+  cashRegisterId                              String?
+  amount                                      Decimal?        @db.Decimal(12, 2)
+  bankName                                    String?
+  accountNumber                               String?
+  reference                                   String?
+  receiptImageKey                             String?
+  status                                      DepositStatus?  @default(PENDING)
+  depositDate                                 DateTime?       @db.Timestamp(6)
+  createdByUserId                             String?
+  approvedByUserId                            String?
+  createdAt                                   DateTime?       @default(now()) @db.Timestamp(6)
+  updatedAt                                   DateTime?       @default(now()) @db.Timestamp(6)
+  notes                                       String?
+  approvedAt                                  DateTime?       @db.Timestamp(6)
+  reconciledAt                                DateTime?       @db.Timestamp(6)
+  users_bank_deposits_approvedByUserIdTousers users?          @relation("bank_deposits_approvedByUserIdTousers", fields: [approvedByUserId], references: [id])
+  cash_registers                              cash_registers? @relation(fields: [cashRegisterId], references: [id])
+  users_bank_deposits_createdByUserIdTousers  users?          @relation("bank_deposits_createdByUserIdTousers", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  @@index([bankName])
+  @@index([depositDate])
+  @@index([status])
+}
+
+model bank_transfers {
+  id              String   @id
+  fromAccount     String
+  toAccount       String
+  amount          Decimal  @db.Decimal(12, 2)
+  reference       String?
+  description     String
+  createdByUserId String
+  transferDate    DateTime @default(now())
+  createdAt       DateTime @default(now())
+  users           users    @relation(fields: [createdByUserId], references: [id])
+
+  @@index([transferDate])
+}
+
+model brands {
+  id        String     @id
+  name      String     @unique
+  logoUrl   String?
+  isActive  Boolean    @default(true)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime
+  products  products[]
+}
+
+model budgets {
+  id              String    @id
+  category        String?
+  amount          Decimal?  @db.Decimal(12, 2)
+  month           Int?
+  year            Int?
+  alertAt         Int?      @default(80)
+  createdByUserId String?
+  createdAt       DateTime? @default(now()) @db.Timestamp(6)
+  updatedAt       DateTime? @default(now()) @db.Timestamp(6)
+  users           users?    @relation(fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  @@unique([category, month, year])
+  @@index([month, year])
+}
+
+model business_config {
+  id             String    @id @default("main")
+  businessName   String?   @default("TALLER Y REPUESTOS CLAVIJOS MOTOS")
+  nit            String?
+  address        String?
+  phone          String?
+  email          String?
+  logoKey        String?
+  taxRate        Decimal?  @default(19) @db.Decimal(5, 2)
+  footer         String?   @default("¡Gracias por su compra!")
+  createdAt      DateTime? @default(now()) @db.Timestamp(6)
+  updatedAt      DateTime? @default(now()) @db.Timestamp(6)
+  resolutionDian String?
+}
+
+model business_settings {
+  id                 String    @id @default(dbgenerated("('bs_'::text || gen_random_uuid())"))
+  businessName       String?   @default("Mi Negocio")
+  nit                String?
+  address            String?
+  phone              String?
+  email              String?
+  defaultIva         Float?    @default(19.0)
+  dianResolution     String?
+  dianResolutionDate DateTime? @db.Timestamp(6)
+  ticketFooter       String?   @default("Gracias por su compra")
+  invoicePrefix      String?   @default("FAC")
+  logoPath           String?
+  createdAt          DateTime? @default(now()) @db.Timestamp(6)
+  updatedAt          DateTime? @default(now()) @db.Timestamp(6)
+}
+
+model cash_counts {
+  id                                        String         @id
+  cashRegisterId                            String
+  countedByUserId                           String
+  approvedByUserId                          String?
+  denominations                             Json           @default("[]")
+  totalCounted                              Decimal        @db.Decimal(12, 2)
+  systemExpected                            Decimal        @db.Decimal(12, 2)
+  difference                                Decimal        @db.Decimal(12, 2)
+  differenceStatus                          String?
+  isBlindCount                              Boolean        @default(true)
+  requiresApproval                          Boolean        @default(false)
+  observations                              String?
+  countedAt                                 DateTime       @default(now())
+  users_cash_counts_approvedByUserIdTousers users?         @relation("cash_counts_approvedByUserIdTousers", fields: [approvedByUserId], references: [id])
+  cash_registers                            cash_registers @relation(fields: [cashRegisterId], references: [id])
+  users_cash_counts_countedByUserIdTousers  users          @relation("cash_counts_countedByUserIdTousers", fields: [countedByUserId], references: [id])
+
+  @@index([cashRegisterId])
+  @@index([countedAt])
+}
+
+model cash_registers {
+  id                                         String                   @id
+  openedByUserId                             String?
+  closedByUserId                             String?
+  openingBalance                             Decimal?                 @db.Decimal(12, 2)
+  closingBalance                             Decimal?                 @db.Decimal(12, 2)
+  expectedClosingBalance                     Decimal?                 @db.Decimal(12, 2)
+  difference                                 Decimal?                 @db.Decimal(12, 2)
+  differenceStatus                           String?
+  status                                     CashRegisterStatus?      @default(OPEN)
+  openedAt                                   DateTime?                @default(now()) @db.Timestamp(6)
+  closedAt                                   DateTime?                @db.Timestamp(6)
+  currentBalance                             Decimal?                 @default(0) @db.Decimal(12, 2)
+  totalIncome                                Decimal?                 @default(0) @db.Decimal(12, 2)
+  totalExpense                               Decimal?                 @default(0) @db.Decimal(12, 2)
+  notes                                      String?
+  requiresAdminReview                        Boolean?                 @default(false)
+  reviewNotes                                String?
+  reviewedAt                                 DateTime?                @db.Timestamp(6)
+  reviewedByUserId                           String?
+  approvedByUserId                           String?
+  approvedAt                                 DateTime?                @db.Timestamp(6)
+  cashierName                                String?
+  startingCash                               Decimal?                 @db.Decimal(12, 2)
+  endingCash                                 Decimal?                 @db.Decimal(12, 2)
+  salesCount                                 Int?                     @default(0)
+  transactionCount                           Int?                     @default(0)
+  bank_deposits                              bank_deposits[]
+  cash_counts                                cash_counts[]
+  users_cash_registers_closedByUserIdTousers users?                   @relation("cash_registers_closedByUserIdTousers", fields: [closedByUserId], references: [id])
+  users_cash_registers_openedByUserIdTousers users?                   @relation("cash_registers_openedByUserIdTousers", fields: [openedByUserId], references: [id], onDelete: Restrict)
+  financial_transactions                     financial_transactions[]
+
+  @@index([openedByUserId])
+  @@index([status])
+}
+
+model categories {
+  id               String     @id
+  name             String     @unique
+  slug             String     @unique
+  codePrefix       String     @db.VarChar(6)
+  marginPercentage Decimal    @default(30.00) @db.Decimal(5, 2)
+  isActive         Boolean    @default(true)
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime
+  products         products[]
+}
+
+model communication_logs {
+  id          String    @id
+  customerId  String
+  type        String
+  message     String
+  performedBy String
+  createdAt   DateTime  @default(now())
+  customers   customers @relation(fields: [customerId], references: [id])
+
+  @@index([customerId])
+  @@index([type])
+}
+
+model communications {
+  id              String    @id
+  customer_id     String
+  direction       String    @default("OUTBOUND")
+  channel         String
+  message         String
+  status          String    @default("SENT")
+  is_read         Boolean   @default(false)
+  read_at         DateTime?
+  sent_by_user_id String
+  metadata        Json?
+  created_at      DateTime  @default(now())
+  customers       customers @relation(fields: [customer_id], references: [id])
+
+  @@index([created_at])
+  @@index([customer_id, channel, status])
+}
+
+model customers {
+  id                       String                @id
+  name                     String
+  phone                    String?               @unique
+  email                    String?
+  identificationNumber     String?               @unique
+  address                  String?
+  isActive                 Boolean               @default(true)
+  preferences              String?
+  notes                    String?
+  tags                     String[]              @default([])
+  loyaltyPoints            Int                   @default(0)
+  loyaltyTier              String                @default("BRONZE")
+  totalSpent               Decimal               @default(0) @db.Decimal(15, 2)
+  lastPurchaseAt           DateTime?
+  purchaseCount            Int                   @default(0)
+  creditLimit              Decimal?              @db.Decimal(15, 2)
+  assigned_user_id         String?
+  recency_days             Int                   @default(0)
+  frequency_6m             Int                   @default(0)
+  monetary_6m              Decimal               @default(0) @db.Decimal(12, 2)
+  rfm_segment              String                @default("REGULAR")
+  credit_risk_score        Int                   @default(50)
+  last_communication_at    DateTime?
+  createdAt                DateTime              @default(now())
+  updatedAt                DateTime
+  email_encrypted          String?
+  phone_encrypted          String?
+  identification_encrypted String?
+  address_encrypted        String?
+  accounts_receivable      accounts_receivable[]
+  communication_logs       communication_logs[]
+  communications           communications[]
+  motorcycles              motorcycles[]
+  quotes                   quotes[]
+  reminders                reminders[]
+  sales                    sales[]
+  tickets                  tickets[]
+  warranties               warranties[]
+  workshop_visits          workshop_visits[]
+
+  @@index([credit_risk_score])
+  @@index([identificationNumber])
+  @@index([loyaltyTier])
+  @@index([name])
+  @@index([phone])
+  @@index([rfm_segment])
+}
+
+model financial_transactions {
+  id                                                    String            @id
+  cashRegisterId                                        String?
+  type                                                  TransactionType?  @default(EXPENSE)
+  amount                                                Decimal?          @db.Decimal(12, 2)
+  description                                           String?
+  category                                              String?
+  performedByUserId                                     String?
+  timestamp                                             DateTime?         @default(now()) @db.Timestamp(6)
+  referenceId                                           String?
+  referenceType                                         String?
+  status                                                String?           @default("COMPLETED")
+  approvedByUserId                                      String?
+  approvedAt                                            DateTime?         @db.Timestamp(6)
+  rejectedByUserId                                      String?
+  rejectedAt                                            DateTime?         @db.Timestamp(6)
+  rejectionReason                                       String?
+  expenseCategory                                       String?
+  paymentMethod                                         String?
+  referenceNumber                                       String?
+  description_encrypted                                 String?
+  users_financial_transactions_approvedByUserIdTousers  users?            @relation("financial_transactions_approvedByUserIdTousers", fields: [approvedByUserId], references: [id])
+  cash_registers                                        cash_registers?   @relation(fields: [cashRegisterId], references: [id], onDelete: Restrict)
+  users_financial_transactions_performedByUserIdTousers users?            @relation("financial_transactions_performedByUserIdTousers", fields: [performedByUserId], references: [id], onDelete: Restrict)
+  tax_withholdings                                      tax_withholdings?
+
+  @@index([cashRegisterId])
+  @@index([expenseCategory])
+  @@index([timestamp])
+  @@index([type])
+}
+
+model import_history {
+  id                 String    @id
+  user_id            String
+  excel_signature    String
+  total_products     Int
+  success_products   Int
+  failed_products    Int
+  configuration_used Json
+  created_at         DateTime? @default(now()) @db.Timestamp(6)
+
+  @@index([created_at], map: "idx_import_history_created")
+  @@index([user_id], map: "idx_import_history_user")
+}
+
+model import_patterns {
+  id                    String    @id
+  user_id               String
+  excel_signature       String
+  column_mapping        Json
+  brand_category_config Json
+  advanced_config       Json
+  success_count         Int?      @default(1)
+  failure_count         Int?      @default(0)
+  last_used             DateTime? @default(now()) @db.Timestamp(6)
+  created_at            DateTime? @default(now()) @db.Timestamp(6)
+
+  @@index([excel_signature], map: "idx_import_patterns_signature")
+  @@index([user_id, excel_signature], map: "idx_import_patterns_user_signature")
+}
+
+model inventory_movements {
+  id                String    @id
+  productId         String?
+  type              String?   @default("ENTRY")
+  quantity          Int?
+  unitCostAtMoment  Decimal?  @db.Decimal(12, 4)
+  referenceDoc      String?
+  reason            String?
+  performedByUserId String?
+  timestamp         DateTime? @default(now()) @db.Timestamp(6)
+  products          products? @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([productId, timestamp])
+}
+
+model motorcycles {
+  id              String            @id
+  plate           String            @unique
+  brand           String
+  model           String
+  year            Int?
+  lastKm          Int?
+  customerId      String
+  createdAt       DateTime          @default(now())
+  customers       customers         @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  sales           sales[]
+  workshop_visits workshop_visits[]
+
+  @@index([customerId])
+  @@index([plate])
+}
+
+model notifications {
+  id         String    @id
+  user_id    String
+  type       String
+  title      String
+  message    String
+  is_read    Boolean   @default(false)
+  read_at    DateTime?
+  metadata   Json?
+  created_at DateTime  @default(now())
+
+  @@index([user_id, is_read, created_at])
+}
+
+model payment_records {
+  id                  String               @id
+  accountReceivableId String?
+  accountPayableId    String?
+  amount              Decimal              @db.Decimal(12, 2)
+  referenceDoc        String?
+  note                String?
+  performedByUserId   String
+  timestamp           DateTime             @default(now())
+  accounts_payable    accounts_payable?    @relation(fields: [accountPayableId], references: [id])
+  accounts_receivable accounts_receivable? @relation(fields: [accountReceivableId], references: [id])
+  users               users                @relation(fields: [performedByUserId], references: [id])
+
+  @@index([accountPayableId])
+  @@index([accountReceivableId])
+}
+
+model permissions {
+  id               String             @id
+  name             String?            @unique
+  description      String?
+  createdAt        DateTime?          @default(now()) @db.Timestamp(6)
+  updatedAt        DateTime?          @default(now()) @db.Timestamp(6)
+  role_permissions role_permissions[]
+}
+
+model product_audit_logs {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId  String    @db.VarChar(191)
+  fieldName  String    @db.VarChar(100)
+  newValue   String
+  createdAt  DateTime? @default(now()) @db.Timestamptz(6)
+  userId     String?   @db.VarChar(191)
+  userName   String?   @default("Sistema") @db.VarChar(191)
+  userEmail  String?   @default("") @db.VarChar(191)
+  oldValue   String?
+  changeType String?   @default("UPDATE") @db.VarChar(191)
+  reason     String?
+  ipAddress  String?   @db.VarChar(191)
+
+  @@index([createdAt])
+  @@index([productId, createdAt])
+}
+
+model product_audit_logs_test {
+  id         String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  test_field String?
+}
+
+model products {
+  id                   String                 @id
+  skuInternal          String                 @unique
+  barcodeExternal      String?                @unique
+  partNumberOEM        String
+  brandId              String
+  categoryId           String
+  nameCommercial       String
+  descriptionTech      String?
+  compatibleModels     Json                   @default("[]")
+  imageKey             String?
+  locationBin          String
+  costPriceAvg         Decimal                @default(0.00) @db.Decimal(12, 4)
+  salePriceBase        Decimal                @default(0.00) @db.Decimal(12, 2)
+  taxRate              Decimal                @default(19.00) @db.Decimal(5, 2)
+  stockQuantity        Int                    @default(0)
+  minStockLevel        Int                    @default(5)
+  maxStockLevel        Int?
+  warrantyDays         Int                    @default(0)
+  isActive             Boolean                @default(true)
+  createdAt            DateTime               @default(now())
+  updatedAt            DateTime
+  inventory_movements  inventory_movements[]
+  brands               brands                 @relation(fields: [brandId], references: [id])
+  categories           categories             @relation(fields: [categoryId], references: [id])
+  purchase_order_items purchase_order_items[]
+  sale_items           sale_items[]
+
+  @@index([barcodeExternal])
+  @@index([brandId, categoryId])
+  @@index([skuInternal])
+}
+
+model purchase_order_items {
+  id                  String           @id
+  purchaseOrderId     String?
+  productId           String?
+  productNameSnapshot String?
+  skuSnapshot         String?
+  quantityOrdered     Int?
+  quantityReceived    Int?             @default(0)
+  unitCost            Decimal?         @db.Decimal(12, 4)
+  createdAt           DateTime?        @default(now()) @db.Timestamp(6)
+  updatedAt           DateTime?        @default(now()) @db.Timestamp(6)
+  lineTotal           Decimal?         @db.Decimal(12, 2)
+  products            products?        @relation(fields: [productId], references: [id], onDelete: Restrict)
+  purchase_orders     purchase_orders? @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@index([purchaseOrderId])
+}
+
+model purchase_orders {
+  id                   String                 @id
+  orderNumber          String?                @unique
+  supplierId           String?
+  userId               String?
+  status               String?                @default("PENDING")
+  subtotal             Decimal?               @db.Decimal(12, 2)
+  taxAmount            Decimal?               @db.Decimal(12, 2)
+  totalAmount          Decimal?               @db.Decimal(12, 2)
+  expectedDate         DateTime?              @db.Timestamp(6)
+  createdAt            DateTime?              @default(now()) @db.Timestamp(6)
+  updatedAt            DateTime?              @default(now()) @db.Timestamp(6)
+  notes                String?
+  receivedAt           DateTime?              @db.Timestamp(6)
+  cancelledAt          DateTime?              @db.Timestamp(6)
+  cancelledReason      String?
+  shippingCost         Decimal?               @default(0) @db.Decimal(12, 2)
+  discount             Decimal?               @default(0) @db.Decimal(12, 2)
+  paymentTerms         String?
+  deliveryDate         DateTime?              @db.Timestamp(6)
+  receivedDate         DateTime?              @db.Timestamp(6)
+  receivedByUserId     String?
+  discountAmount       Decimal?               @default(0) @db.Decimal(12, 2)
+  approvedByUserId     String?
+  approvedAt           DateTime?              @db.Timestamp(6)
+  cancelledByUserId    String?
+  accounts_payable     accounts_payable?
+  purchase_order_items purchase_order_items[]
+  suppliers            suppliers?             @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+
+  @@index([orderNumber])
+  @@index([status, createdAt])
+  @@index([supplierId])
+}
+
+model quote_deliveries {
+  id           String    @id
+  quote_id     String
+  channel      String
+  status       String    @default("PENDING")
+  link         String?
+  sent_at      DateTime?
+  attempted_by String
+  created_at   DateTime  @default(now())
+  quotes       quotes    @relation(fields: [quote_id], references: [id])
+
+  @@index([quote_id, status])
+}
+
+model quotes {
+  id               String             @id
+  customer_id      String
+  items            Json               @default("[]")
+  subtotal         Decimal            @db.Decimal(12, 2)
+  discount         Decimal            @default(0.00) @db.Decimal(12, 2)
+  total            Decimal            @db.Decimal(12, 2)
+  status           String             @default("DRAFT")
+  expires_at       DateTime?
+  notes            String?
+  created_by_id    String
+  created_at       DateTime           @default(now())
+  updated_at       DateTime
+  quote_deliveries quote_deliveries[]
+  customers        customers          @relation(fields: [customer_id], references: [id])
+
+  @@index([created_at])
+  @@index([customer_id, status])
+}
+
+model refresh_tokens {
+  id         String    @id
+  userId     String?
+  token      String?   @unique
+  expiresAt  DateTime? @db.Timestamp(6)
+  revoked    Boolean?  @default(false)
+  deviceInfo String?
+  ipAddress  String?
+  createdAt  DateTime? @default(now()) @db.Timestamp(6)
+  updatedAt  DateTime? @default(now()) @db.Timestamp(6)
+  users      users?    @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "refresh_tokens_user_id_fkey")
+
+  @@index([expiresAt], map: "refresh_tokens_expiresat_idx")
+  @@index([token])
+  @@index([userId], map: "refresh_tokens_userid_idx")
+}
+
+model reminders {
+  id         String    @id
+  customerId String
+  type       String
+  message    String
+  dueDate    DateTime
+  isSent     Boolean   @default(false)
+  createdAt  DateTime  @default(now())
+  customers  customers @relation(fields: [customerId], references: [id])
+
+  @@index([customerId])
+  @@index([isSent, dueDate])
+}
+
+model role_permissions {
+  roleId       String
+  permissionId String
+  permissions  permissions @relation(fields: [permissionId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  roles        roles       @relation(fields: [roleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@id([roleId, permissionId])
+}
+
+model roles {
+  id               String             @id
+  name             String?            @unique
+  description      String?
+  createdAt        DateTime?          @default(now()) @db.Timestamp(6)
+  updatedAt        DateTime?          @default(now()) @db.Timestamp(6)
+  role_permissions role_permissions[]
+  users            users[]
+}
+
+model sale_items {
+  id                  String   @id
+  saleId              String
+  productId           String
+  productNameSnapshot String
+  skuSnapshot         String
+  quantity            Int
+  unitPrice           Decimal  @db.Decimal(12, 2)
+  discountPerItem     Decimal  @default(0.00) @db.Decimal(12, 2)
+  lineTotal           Decimal  @db.Decimal(12, 2)
+  products            products @relation(fields: [productId], references: [id])
+  sales               sales    @relation(fields: [saleId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@index([saleId])
+}
+
+model sales {
+  id                     String               @id
+  saleNumber             String               @unique
+  customerId             String?
+  userId                 String
+  subtotal               Decimal              @db.Decimal(12, 2)
+  discountAmount         Decimal              @default(0.00) @db.Decimal(12, 2)
+  taxAmount              Decimal              @db.Decimal(12, 2)
+  totalAmount            Decimal              @db.Decimal(12, 2)
+  paymentMethod          PaymentMethod
+  status                 SaleStatus           @default(COMPLETED)
+  notes                  String?
+  motorcycle_id          String?
+  createdAt              DateTime             @default(now())
+  updatedAt              DateTime
+  customerIdentification String?              @db.VarChar(20)
+  cashReceived           Decimal?             @default(0) @db.Decimal(12, 2)
+  changeAmount           Decimal?             @default(0) @db.Decimal(12, 2)
+  customerName           String?              @db.VarChar(255)
+  accounts_receivable    accounts_receivable?
+  sale_items             sale_items[]
+  customers              customers?           @relation(fields: [customerId], references: [id])
+  motorcycles            motorcycles?         @relation(fields: [motorcycle_id], references: [id])
+
+  @@index([customerId])
+  @@index([saleNumber])
+  @@index([status, createdAt])
+  @@index([userId])
+}
+
+model shift {
+  id                     String    @id
+  cashRegisterId         String?
+  openedByUserId         String?
+  closedByUserId         String?
+  openingBalance         Decimal?  @db.Decimal(12, 2)
+  closingBalance         Decimal?  @db.Decimal(12, 2)
+  expectedClosingBalance Decimal?  @db.Decimal(12, 2)
+  difference             Decimal?  @db.Decimal(12, 2)
+  differenceStatus       String?
+  status                 String?   @default("OPEN")
+  openedAt               DateTime? @default(now()) @db.Timestamp(6)
+  closedAt               DateTime? @db.Timestamp(6)
+  notes                  String?
+}
+
+model shift_movements {
+  id          String    @id
+  shiftId     String?
+  type        String?
+  amount      Decimal?  @db.Decimal(12, 2)
+  description String?
+  reference   String?
+  createdAt   DateTime? @default(now()) @db.Timestamp(6)
+}
+
+model suppliers {
+  id                  String             @id
+  name                String?
+  nit                 String?            @unique
+  phone               String?
+  email               String?
+  address             String?
+  contactPerson       String?
+  paymentTerms        String?
+  isActive            Boolean?           @default(true)
+  createdAt           DateTime?          @default(now()) @db.Timestamp(6)
+  updatedAt           DateTime?          @default(now()) @db.Timestamp(6)
+  deactivationReason  String?
+  category            String?
+  rating              Int?               @default(3)
+  website             String?
+  taxRegime           String?
+  bankAccount         String?
+  bankName            String?
+  taxId               String?
+  accountType         String?
+  notes               String?
+  tags                String[]
+  lastOrderDate       DateTime?          @db.Timestamp(6)
+  totalSpent          Decimal?           @default(0) @db.Decimal(12, 2)
+  deactivatedAt       DateTime?          @db.Timestamp(6)
+  deactivatedByUserId String?
+  deactivatedBy       String?
+  accounts_payable    accounts_payable[]
+  purchase_orders     purchase_orders[]
+
+  @@index([name])
+  @@index([nit])
+}
+
+model system_audits {
+  id         String   @id
+  user_id    String?
+  action     String
+  entity     String
+  entity_id  String?
+  ip_address String?
+  user_agent String?
+  metadata   Json?
+  created_at DateTime @default(now())
+
+  @@index([user_id, action, created_at])
+}
+
+model system_backups {
+  id           String    @id
+  type         String    @default("FULL")
+  status       String    @default("PENDING")
+  size         Decimal?
+  checksum     String?
+  storage_url  String?
+  triggered_by String
+  started_at   DateTime?
+  completed_at DateTime?
+  created_at   DateTime  @default(now())
+
+  @@index([status, created_at])
+}
+
+model tax_withholdings {
+  id                     String                 @id
+  transactionId          String                 @unique
+  percentage             Decimal                @db.Decimal(5, 2)
+  baseAmount             Decimal                @db.Decimal(12, 2)
+  withholdingAmount      Decimal                @db.Decimal(12, 2)
+  netAmount              Decimal                @db.Decimal(12, 2)
+  createdAt              DateTime               @default(now())
+  type                   String?
+  financial_transactions financial_transactions @relation(fields: [transactionId], references: [id])
+}
+
+model tickets {
+  id          String    @id
+  customer_id String
+  subject     String
+  description String
+  status      String    @default("OPEN")
+  priority    String    @default("MEDIUM")
+  assigned_to String?
+  resolved_at DateTime?
+  resolved_by String?
+  created_at  DateTime  @default(now())
+  updated_at  DateTime
+  customers   customers @relation(fields: [customer_id], references: [id])
+
+  @@index([assigned_to, status])
+  @@index([customer_id, status])
+}
+
+model users {
+  id                                                                     String                   @id
+  email                                                                  String?                  @unique
+  password                                                               String?
+  name                                                                   String?
+  roleId                                                                 String?
+  isActive                                                               Boolean?                 @default(true)
+  createdAt                                                              DateTime?                @default(now()) @db.Timestamp(6)
+  updatedAt                                                              DateTime?                @default(now()) @db.Timestamp(6)
+  email_encrypted                                                        String?
+  password_encrypted                                                     String?
+  bank_deposits_bank_deposits_approvedByUserIdTousers                    bank_deposits[]          @relation("bank_deposits_approvedByUserIdTousers")
+  bank_deposits_bank_deposits_createdByUserIdTousers                     bank_deposits[]          @relation("bank_deposits_createdByUserIdTousers")
+  bank_transfers                                                         bank_transfers[]
+  budgets                                                                budgets[]
+  cash_counts_cash_counts_approvedByUserIdTousers                        cash_counts[]            @relation("cash_counts_approvedByUserIdTousers")
+  cash_counts_cash_counts_countedByUserIdTousers                         cash_counts[]            @relation("cash_counts_countedByUserIdTousers")
+  cash_registers_cash_registers_closedByUserIdTousers                    cash_registers[]         @relation("cash_registers_closedByUserIdTousers")
+  cash_registers_cash_registers_openedByUserIdTousers                    cash_registers[]         @relation("cash_registers_openedByUserIdTousers")
+  financial_transactions_financial_transactions_approvedByUserIdTousers  financial_transactions[] @relation("financial_transactions_approvedByUserIdTousers")
+  financial_transactions_financial_transactions_performedByUserIdTousers financial_transactions[] @relation("financial_transactions_performedByUserIdTousers")
+  payment_records                                                        payment_records[]
+  refresh_tokens                                                         refresh_tokens[]
+  roles                                                                  roles?                   @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@index([email])
+}
+
+model warranties {
+  id          String    @id
+  customerId  String
+  saleItemId  String
+  productName String
+  days        Int
+  expiresAt   DateTime
+  status      String    @default("ACTIVE")
+  claimNotes  String?
+  createdAt   DateTime  @default(now())
+  customers   customers @relation(fields: [customerId], references: [id])
+
+  @@index([customerId])
+  @@index([status, expiresAt])
+}
+
+model workshop_visits {
+  id                String       @id
+  customer_id       String
+  motorcycle_id     String?
+  km_real           Int?
+  services          String[]     @default([])
+  technician        String?
+  total_cost        Decimal      @db.Decimal(12, 2)
+  status            String       @default("COMPLETED")
+  notes             String?
+  next_service_km   Int?
+  next_service_date DateTime?
+  created_at        DateTime     @default(now())
+  customers         customers    @relation(fields: [customer_id], references: [id])
+  motorcycles       motorcycles? @relation(fields: [motorcycle_id], references: [id])
+
+  @@index([customer_id, created_at])
+  @@index([motorcycle_id])
+}
+
+enum AccountStatus {
+  PENDING
+  PARTIALLY_PAID
+  PAID
+  OVERDUE
+}
+
+enum CashCountType {
+  OPENING
+  CLOSING
+  SURPRISE
+  MIDDAY
+}
+
+enum CashRegisterStatus {
+  OPEN
+  CLOSED
+}
+
+enum DepositStatus {
+  PENDING
+  IN_TRANSIT
+  RECONCILED
+}
+
+enum ExpenseCategory {
+  OPERATIVO
+  FINANCIERO
+  IMPUESTO
+  INVERSION
+  VARIOS
+}
+
+enum MovementType {
+  ENTRY
+  EXIT
+  ADJUSTMENT_POS
+  ADJUSTMENT_NEG
+  MERMA
+  RETURN
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  TRANSFER
+  MIXED
+  CREDIT
+  NEQUI
+  DAVIPLATA
+}
+
+enum PurchaseOrderStatus {
+  PENDING
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+}
+
+enum SaleStatus {
+  COMPLETED
+  CANCELLED
+  REFUNDED
+}
+
+enum TransactionType {
+  INCOME
+  EXPENSE
+  WITHDRAWAL
+  DEPOSIT
+  PAYMENT_RECEIVED
+  PAYMENT_MADE
+}
+
+enum WithholdingType {
+  RETEFUENTE_35
+  RETEFUENTE_10
+  RETEIVA_15
+  RETEICA_01
+}
+

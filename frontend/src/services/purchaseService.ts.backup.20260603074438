@@ -1,0 +1,86 @@
+import api from './api'
+import type { PurchaseOrder, Supplier } from '@/types'
+
+// ✅ ELIMINADO: const API = '/api/v1' (ya está en api.ts baseURL)
+
+export interface GetOrdersParams {
+  page?: number
+  limit?: number
+  status?: string
+  supplierId?: string
+}
+
+export interface PurchaseOrderResponse {
+  success: boolean
+  data: PurchaseOrder[]
+  total: number
+  totalPages: number
+}
+
+export const purchaseService = {
+  async getOrders(params?: GetOrdersParams): Promise<PurchaseOrderResponse> {
+    // ✅ CORREGIDO: Ruta relativa (baseURL ya agrega /api/v1)
+    const res = await api.get(`/purchases/orders`, { params })
+    return {
+      success: res.data.success,
+      data: res.data.data?.data ?? [],
+      total: res.data.data?.total ?? 0,
+      totalPages: res.data.data?.totalPages ?? 1,
+  }
+  },
+
+
+  async getSuppliers(): Promise<Supplier[]> {
+    const res = await api.get(`/purchases/suppliers`)
+    return res.data.data ?? []
+  },
+
+  async createOrder(data: unknown): Promise<PurchaseOrder> {
+    const res = await api.post(`/purchases/orders`, data)
+    return res.data.data
+  },
+
+  async createSupplier(data: unknown): Promise<Supplier> {
+    const res = await api.post(`/purchases/suppliers`, data)
+    return res.data.data
+  },
+
+  async receiveOrder(id: string, items: unknown[]): Promise<PurchaseOrder> {
+    const res = await api.post(`/purchases/orders/${id}/receive`, { items })
+    return res.data.data
+  },
+
+  async cancelOrder(id: string, reason: string): Promise<PurchaseOrder> {
+    const res = await api.post(`/purchases/orders/${id}/cancel`, { reason })
+    return res.data.data
+  },
+
+  async updateOrder(id: string, data: unknown): Promise<PurchaseOrder> {
+    const res = await api.put(`/purchases/orders/${id}`, data)
+    return res.data.data
+  },
+
+    
+  async downloadOrderPDF(id: string): Promise<Blob> {
+    if (!id || id.trim() === '') throw new Error('ID requerido');
+    
+    const res = await api.get(`/purchases/orders/${id}/pdf`, {
+      responseType: 'blob',
+      timeout: 30000
+    });
+    
+    if (!res.data || res.data.size === 0) throw new Error('PDF vacío');
+    return res.data;
+  },
+
+  async deleteSupplier(id: string, reason: string): Promise<void> {
+      await api.delete(`/purchases/suppliers/${id}`, { data: { reason } });
+    },
+
+    async reactivateSupplier(id: string): Promise<void> {
+      await api.patch(`/purchases/suppliers/${id}/reactivate`);
+    },
+
+
+}
+

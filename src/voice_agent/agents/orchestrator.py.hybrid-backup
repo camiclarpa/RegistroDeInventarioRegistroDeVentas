@@ -1,0 +1,179 @@
+"""
+Multi-Agent Orchestrator OPTIMIZADO para SIGC-Motos
+Objetivo: 10 productos en 1 minuto (6 seg/producto)
+"""
+import os
+import re
+from typing import TypedDict, List, Dict, Any
+from groq import Groq
+
+class AgentState(TypedDict):
+    messages: List[str]
+    current_field: str
+    product_data: dict
+    product_queue: List[dict]
+    current_product_index: int
+    response: str
+    phase: str  # 'collecting', 'confirming', 'correcting', 'complete'
+
+class VoiceMultiAgentOrchestrator:
+    """Orquestador ULTRA-RÁPIDO para registro de productos"""
+
+    FIELDS = ['name', 'category', 'brand', 'quantity', 'sale_price']
+    FIELD_NAMES_ES = {
+        'name': 'nombre',
+        'category': 'categoría',
+        'brand': 'marca',
+        'quantity': 'cantidad',
+        'sale_price': 'precio'
+    }
+
+    def __init__(self):
+        self.api_key = os.getenv("GROQ_API_KEY")
+        if not self.api_key:
+            raise ValueError("GROQ_API_KEY no configurada")
+        self.client = Groq(api_key=self.api_key)
+
+    async def process(self, user_message: str, context: dict = None) -> dict:
+        """Procesa mensaje del usuario con lógica ultra-rápida"""
+        ctx = context or {}
+        product_data = ctx.get('product_data', {})
+        product_queue = ctx.get('product_queue', [])
+        current_index = ctx.get('current_product_index', 0)
+        current_field = ctx.get('current_field', 'name')
+        phase = ctx.get('phase', 'collecting')
+
+        # Lógica de estado
+        if phase == 'collecting':
+            return await self._handle_collecting(user_message, product_data, current_field, product_queue, current_index)
+        elif phase == 'confirming':
+            return await self._handle_confirming(user_message, product_data, product_queue, current_index)
+        elif phase == 'correcting':
+            return await self._handle_correcting(user_message, product_data, current_field)
+        
+        return {"response": "Error", "product_data": product_data}
+
+    async def _handle_collecting(self, user_msg: str, product_data: dict, current_field: str, queue: list, idx: int) -> dict:
+        """Fase: Recopilando datos de campos"""
+        # Extraer valor del mensaje
+        value = self._extract_value(user_msg, current_field)
+        product_data[current_field] = value
+
+        # Avanzar al siguiente campo
+        field_idx = self.FIELDS.index(current_field)
+        if field_idx < len(self.FIELDS) - 1:
+            next_field = self.FIELDS[field_idx + 1]
+            response = f"{self.FIELD_NAMES_ES[next_field]}?"
+            return {
+                "response": response,
+                "product_data": product_data,
+                "current_field": next_field,
+                "phase": "collecting"
+            }
+        else:
+            # Todos los campos completados → Confirmación
+            response = self._build_confirmation(product_data)
+            return {
+                "response": response,
+                "product_data": product_data,
+                "phase": "confirming"
+            }
+
+    async def _handle_confirming(self, user_msg: str, product_data: dict, queue: list, idx: int) -> dict:
+        """Fase: Confirmación del producto"""
+        msg_lower = user_msg.lower()
+        
+        if any(word in msg_lower for word in ['sí', 'si', 'correcto', 'bien', 'ok', 'dale']):
+            # Confirmado → Siguiente producto o completar
+            if idx < len(queue) - 1:
+                # Hay más productos
+                next_idx = idx + 1
+                response = f"Producto {next_idx + 1}: {self.FIELD_NAMES_ES['name']}?"
+                return {
+                    "response": response,
+                    "product_data": {},
+                    "current_field": "name",
+                    "current_product_index": next_idx,
+                    "phase": "collecting"
+                }
+            else:
+                # Todos completados
+                return {
+                    "response": "Todos los productos registrados!",
+                    "product_data": product_data,
+                    "phase": "complete"
+                }
+        
+        elif any(word in msg_lower for word in ['no', 'incorrecto', 'mal', 'cambiar']):
+            # No confirmado → Preguntar qué campos corregir
+            return {
+                "response": "¿Qué campo(s)?",
+                "product_data": product_data,
+                "phase": "correcting"
+            }
+        
+        else:
+            # Respuesta no clara
+            return {
+                "response": "¿Sí o no?",
+                "product_data": product_data,
+                "phase": "confirming"
+            }
+
+    async def _handle_correcting(self, user_msg: str, product_data: dict, current_field: str) -> dict:
+        """Fase: Corrigiendo campos específicos"""
+        # Detectar qué campos quiere corregir
+        fields_to_correct = []
+        msg_lower = user_msg.lower()
+        
+        for field, name_es in self.FIELD_NAMES_ES.items():
+            if name_es in msg_lower or field in msg_lower:
+                fields_to_correct.append(field)
+        
+        if fields_to_correct:
+            # Corregir primer campo de la lista
+            field_to_correct = fields_to_correct[0]
+            response = f"{self.FIELD_NAMES_ES[field_to_correct]}?"
+            return {
+                "response": response,
+                "product_data": product_data,
+                "current_field": field_to_correct,
+                "phase": "collecting"
+            }
+        else:
+            # No entendió, volver a preguntar
+            return {
+                "response": "¿Qué campo? Nombre, categoría, marca, cantidad o precio?",
+                "product_data": product_data,
+                "phase": "correcting"
+            }
+
+    def _extract_value(self, text: str, field: str) -> str:
+        """Extrae valor del texto según el campo"""
+        text = text.strip()
+        
+        if field == 'quantity':
+            # Extraer número
+            match = re.search(r'\d+', text)
+            return match.group(0) if match else text
+        
+        elif field == 'sale_price':
+            # Extraer número (puede tener comas, puntos, pesos)
+            text = text.replace('$', '').replace(',', '').replace(' ', '')
+            match = re.search(r'\d+', text)
+            return match.group(0) if match else text
+        
+        else:
+            # Texto libre
+            return text
+
+    def _build_confirmation(self, product_data: dict) -> str:
+        """Construye mensaje de confirmación corto"""
+        name = product_data.get('name', '?')
+        category = product_data.get('category', '?')
+        brand = product_data.get('brand', '?')
+        quantity = product_data.get('quantity', '?')
+        price = product_data.get('sale_price', '?')
+        
+        return f"{name}, {category}, {brand}, {quantity} unidades, ${price}. ¿Correcto?"
+

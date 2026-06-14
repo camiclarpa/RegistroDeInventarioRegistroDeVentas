@@ -1,0 +1,29 @@
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+export type RfmSegment = 'VIP' | 'LOYAL' | 'AT_RISK' | 'DORMANT' | 'CHURNED' | 'NEW' | 'REGULAR';
+
+export async function getSegmentedCustomers(segment: RfmSegment, limit = 200) {
+  return prisma.customers.findMany({ where: { isActive: true, rfmSegment: segment }, take: limit, select: { id: true, name: true, phone: true, email: true, rfm_segment: true, loyaltyTier: true, total_spent: true } });
+}
+
+export async function launchCampaign(data: { segment: RfmSegment; channel: string; message: string; sentByUserId: string; limit?: number; }) {
+  const customers = await getSegmentedCustomers(data.segment, data.limit ?? 200);
+  if (customers.length === 0) return { sent: 0, failed: 0, skipped: 0 };
+  const MAX_PER_BATCH = 50;
+  let sent = 0; let failed = 0;
+  const skipped = customers.filter(c => !c.phone && !c.email).length;
+  for (let i = 0; i < customers.length; i += MAX_PER_BATCH) {
+    const batch = customers.slice(i, i + MAX_PER_BATCH);
+    const comms = batch.filter(c => c.phone || c.email).map(c => ({ customerId: c.id, channel: data.channel, message: data.message, direction: 'OUTBOUND' as const, status: 'SENT' as const, sentByUserId: data.sentByUserId }));
+    try { await prisma.communications.createMany({ data: comms }); sent += comms.length; } catch (err) { logger.error('[campaignService] Error en lote de campaña:', err); failed += comms.length; }
+  }
+  logger.info(`[campaignService] Campaña ${data.segment}/${data.channel}: ${sent} enviados, ${failed} fallidos, ${skipped} sin contacto`);
+  return { sent, failed, skipped };
+}
+
+export async function getCampaignStats(segment?: string) {
+  const where = segment ? { channel: { not: 'IN_PERSON' }, ...(segment && {}) } : {};
+  const stats = await prisma.communications.groupBy({ by: ['channel', 'status'], where, _count: { id: true } });
+  return stats.map(s => ({ channel: s.channel, status: s.status, count: s._count.id }));
+}

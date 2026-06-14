@@ -1,0 +1,87 @@
+import { rateLimit } from 'express-rate-limit';
+import { logger } from '../config/logger';
+
+/**
+ * Rate Limiting para creación de productos
+ * - Máximo 10 productos por segundo por usuario
+ * - Previene abuso y saturación del servidor
+ * - Mensaje claro con tiempo de reintento
+ */
+export const productCreateRateLimit = rateLimit({
+  windowMs: 1 * 1000, // 1 segundo
+  max: 10, // máximo 10 requests por ventana
+  message: { 
+    success: false, 
+    error: 'Demasiadas solicitudes de creación. Intenta en 1 segundo.', 
+    retryAfter: 1 
+  },
+  standardHeaders: true, // Devolver información de rate limit en headers
+  legacyHeaders: false, // Deshabilitar headers legacy (X-RateLimit-*)
+  
+  // Generar clave única por usuario autenticado o por IP
+  keyGenerator: (req) => {
+    const userId = (req.user as any)?.id;
+    return userId ? `user:${userId}` : `ip:${req.ip}`;
+  },
+  
+  // Handler cuando se excede el límite
+  handler: (req, res) => {
+    const userId = (req.user as any)?.id;
+    logger.warn('RATE_LIMIT_EXCEEDED', {
+      endpoint: req.path,
+      method: req.method,
+      user_id: userId,
+      ip: req.ip,
+      timestamp: new Date().toISOString(),
+    });
+    
+    res.status(429).json({
+      success: false,
+      error: 'Demasiadas solicitudes. Por favor espera antes de intentar nuevamente.',
+      retryAfter: 1,
+    });
+  },
+  
+  // No aplicar rate limit a ciertos endpoints si es necesario
+  skip: (req) => {
+    // Permitir bypass para usuarios admin si es necesario en el futuro
+    // return (req.user as any)?.role === 'admin';
+    return false;
+  },
+});
+
+/**
+ * Rate Limiting para importación masiva (más permisivo pero con límites)
+ * - Máximo 1 solicitud de bulk cada 10 segundos
+ * - Previene saturación por importaciones grandes
+ */
+export const bulkImportRateLimit = rateLimit({
+  windowMs: 10 * 1000, // 10 segundos
+  max: 1, // 1 request por ventana
+  message: {
+    success: false,
+    error: 'Importación masiva en progreso. Espera 10 segundos antes de otra importación.',
+    retryAfter: 10,
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const userId = (req.user as any)?.id;
+    return userId ? `user:${userId}` : `ip:${req.ip}`;
+  },
+  handler: (req, res) => {
+    const userId = (req.user as any)?.id;
+    logger.warn('BULK_RATE_LIMIT_EXCEEDED', {
+      endpoint: req.path,
+      user_id: userId,
+      ip: req.ip,
+      timestamp: new Date().toISOString(),
+    });
+    
+    res.status(429).json({
+      success: false,
+      error: 'Importación masiva en progreso. Espera antes de intentar nuevamente.',
+      retryAfter: 10,
+    });
+  },
+});

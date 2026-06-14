@@ -1,0 +1,58 @@
+import { Router } from 'express';
+import { authenticate, authorize } from '../middleware/authMiddleware';
+import * as ctrl from '../controllers/inventoryController';
+import { requireAnyPermission } from '../middleware/rbacMiddleware';
+
+const router = Router();
+
+const canRead = [authenticate, authorize('inventory.read')];
+const canWrite = [authenticate, authorize('inventory.write')];
+
+/**
+ * MARCAS - /api/v1/inventory/brands
+ */
+router.post(  '/brands',     ...canWrite, ctrl.createBrand);
+router.get(   '/brands',     ...canRead,  ctrl.getBrands);
+router.get(   '/brands/:id', ...canRead,  ctrl.getBrandById);
+router.put(   '/brands/:id', ...canWrite, ctrl.updateBrand);
+router.delete('/brands/:id', ...canWrite, ctrl.deleteBrand);
+
+/**
+ * CATEGORÍAS - /api/v1/inventory/categories
+ */
+router.post(  '/categories',       ...canWrite, ctrl.createCategory);
+router.get(   '/categories',       ...canRead,  ctrl.getCategories);
+router.get(   '/categories/stats', ...canRead,  ctrl.getCategoriesStats);
+router.get(   '/categories/:id',   ...canRead,  ctrl.getCategoryById);
+router.put(   '/categories/:id',   ...canWrite, ctrl.updateCategory);
+router.delete('/categories/:id',   ...canWrite, ctrl.deleteCategory);
+
+/**
+ * PRODUCTOS - /api/v1/inventory/products
+ */
+router.post(  '/products',     ...canWrite, ctrl.createProduct);
+router.get(   '/products',     ...canRead,  ctrl.getAllProducts);
+router.get(   '/products/low-stock', ...canRead, ctrl.getLowStockProducts);
+router.get('/products/export', authenticate, authorize('inventory.read'), ctrl.exportProducts);
+router.post('/products/bulk', authenticate, authorize('inventory.write'), ctrl.bulkImportProducts);
+router.get(   '/products/:id', ...canRead,  ctrl.getProductById);
+router.put(   '/products/:id', ...canWrite, ctrl.updateProduct);
+router.delete('/products/:id', ...canWrite, ctrl.deleteProduct);
+router.patch('/products/:id/stock',        ...canWrite, ctrl.adjustStock);
+router.post( '/products/:id/adjust-stock', ...canWrite, ctrl.adjustStockPost);
+router.get(  '/products/:id/movements',    ...canRead,  ctrl.getProductMovements);
+
+/**
+ * ESTADÍSTICAS Y AUDITORÍA
+ */
+router.get('/stats', ...canRead, ctrl.getInventoryStats);
+router.get('/audit/users', ...canRead, ctrl.getAuditUsers);
+router.get('/audit/logs', ...canRead, ctrl.getInventoryAuditLogs);
+
+// Export/Import endpoints
+// Export/Import endpoints
+router.get('/audit/:productId', authenticate, authorize('inventory.read'), ctrl.getProductMovements);
+
+// Generador automático de SKU y Código de Barras
+router.post('/generate-product-code', authenticate, authorize('inventory.write'), ctrl.generateProductCode);
+export default router;

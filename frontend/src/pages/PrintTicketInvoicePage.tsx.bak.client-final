@@ -1,0 +1,181 @@
+import { useEffect, useState } from 'react'
+import { useParams, useNavigate } from 'react-router-dom'
+import { Printer, ArrowLeft } from 'lucide-react'
+import { QRCodeSVG } from 'qrcode.react'
+import { invoiceService } from '@/services/invoiceService'
+import { formatCOP } from '@/utils/formatters'
+import '@/styles/print-ticket.css'
+
+export default function PrintTicketInvoicePage() {
+  const { invoiceId } = useParams<{ invoiceId: string }>()
+  const navigate = useNavigate()
+  const [ticketData, setTicketData] = useState<any>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    if (!invoiceId) { setError('No invoice ID'); setLoading(false); return }
+    
+    invoiceService.getInvoice(invoiceId)
+      .then((response: any) => {
+        // ✅ CORRECCIÓN: El backend devuelve { success: true, data: { ... } }
+        const data = response?.data ?? response
+        console.log("📦 [DEBUG] Datos procesados:", JSON.stringify(data, null, 2))
+        setTicketData(data)
+      })
+      .catch((err: any) => {
+        console.error("❌ Error:", err)
+        setError(err.message || 'Error cargando factura')
+      })
+      .finally(() => setLoading(false))
+  }, [invoiceId])
+
+  if (loading) return <div className="p-4 text-center">Cargando ticket...</div>
+  
+  if (error || !ticketData) {
+    return (
+      <div className="p-4 text-center">
+        <p className="text-red-500 mb-4">{error || 'Factura no encontrada'}</p>
+        <button onClick={() => navigate(-1)} className="btn-outline">Volver</button>
+      </div>
+    )
+  }
+
+  // ✅ MAPEO EXACTO DE LA ESTRUCTURA DEL BACKEND
+  const invoice = ticketData.invoice ?? {}
+  const customer = ticketData.customer ?? {}
+  const items = ticketData.items ?? []
+  const totals = ticketData.totals ?? {}
+  const header = ticketData.header ?? {}
+  const footer = ticketData.footer ?? {}
+
+  // Fechas
+  const rawDate = invoice.date ?? invoice.issuedAt ?? invoice.createdAt ?? new Date().toISOString()
+  const d = new Date(rawDate)
+  const invDate = isNaN(d.getTime()) ? 'Fecha inválida' : d.toLocaleDateString('es-CO')
+  const invTime = isNaN(d.getTime()) ? '--:--' : d.toLocaleTimeString('es-CO', {hour:'2-digit',minute:'2-digit'})
+
+  // Totales con fallbacks múltiples
+  const total = Number(totals.total ?? totals.grandTotal ?? invoice.totalAmount ?? invoice.total ?? 0)
+  const taxAmount = Number(totals.taxAmount ?? totals.iva ?? invoice.taxAmount ?? invoice.taxTotal ?? 0)
+  const discountAmt = Number(totals.discount ?? totals.discountTotal ?? invoice.discountAmount ?? 0)
+  const taxBase = Number(totals.taxableBase ?? totals.base ?? (taxAmount > 0 ? total - taxAmount : 0))
+
+  return (
+    <div className="ticket-wrapper">
+      <div className="ticket-actions no-print flex gap-2">
+        <button className="btn-outline flex items-center gap-2" onClick={() => navigate(-1)}>
+          <ArrowLeft className="w-4 h-4"/> Volver
+        </button>
+        <button className="btn-primary flex items-center gap-2" onClick={() => window.print()}>
+          <Printer className="w-4 h-4"/> Imprimir Ticket
+        </button>
+      </div>
+
+      <div className="ticket-preview">
+        {/* ENCABEZADO */}
+        <div className="ticket-header">
+          <p className="ticket-logo-text">{header.company?.substring(0, 20) ?? "CLAVIJOS MOTOS"}</p>
+          <p className="ticket-company-name">{header.company ?? 'TALLER Y REPUESTOS CLAVIJOS MOTOS'}</p>
+          <p className="ticket-company-sub">NIT: {header.nit ?? 'N/A'}</p>
+          <p className="ticket-company-sub">{header.address ?? 'Dirección no configurada'}</p>
+          <p className="ticket-company-sub">Tel: {header.phone ?? 'Sin teléfono'}</p>
+        </div>
+
+        {/* TIPO DE DOCUMENTO */}
+        <div className="ticket-doc-type">
+          <p>— DOCUMENTO EQUIVALENTE —</p>
+          <p>TICKET DE FACTURA</p>
+        </div>
+
+        {/* DATOS DE LA FACTURA */}
+        <div className="ticket-meta">
+          <table>
+            <tbody>
+              <tr><td>Fecha:</td><td>{invDate}</td></tr>
+              <tr><td>Hora:</td><td>{invTime}</td></tr>
+              <tr><td>No. Factura:</td><td><strong>{invoice.number ?? invoice.invoiceNumber ?? 'N/A'}</strong></td></tr>
+              <tr><td>Cliente:</td><td>{customer.name?.toUpperCase() ?? customer.nombre ?? 'CONSUMIDOR FINAL'}</td></tr>
+              {(customer.identification ?? customer.documentNumber ?? customer.nit) && (
+                <tr><td>C.C./NIT:</td><td>{customer.identification ?? customer.documentNumber ?? customer.nit}</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {/* TABLA DE ÍTEMS */}
+        <div className="ticket-items">
+          <table>
+            <thead>
+              <tr>
+                <th className="col-qty">CNT</th>
+                <th className="col-desc">DESCRIPCIÓN</th>
+                <th className="col-total">TOTAL</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.length > 0 ? items.map((item:any, i:number) => {
+                const lineTotal = Number(item.lineTotal ?? item.total ?? item.subtotal ?? 0)
+                const unitPrice = Number(item.unitPrice ?? item.price ?? 0)
+                const qty = Number(item.qty ?? item.quantity ?? 1)
+                const name = item.name ?? item.productNameSnapshot ?? item.product?.name ?? 'Producto'
+                const sku = item.sku ?? item.code ?? ''
+                
+                return (
+                  <tr key={i} className="ticket-item-row">
+                    <td className="col-qty">{qty}</td>
+                    <td className="col-desc">
+                      <div className="item-name-line">{sku ? `[${sku}] ` : ''}{name.length > 25 ? name.slice(0,25)+'…' : name}</div>
+                      <div className="item-unit-line">V.Unit: {formatCOP(unitPrice)}</div>
+                    </td>
+                    <td className="col-total">{formatCOP(lineTotal)}</td>
+                  </tr>
+                )
+              }) : <tr><td colSpan={3} className="text-center text-xs text-gray-400 py-2">Sin productos</td></tr>}
+            </tbody>
+          </table>
+        </div>
+
+        {/* TOTALES */}
+        <div className="ticket-totals">
+          <table>
+            <tbody>
+              {discountAmt > 0 && <tr><td>Descuento:</td><td>-{formatCOP(discountAmt)}</td></tr>}
+              <tr><td>Base Gravable:</td><td>{formatCOP(taxBase)}</td></tr>
+              <tr><td>IVA:</td><td>{formatCOP(taxAmount)}</td></tr>
+              <tr className="ticket-total-row"><td>TOTAL:</td><td>{formatCOP(total)}</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        {/* FORMA DE PAGO */}
+        {invoice.paymentMethod && (
+          <div className="ticket-payment-block">
+            <p className="ticket-payment-label">FORMA DE PAGO</p>
+            <table className="ticket-payment-table">
+              <tbody>
+                <tr>
+                  <td>{invoice.paymentMethod === 'CARD' ? 'TARJETA' : invoice.paymentMethod === 'CASH' ? 'EFECTIVO' : invoice.paymentMethod}</td>
+                  <td>{formatCOP(total)}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* QR */}
+        <div className="ticket-qr">
+          <QRCodeSVG value={`${window.location.origin}/print-ticket-invoice/${invoiceId}`} size={72} />
+          <p style={{fontSize:'8px',marginTop:'3px',color:'#888'}}>Escanea para verificar</p>
+        </div>
+
+        {/* PIE */}
+        <div className="ticket-footer">
+          <p>SIGC-Motos v2.0 | Powered by Quanta Cloud</p>
+          <p style={{marginTop:'4px'}}>{footer.message ?? '¡Gracias por su compra!'}</p>
+          <p style={{marginTop:'6px',fontSize:'8px'}}>No es factura electrónica DIAN</p>
+        </div>
+      </div>
+    </div>
+  )
+}

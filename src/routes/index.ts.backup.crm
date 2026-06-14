@@ -1,0 +1,95 @@
+import { Router } from 'express';
+import adminRoutes from './adminRoutes';
+import inventoryRoutes     from './inventoryRoutes';
+import posRoutes           from './posRoutes';
+import salesRoutes         from './salesRoutes';
+import customerRoutes      from './customerRoutes';
+import purchaseRoutes      from './purchaseRoutes';
+import purchaseOrderRoutes from './purchaseOrderRoutes';
+import supplierRoutes      from './supplierRoutes';
+import reportRoutes        from './reportRoutes';
+import authRoutes          from './authRoutes';
+import userRoutes          from './userRoutes';
+import financeRoutes       from './financeRoutes';
+import invoiceRoutes       from './invoiceRoutes';
+import treasuryRoutes      from './treasuryRoutes';
+import securityRoutes      from './securityRoutes';
+// ── Rutas adicionales (solo las que existen) ─────────────────────────────
+import debtRoutes          from './debtRoutes';
+import abcRoutes           from './abcRoutes';
+import posSearchRoutes     from './posSearchRoutes';
+import configRoutes        from './configRoutes';
+import crmRoutes           from './crmRoutes';
+import crmExtendedRoutes   from './crmExtendedRoutes';
+import { authenticate }    from '../middleware/authMiddleware';
+
+const router = Router();
+
+// Módulo 5 — Auth (público)
+router.use('/auth', authRoutes);
+
+// Módulo 5 — Usuarios (protegido)
+router.use('/users', authenticate, userRoutes);
+
+// Módulo 1 — Inventario (rutas canónicas)
+router.use('/inventory', inventoryRoutes);
+
+// Módulo 1 — Ruta legacy para compatibilidad
+// Legacy alias: /products → inventoryRoutes (para compatibilidad con frontend)
+router.use('/products', inventoryRoutes);
+
+// Módulo 2 — POS
+router.use('/pos', posRoutes);
+router.use('/pos', posSearchRoutes);
+
+// Módulo 2 — Ventas y clientes (legacy)
+router.use('/sales', salesRoutes);
+router.use('/customers', customerRoutes);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MÓDULO 3 — COMPRAS Y PROVEEDORES (ORDEN CRÍTICO)
+// ═══════════════════════════════════════════════════════════════════════════
+// Específicas PRIMERO (evitan que /:id genérico capture /entries o /orders)
+
+// Proveedores
+router.use('/purchases/suppliers', authenticate, supplierRoutes);
+
+// Órdenes de compra
+router.use('/purchases/orders', authenticate, purchaseOrderRoutes);
+
+// Entradas de mercancía
+router.use('/purchases/entries', authenticate, purchaseRoutes);
+
+// Fallback genérico (AL FINAL)
+router.use('/purchases', authenticate, purchaseRoutes);
+router.use('/suppliers', authenticate, supplierRoutes);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OTROS MÓDULOS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Reportes
+router.use('/reports', reportRoutes);
+router.use('/reports', abcRoutes);
+
+// Facturación
+router.use('/invoices', invoiceRoutes);
+
+// Finanzas y Tesorería
+router.use('/finance', authenticate, financeRoutes);
+router.use('/treasury', authenticate, treasuryRoutes);
+router.use('/treasury/debts', authenticate, debtRoutes);
+
+// Seguridad
+router.use('/security', authenticate, securityRoutes);
+
+// CRM
+router.use('/crm', crmRoutes);
+router.use('/crm/extended', crmExtendedRoutes);
+
+// Configuración
+router.use('/config', authenticate, configRoutes);
+
+router.use('/admin', authenticate, adminRoutes);
+// ─── Aliases para compatibilidad con Frontend (Plurales/Singulares) ─────
+export default router;

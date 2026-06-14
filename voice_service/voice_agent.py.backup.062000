@@ -1,0 +1,460 @@
+"""
+Voice Agent - Multi-agent orchestration for purchases
+Conversación fluida con campos en tiempo real y corrección
+100% GRATIS: Groq API + Piper TTS
+"""
+import os
+import re
+import asyncio
+import tempfile
+import subprocess
+from typing import Dict, Optional, List, Any
+from groq import Groq
+from fastapi import WebSocket
+
+
+class VoiceAgent:
+    def __init__(self):
+        self.api_key = os.getenv("GROQ_API_KEY")
+        if not self.api_key or self.api_key == "your_groq_api_key_here":
+            print("⚠️  GROQ_API_KEY no configurada")
+            self.client = None
+        else:
+            self.client = Groq(api_key=self.api_key)
+            print("✅ GROQ API configurada")
+
+        self.piper_model = "/app/models/es_ES-sharvard-medium.onnx"
+        self.sessions: Dict[str, Dict] = {}
+        
+        # Latency budget (objetivo: <7s total)
+        self.latency_budget = {
+            "stt_max_ms": 2000,
+            "llm_max_ms": 3000,
+            "tts_max_ms": 2000,
+            "total_max_ms": 7000
+        }
+
+    def get_agents_list(self) -> List[str]:
+        return [
+            "greeting_agent",
+            "product_info_agent",
+            "category_agent",
+            "brand_agent",
+            "price_agent",
+            "quantity_agent",
+            "confirmation_agent",
+        ]
+
+    async def handle_session(self, websocket: WebSocket):
+        """Maneja una sesión de voz completa con conversación fluida"""
+        await websocket.accept()
+        session_id = str(id(websocket))
+
+        self.sessions[session_id] = {
+            "customer_name": None,
+            "product_data": {
+                "name": None,
+                "category": None,
+                "brand": None,
+                "sale_price": None,
+                "quantity": 1,
+            },
+            "current_field": "greeting",
+            "conversation_history": [],
+            "state": "collecting",  # collecting, confirming, complete
+        }
+
+        try:
+            # Saludo inicial natural
+            greeting = (
+                "¡Hola! Bienvenido a Clavijos Motos. "
+                "Soy tu asistente virtual. "
+                "¿Cómo te llamas?"
+            )
+            await self._send_audio_response(websocket, greeting)
+            await self._send_field_updates(websocket, session_id)
+
+            while True:
+                try:
+                    audio_chunk = await websocket.receive_bytes()
+                    await self._process_audio(audio_chunk, session_id, websocket)
+
+                    if self.sessions[session_id]["state"] == "complete":
+                        break
+
+                except WebSocketDisconnect:
+                    break
+                except Exception as e:
+                    print(f"Error processing audio: {e}")
+                    await self._send_audio_response(
+                        websocket,
+                        "Disculpa, no entendí bien. ¿Puedes repetir por favor?"
+                    )
+
+        finally:
+            self.sessions.pop(session_id, None)
+
+    async def _process_audio(self, audio_data: bytes, session_id: str, websocket: WebSocket):
+        """Procesa audio del usuario con normalización y detección de intención"""
+        if not self.client:
+            return
+
+        # 1. STT con timeout estricto
+        user_text = await self._stt_transcribe(audio_data)
+        if not user_text or len(user_text.strip()) < 2:
+            return
+
+        # 2. Normalización post-STT (números, precios)
+        user_text = self._normalize_transcription(user_text)
+        print(f"🎤 Cliente: {user_text}")
+
+        session = self.sessions[session_id]
+        session["conversation_history"].append({
+            "role": "user",
+            "content": user_text
+        })
+
+        # 3. Detectar intención del usuario
+        intent = await self._detect_intent(user_text, session)
+        print(f"🎯 Intención detectada: {intent}")
+
+        # 4. Procesar según intención
+        if intent["type"] == "correction":
+            await self._handle_correction(user_text, intent, session, websocket)
+        elif intent["type"] == "confirmation_yes":
+            await self._handle_confirmation_yes(session, websocket)
+        elif intent["type"] == "confirmation_no":
+            await self._handle_confirmation_no(session, websocket)
+        elif intent["type"] == "answer":
+            await self._handle_answer(user_text, session, websocket)
+
+        # 5. Enviar actualizaciones de campos al frontend
+        await self._send_field_updates(websocket, session_id)
+
+        session["conversation_history"].append({
+            "role": "assistant",
+            "content": session.get("last_response", "")
+        })
+
+    def _normalize_transcription(self, text: str) -> str:
+        """Normaliza texto transcrito para mejor comprensión del LLM"""
+        # Normalizar números en español
+        number_map = {
+            "cero": "0", "uno": "1", "dos": "2", "tres": "3", "cuatro": "4",
+            "cinco": "5", "seis": "6", "siete": "7", "ocho": "8", "nueve": "9",
+            "diez": "10", "veinte": "20", "treinta": "30", "cuarenta": "40",
+            "cincuenta": "50", "sesenta": "60", "setenta": "70", "ochenta": "80",
+            "noventa": "90", "cien": "100", "mil": "1000"
+        }
+        
+        for word, number in number_map.items():
+            text = re.sub(rf'\b{word}\b', number, text, flags=re.IGNORECASE)
+        
+        # Normalizar precios ("25 mil" -> "25000")
+        text = re.sub(r'(\d+)\s*mil', lambda m: str(int(m.group(1)) * 1000), text)
+        
+        # Eliminar muletillas
+        text = re.sub(r'\b(este|eh|o sea|mmm|um)\b', '', text, flags=re.IGNORECASE)
+        
+        return text.strip()
+
+    async def _detect_intent(self, user_text: str, session: Dict) -> Dict:
+        """Detecta la intención del usuario usando LLM"""
+        state = session["state"]
+        
+        # Si está en estado de confirmación
+        if state == "confirming":
+            prompt = f"""
+El usuario está en confirmación final de un producto.
+Los campos actuales son:
+- Nombre: {session['product_data']['name']}
+- Categoría: {session['product_data']['category']}
+- Marca: {session['product_data']['brand']}
+- Precio: {session['product_data']['sale_price']}
+- Cantidad: {session['product_data']['quantity']}
+
+El usuario dice: "{user_text}"
+
+Clasifica la intención en UNA de estas categorías:
+- confirmation_yes: si dice sí, correcto, está bien, perfecto, guardar, etc.
+- confirmation_no: si dice no, incorrecto, está mal, cambiar, etc.
+- correction: si quiere corregir un campo específico (ej: "corrige el precio", "cambia la marca")
+
+Si es correction, indica también qué campo quiere corregir: name, category, brand, sale_price, quantity
+
+Responde SOLO en formato JSON:
+{{"type": "confirmation_yes" | "confirmation_no" | "correction", "field": "name|category|brand|sale_price|quantity|null"}}
+"""
+        else:
+            prompt = f"""
+El usuario está registrando un producto. Campo actual: {session['current_field']}
+El usuario dice: "{user_text}"
+
+Clasifica la intención:
+- answer: si está respondiendo al campo actual
+- correction: si quiere corregir un campo anterior (ej: "oye está mal el nombre", "cambia la categoría")
+
+Si es correction, indica qué campo: name, category, brand, sale_price, quantity
+
+Responde SOLO en formato JSON:
+{{"type": "answer" | "correction", "field": "name|category|brand|sale_price|quantity|null"}}
+"""
+
+        try:
+            completion = self.client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=100,
+                temperature=0.1,
+                timeout=3
+            )
+            
+            response_text = completion.choices[0].message.content.strip()
+            json_match = re.search(r'\{[^}]+\}', response_text)
+            if json_match:
+                import json
+                return json.loads(json_match.group())
+            
+            return {"type": "answer", "field": None}
+        except Exception as e:
+            print(f"Error detectando intención: {e}")
+            return {"type": "answer", "field": None}
+
+    async def _handle_correction(self, user_text: str, intent: Dict, session: Dict, websocket: WebSocket):
+        """Maneja corrección de un campo"""
+        field = intent.get("field")
+        if not field or field not in session["product_data"]:
+            await self._send_audio_response(
+                websocket,
+                "¿Qué campo quieres corregir? Puede ser nombre, categoría, marca, precio o cantidad."
+            )
+            return
+
+        session["current_field"] = field
+        session["state"] = "collecting"
+        
+        field_names = {
+            "name": "nombre",
+            "category": "categoría",
+            "brand": "marca",
+            "sale_price": "precio",
+            "quantity": "cantidad"
+        }
+        
+        response = f"Entendido, vamos a corregir el {field_names[field]}. ¿Cuál es el nuevo valor?"
+        session["last_response"] = response
+        await self._send_audio_response(websocket, response)
+
+    async def _handle_confirmation_yes(self, session: Dict, websocket: WebSocket):
+        """Maneja confirmación positiva"""
+        session["state"] = "complete"
+        response = (
+            "¡Perfecto! Producto registrado exitosamente. "
+            "¿Deseas registrar otro producto?"
+        )
+        session["last_response"] = response
+        await self._send_audio_response(websocket, response)
+        
+        await websocket.send_json({
+            "type": "product_complete",
+            "data": session["product_data"]
+        })
+
+    async def _handle_confirmation_no(self, session: Dict, websocket: WebSocket):
+        """Maneja confirmación negativa"""
+        session["state"] = "collecting"
+        response = (
+            "Entendido. ¿Qué campo quieres corregir? "
+            "Puede ser nombre, categoría, marca, precio o cantidad."
+        )
+        session["last_response"] = response
+        await self._send_audio_response(websocket, response)
+
+    async def _handle_answer(self, user_text: str, session: Dict, websocket: WebSocket):
+        """Maneja respuesta normal al campo actual"""
+        current_field = session["current_field"]
+        
+        value = await self._extract_field_value(user_text, current_field, session)
+        
+        if value:
+            if current_field == "greeting":
+                session["customer_name"] = value
+                session["current_field"] = "name"
+                response = f"Mucho gusto {value}. ¿Cuál es el nombre del producto que deseas registrar?"
+            else:
+                session["product_data"][current_field] = value
+                
+                field_order = ["name", "category", "brand", "sale_price", "quantity"]
+                current_idx = field_order.index(current_field)
+                
+                if current_idx < len(field_order) - 1:
+                    next_field = field_order[current_idx + 1]
+                    session["current_field"] = next_field
+                    response = self._get_next_question(next_field, value)
+                else:
+                    session["state"] = "confirming"
+                    response = await self._build_confirmation_message(session)
+            
+            session["last_response"] = response
+            await self._send_audio_response(websocket, response)
+
+    async def _extract_field_value(self, user_text: str, field: str, session: Dict) -> Optional[str]:
+        """Extrae el valor de un campo usando LLM"""
+        if field == "greeting":
+            prompt = f"""
+El usuario está saludando y dice su nombre: "{user_text}"
+Extrae SOLO el nombre de la persona.
+Responde SOLO con el nombre, nada más.
+"""
+        else:
+            prompt = f"""
+El usuario está registrando un producto.
+Campo actual: {field}
+El usuario dice: "{user_text}"
+
+Extrae SOLO el valor para el campo '{field}':
+- name: nombre completo del producto
+- category: categoría (aceites, frenos, cadenas, llantas, filtros, baterías, etc.)
+- brand: marca (Bajaj, Yamaha, Honda, Suzuki, AKT, Motul, etc.)
+- sale_price: SOLO el número en pesos (ej: 25000)
+- quantity: SOLO el número entero (ej: 1, 5, 10)
+
+Responde SOLO con el valor extraído, nada más.
+"""
+
+        try:
+            completion = self.client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=50,
+                temperature=0.3,
+                timeout=2
+            )
+            
+            value = completion.choices[0].message.content.strip()
+            
+            if field == "sale_price" or field == "quantity":
+                numbers = re.findall(r'\d+', value)
+                if numbers:
+                    return numbers[0]
+                return None
+            
+            return value if value else None
+        except Exception as e:
+            print(f"Error extrayendo valor: {e}")
+            return None
+
+    def _get_next_question(self, next_field: str, previous_value: str) -> str:
+        """Genera la siguiente pregunta con prompts optimizados para voz"""
+        questions = {
+            "name": f"Perfecto, {previous_value}. ¿Cuál es el nombre del producto?",
+            "category": f"Excelente. ¿A qué categoría pertenece? Por ejemplo: aceites, frenos, cadenas, llantas, filtros, baterías.",
+            "brand": f"Muy bien. ¿Qué marca es? Por ejemplo: Bajaj, Yamaha, Honda, Suzuki, AKT, Motul, o genérico.",
+            "sale_price": f"Perfecto. ¿Cuál es el precio de venta en pesos colombianos?",
+            "quantity": f"Entendido. ¿Cuántas unidades estás registrando?"
+        }
+        return questions.get(next_field, "Continuemos.")
+
+    async def _build_confirmation_message(self, session: Dict) -> str:
+        """Construye mensaje de confirmación"""
+        data = session["product_data"]
+        return (
+            f"Perfecto, déjame confirmar los datos del producto. "
+            f"Nombre: {data['name']}. "
+            f"Categoría: {data['category']}. "
+            f"Marca: {data['brand']}. "
+            f"Precio de venta: {data['sale_price']} pesos. "
+            f"Cantidad: {data['quantity']}. "
+            f"¿Están correctos todos los valores? Responde sí o no."
+        )
+
+    async def _send_field_updates(self, websocket: WebSocket, session_id: str):
+        """Envía actualizaciones de campos al frontend en tiempo real"""
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+
+        await websocket.send_json({
+            "type": "field_update",
+            "data": {
+                "customer_name": session.get("customer_name"),
+                "product_data": session["product_data"],
+                "current_field": session["current_field"],
+                "state": session["state"]
+            }
+        })
+
+    async def _stt_transcribe(self, audio_data: bytes) -> str:
+        """Transcribe audio usando Groq Whisper con timeout estricto"""
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(audio_data)
+            temp_path = f.name
+
+        try:
+            with open(temp_path, "rb") as audio_file:
+                transcription = self.client.audio.transcriptions.create(
+                    file=audio_file,
+                    model="whisper-large-v3-turbo",
+                    language="es",
+                    response_format="text",
+                    timeout=2
+                )
+            return transcription.strip()
+        except Exception as e:
+            print(f"STT error: {e}")
+            return ""
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    async def _send_audio_response(self, websocket: WebSocket, text: str):
+        """Sintetiza texto y envía audio con fallback"""
+        try:
+            audio = await self.tts_synthesize(text)
+            if audio:
+                await websocket.send_bytes(audio)
+            else:
+                await websocket.send_json({"type": "text", "content": text})
+        except Exception as e:
+            print(f"TTS error: {e}")
+            await websocket.send_json({"type": "text", "content": text})
+
+    async def tts_synthesize(self, text: str) -> bytes:
+        """Sintetiza texto usando Piper TTS con timeout"""
+        if not os.path.exists(self.piper_model):
+            print(f"⚠️  Modelo Piper no encontrado en {self.piper_model}")
+            return b""
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            output_path = f.name
+
+        try:
+            cmd = [
+                "/usr/local/bin/piper",
+                "-m", self.piper_model,
+                "-f", output_path
+            ]
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            stdout, stderr = process.communicate(input=text.encode("utf-8"), timeout=2)
+
+            if process.returncode != 0:
+                print(f"Piper error: {stderr.decode()}")
+                return b""
+
+            with open(output_path, "rb") as f:
+                audio = f.read()
+            return audio
+        except subprocess.TimeoutExpired:
+            print("TTS timeout")
+            return b""
+        except Exception as e:
+            print(f"TTS error: {e}")
+            return b""
+        finally:
+            if os.path.exists(output_path):
+                os.unlink(output_path)

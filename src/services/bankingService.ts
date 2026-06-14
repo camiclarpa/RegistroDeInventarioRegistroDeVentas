@@ -1,0 +1,267 @@
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+export interface CreateDepositInput {
+  cashRegisterId?: string;
+  amount: number;
+  bankName: string;
+  accountNumber?: string;
+  reference?: string;
+  depositDate: Date;
+  notes?: string;
+}
+
+export interface CreateTransferInput {
+  fromAccount: string;
+  toAccount: string;
+  amount: number;
+  reference?: string;
+  description: string;
+}
+
+export interface InTransitItem {
+  saleId: string;
+  saleNumber: string;
+  amount: number;
+  commission: number;
+  netAmount: number;
+  paymentMethod: string;
+  saleDate: Date;
+  estimatedSettlementDate: Date;
+}
+
+export interface DailyLiquidityResult {
+  cashOnHand: number;
+  inTransitCard: number;
+  inTransitTransfer: number;
+  depositsToday: number;
+  totalCommissions: number;
+  availableToday: number;
+  expectedTotal: number;
+  breakdown: {
+    paymentMethod: string;
+    grossAmount: number;
+    commission: number;
+    netAmount: number;
+    available: boolean;
+  }[];
+}
+
+const COMMISSION_RATES: Record<string, number> = {
+  'CARD': 0.035,
+  'TRANSFER': 0,
+  'NEQUI': 0,
+  'DAVIPLATA': 0,
+  'CASH': 0,
+  'MIXED': 0.015,
+};
+
+const SETTLEMENT_DAYS: Record<string, number> = {
+  'CARD': 2,
+  'TRANSFER': 0,
+  'NEQUI': 0,
+  'DAVIPLATA': 0,
+  'CASH': 0,
+  'MIXED': 1,
+};
+
+export function getSettlementDays(method: string): number {
+  return SETTLEMENT_DAYS[method] ?? 0;
+}
+
+export function isImmediatePayment(method: string): boolean {
+  return getSettlementDays(method) === 0;
+}
+
+export function calculateCommission(amount: number, method: string): number {
+  const rate = COMMISSION_RATES[method] ?? 0;
+  return amount * rate;
+}
+
+function toNum(v: unknown): number {
+  return parseFloat(String(v ?? 0)) || 0;
+}
+
+function buildDayRange(dateStr: string) {
+  const d = new Date(dateStr);
+  return {
+    gte: new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0),
+    lte: new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999),
+  };
+}
+
+export async function createDeposit(userId: string, input: CreateDepositInput): Promise<object> {
+  const deposit = await prisma.bank_deposits.create({
+    data: {
+      cashRegisterId: input.cashRegisterId,
+      amount: input.amount,
+      bankName: input.bankName,
+      accountNumber: input.accountNumber,
+      reference: input.reference,
+      depositDate: input.depositDate,
+      notes: input.notes,
+      status: 'PENDING',
+      performedByUserId: userId,
+    } as any,
+  });
+  logger.info(`[bankingService] Depósito creado: $${input.amount} → ${input.bankName} | usuario ${userId}`);
+  return deposit;
+}
+
+export async function updateDepositStatus(depositId: string, status: string, userId: string): Promise<object> {
+  const data: any = { status };
+  if (status === 'IN_TRANSIT') {
+    data.approvedByUserId = userId;
+  }
+  if (status === 'RECONCILED') {
+    data.reconciledAt = new Date();
+    data.approvedByUserId = userId;
+  }
+  const updated = await prisma.bank_deposits.update({
+    where: { id: depositId },
+    data,
+  });
+  logger.info(`[bankingService] Depósito ${depositId} → ${status} | usuario ${userId}`);
+  return updated;
+}
+
+export async function getDeposits(date?: string): Promise<object[]> {
+  const range = date ? buildDayRange(date) : undefined;
+  return prisma.bank_deposits.findMany({
+    where: range ? { depositDate: range } : undefined,
+    orderBy: { depositDate: 'desc' },
+  });
+}
+
+export async function createBankTransfer(userId: string, input: CreateTransferInput): Promise<object> {
+  const transfer = await prisma.bank_transfers.create({
+    data: {
+      fromAccount: input.fromAccount,
+      toAccount: input.toAccount,
+      amount: input.amount,
+      reference: input.reference,
+      description: input.description,
+      performedByUserId: userId,
+    } as any,
+  });
+  logger.info(`[bankingService] Transferencia: ${input.fromAccount} → ${input.toAccount} $${input.amount}`);
+  return transfer;
+}
+
+export async function getBankTransfers(date?: string): Promise<object[]> {
+  const range = date ? buildDayRange(date) : undefined;
+  return prisma.bank_transfers.findMany({
+    where: range ? { transferDate: range } : undefined,
+    orderBy: { transferDate: 'desc' },
+  });
+}
+
+export async function getInTransitMoney(date?: string): Promise<{ items: InTransitItem[]; totalGross: number; totalCommission: number; totalNet: number; }> {
+  const targetDate = date ?? new Date().toISOString().split('T')[0]!;
+  const range = buildDayRange(targetDate);
+  const cardSales = await prisma.sales.findMany({
+    where: {
+      status: 'COMPLETED',
+      paymentMethod: 'MIXED',
+      createdAt: range,
+    },
+    select: {
+      id: true,
+      saleNumber: true,
+      totalAmount: true,
+      paymentMethod: true,
+      createdAt: true,
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  let totalGross = 0;
+  let totalCommission = 0;
+  const items: InTransitItem[] = cardSales.map(s => {
+    const gross = toNum(s.totalAmount);
+    const commission = calculateCommission(gross, s.paymentMethod);
+    const net = gross - commission;
+    const days = getSettlementDays(s.paymentMethod);
+    const settlement = new Date(s.createdAt);
+    settlement.setDate(settlement.getDate() + days);
+    totalGross += gross;
+    totalCommission += commission;
+    return {
+      saleId: s.id,
+      saleNumber: s.saleNumber,
+      amount: parseFloat(gross.toFixed(2)),
+      commission: parseFloat(commission.toFixed(2)),
+      netAmount: parseFloat(net.toFixed(2)),
+      paymentMethod: s.paymentMethod,
+      saleDate: s.createdAt,
+      estimatedSettlementDate: settlement,
+    };
+  });
+
+  return {
+    items,
+    totalGross: parseFloat(totalGross.toFixed(2)),
+    totalCommission: parseFloat(totalCommission.toFixed(2)),
+    totalNet: parseFloat((totalGross - totalCommission).toFixed(2)),
+  };
+}
+
+export async function getDailyLiquidity(date?: string): Promise<DailyLiquidityResult> {
+  const targetDate = date ?? new Date().toISOString().split('T')[0]!;
+  const range = buildDayRange(targetDate);
+  
+  const [salesByMethod, depositsToday, openRegister] = await Promise.all([
+    prisma.sales.groupBy({
+      by: ['paymentMethod'],
+      where: { status: 'COMPLETED', createdAt: range },
+      _sum: { totalAmount: true },
+    }),
+    prisma.bank_deposits.aggregate({
+      where: {
+        depositDate: range,
+        status: 'RECONCILED',
+      },
+      _sum: { amount: true },
+    }),
+    prisma.cash_registers.findFirst({
+      where: { openedAt: range },
+      select: { openingBalance: true },
+      orderBy: { openedAt: 'desc' },
+    }),
+  ]);
+
+  const breakdown = salesByMethod.map(s => {
+    const gross = toNum(s._sum.totalAmount);
+    const commission = calculateCommission(gross, s.paymentMethod);
+    return {
+      paymentMethod: s.paymentMethod,
+      grossAmount: parseFloat(gross.toFixed(2)),
+      commission: parseFloat(commission.toFixed(2)),
+      netAmount: parseFloat((gross - commission).toFixed(2)),
+      available: isImmediatePayment(s.paymentMethod),
+    };
+  });
+
+  const cashOnHand = toNum(openRegister?.openingBalance ?? 0) + breakdown
+    .filter(b => b.paymentMethod === 'CASH')
+    .reduce((s, b) => s + b.netAmount, 0);
+  
+  const inTransitCard = breakdown.filter(b => !b.available).reduce((s, b) => s + b.netAmount, 0);
+  const inTransitTransfer = 0;
+  const deposited = toNum(depositsToday._sum.amount);
+  const totalCommissions = breakdown.reduce((s, b) => s + b.commission, 0);
+  const availableToday = breakdown.filter(b => b.available).reduce((s, b) => s + b.netAmount, 0);
+  const expectedTotal = availableToday + inTransitCard;
+
+  return {
+    cashOnHand: parseFloat(cashOnHand.toFixed(2)),
+    inTransitCard: parseFloat(inTransitCard.toFixed(2)),
+    inTransitTransfer: parseFloat(inTransitTransfer.toFixed(2)),
+    depositsToday: parseFloat(deposited.toFixed(2)),
+    totalCommissions: parseFloat(totalCommissions.toFixed(2)),
+    availableToday: parseFloat(availableToday.toFixed(2)),
+    expectedTotal: parseFloat(expectedTotal.toFixed(2)),
+    breakdown,
+  };
+}
+

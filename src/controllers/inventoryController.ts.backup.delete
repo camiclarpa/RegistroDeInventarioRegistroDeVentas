@@ -1,0 +1,340 @@
+import { Request, Response } from 'express';
+import { Prisma } from '@prisma/client';
+import { ZodError } from 'zod';
+import {
+  createBrandSchema,
+  updateBrandSchema,
+  listBrandsQuerySchema,
+  createCategorySchema,
+  updateCategorySchema,
+  listCategoriesQuerySchema,
+  createProductSchema,
+  updateProductSchema,
+  patchStockSchema,
+  getProductsQuerySchema,
+} from '../utils/validators';
+import * as inventoryService from '../services/inventoryService';
+import { logAction } from '../services/auditService';
+import { logger } from '../config/logger';
+
+// ─── Helpers HTTP ─────────────────────────────────────────────────────────
+
+const ok = (res: Response, data: unknown, status = 200) =>
+  res.status(status).json({ success: true, data });
+
+const fail = (res: Response, error: string, status = 400, details?: unknown) =>
+  res.status(status).json({ success: false, error, ...(details ? { details } : {}) });
+
+function handleError(res: Response, err: unknown, context: string) {
+  logger.error(`[InventoryController] ${context}`, { err });
+
+  if (err instanceof ZodError) {
+    return fail(res, 'Datos de entrada inválidos', 422, err.flatten());
+  }
+
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    if (err.code === 'P2002') {
+      const fields = (err.meta?.target as string[] | undefined) ?? [];
+      const isSkuOrBarcode = fields.some((f) => f === 'skuInternal' || f === 'barcodeExternal');
+      return fail(res, isSkuOrBarcode ? 'El SKU o Código de Barras ya existe' : `Ya existe un registro con ese ${fields.join(', ')}`, 409);
+    }
+    if (err.code === 'P2025') {
+      return fail(res, 'Registro no encontrado', 404);
+    }
+  }
+
+  if (err instanceof Error) {
+    return fail(res, err.message, 400);
+  }
+
+  return fail(res, 'Error interno del servidor', 500);
+}
+
+function extractId(param: string | string[]): string {
+  return Array.isArray(param) ? param[0]! : param;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MARCAS (Brand)
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function createBrand(req: Request, res: Response) {
+  try {
+    const input = createBrandSchema.parse(req.body);
+    const brand = await inventoryService.createBrand(input);
+    void logAction(req.user?.id ?? null, 'CREATE_BRAND', 'Brand', brand.id, { name: brand.name }, req.ip);
+    return ok(res, brand, 201);
+  } catch (err) { return handleError(res, err, 'createBrand'); }
+}
+
+export async function getBrands(req: Request, res: Response) {
+  try {
+    const query = listBrandsQuerySchema.parse(req.query);
+    const result = await inventoryService.getBrands(query);
+    return ok(res, result);
+  } catch (err) { return handleError(res, err, 'getBrands'); }
+}
+
+export async function getBrandById(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const brand = await inventoryService.getBrandById(id);
+    if (!brand) return fail(res, 'Marca no encontrada', 404);
+    return ok(res, brand);
+  } catch (err) { return handleError(res, err, 'getBrandById'); }
+}
+
+export async function updateBrand(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const input = updateBrandSchema.parse(req.body);
+    const brand = await inventoryService.updateBrand(id, input);
+    void logAction(req.user?.id ?? null, 'UPDATE_BRAND', 'Brand', id, { changes: input }, req.ip);
+    return ok(res, brand);
+  } catch (err) { return handleError(res, err, 'updateBrand'); }
+}
+
+export async function deleteBrand(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    await inventoryService.deleteBrand(id);
+    void logAction(req.user?.id ?? null, 'DELETE_BRAND', 'Brand', id, {}, req.ip);
+    return ok(res, { message: 'Marca desactivada correctamente' });
+  } catch (err) { return handleError(res, err, 'deleteBrand'); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CATEGORÍAS (Category)
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function createCategory(req: Request, res: Response) {
+  try {
+    const input = createCategorySchema.parse(req.body);
+    const category = await inventoryService.createCategory(input);
+    void logAction(req.user?.id ?? null, 'CREATE_CATEGORY', 'Category', category.id, { name: category.name, slug: category.slug }, req.ip);
+    return ok(res, category, 201);
+  } catch (err) { return handleError(res, err, 'createCategory'); }
+}
+
+export async function getCategories(req: Request, res: Response) {
+  try {
+    const query = listCategoriesQuerySchema.parse(req.query);
+    const result = await inventoryService.getCategories(query);
+    return ok(res, result);
+  } catch (err) { return handleError(res, err, 'getCategories'); }
+}
+
+export async function getCategoryById(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const category = await inventoryService.getCategoryById(id);
+    if (!category) return fail(res, 'Categoría no encontrada', 404);
+    return ok(res, category);
+  } catch (err) { return handleError(res, err, 'getCategoryById'); }
+}
+
+export async function updateCategory(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const input = updateCategorySchema.parse(req.body);
+    const category = await inventoryService.updateCategory(id, input);
+    void logAction(req.user?.id ?? null, 'UPDATE_CATEGORY', 'Category', id, { changes: input }, req.ip);
+    return ok(res, category);
+  } catch (err) { return handleError(res, err, 'updateCategory'); }
+}
+
+export async function deleteCategory(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    await inventoryService.deleteCategory(id);
+    void logAction(req.user?.id ?? null, 'DELETE_CATEGORY', 'Category', id, {}, req.ip);
+    return ok(res, { message: 'Categoría desactivada correctamente' });
+  } catch (err) { return handleError(res, err, 'deleteCategory'); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PRODUCTOS (Product)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function serializeProduct(p: Record<string, unknown>) {
+  return {
+    id: p['id'], sku: p['skuInternal'], barcode: p['barcodeExternal'], name: p['nameCommercial'],
+    description: p['descriptionTech'], categoryId: p['categoryId'], category: p['category'],
+    brandId: p['brandId'], brand: p['brand'], costPrice: Number(p['costPriceAvg']),
+    salePrice: Number(p['salePriceBase']), taxRate: Number(p['taxRate']), stock: p['stockQuantity'],
+    minStock: p['minStockLevel'], binLocation: p['locationBin'], isActive: p['isActive'],
+    createdAt: p['createdAt'], updatedAt: p['updatedAt'],
+  };
+}
+
+export async function createProduct(req: Request, res: Response) {
+  try {
+    const body = req.body as Record<string, unknown>;
+    const resolvedBrandId: string = (typeof body['brandId'] === 'string' && body['brandId']) ? body['brandId'] : await inventoryService.getOrCreateGenericBrand();
+    const mapped = {
+      nameCommercial: body['nameCommercial'] ?? body['name'], skuInternal: body['skuInternal'] ?? body['sku'],
+      barcodeExternal: body['barcodeExternal'] ?? body['barcode'], partNumberOEM: body['partNumberOEM'] ?? body['name'] ?? body['nameCommercial'],
+      brandId: resolvedBrandId, categoryId: body['categoryId'], costPriceAvg: body['costPriceAvg'] ?? body['costPrice'],
+      salePriceBase: body['salePriceBase'] ?? body['salePrice'], taxRate: body['taxRate'],
+      stockQuantity: body['stockQuantity'] ?? body['stock'], minStockLevel: body['minStockLevel'] ?? body['minStock'],
+      locationBin: body['locationBin'] ?? body['binLocation'] ?? 'SIN-UBICACION',
+      descriptionTech: body['descriptionTech'] ?? body['description'], compatibleModels: body['compatibleModels'] ?? [],
+      isActive: body['isActive'] ?? true,
+    };
+    const input = createProductSchema.parse(mapped);
+    const userId = req.user?.id;
+    const product = await inventoryService.createProduct(input, userId);
+    void logAction(userId ?? null, 'CREATE_PRODUCT', 'Product', product.id, { sku: product.skuInternal, name: product.nameCommercial, cost: product.costPriceAvg }, req.ip);
+    return ok(res, serializeProduct(product as unknown as Record<string, unknown>), 201);
+  } catch (err) { return handleError(res, err, 'createProduct'); }
+}
+
+export async function getAllProducts(req: Request, res: Response) {
+  try {
+    const query = getProductsQuerySchema.parse(req.query);
+    const result = await inventoryService.getAllProducts(query);
+    return ok(res, { data: result.data.map((p) => serializeProduct(p as unknown as Record<string, unknown>)), meta: result.meta });
+  } catch (err) { return handleError(res, err, 'getAllProducts'); }
+}
+
+export async function getLowStockProducts(_req: Request, res: Response) {
+  try {
+    const products = await inventoryService.getLowStockProducts();
+    return ok(res, products);
+  } catch (err) { return handleError(res, err, 'getLowStockProducts'); }
+}
+
+export async function getProductById(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const product = await inventoryService.getProductById(id);
+    if (!product) return fail(res, 'Producto no encontrado', 404);
+    return ok(res, product);
+  } catch (err) { return handleError(res, err, 'getProductById'); }
+}
+
+export async function updateProduct(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const body = req.body as Record<string, unknown>;
+    const mapped: Record<string, unknown> = {};
+    const set = (key: string, ...sources: string[]) => { for (const src of sources) { if (body[src] !== undefined) { mapped[key] = body[src]; return; } } };
+    set('nameCommercial', 'nameCommercial', 'name'); set('barcodeExternal', 'barcodeExternal', 'barcode');
+    set('partNumberOEM', 'partNumberOEM'); set('brandId', 'brandId'); set('categoryId', 'categoryId');
+    set('costPriceAvg', 'costPriceAvg', 'costPrice'); set('salePriceBase', 'salePriceBase', 'salePrice');
+    set('taxRate', 'taxRate'); set('stockQuantity', 'stockQuantity', 'stock');
+    set('minStockLevel', 'minStockLevel', 'minStock'); set('locationBin', 'locationBin', 'binLocation');
+    set('descriptionTech', 'descriptionTech', 'description'); set('isActive', 'isActive');
+    const input = updateProductSchema.parse(mapped);
+    const userId = req.user?.id;
+    const product = await inventoryService.updateProduct(id, input, userId);
+    void logAction(userId ?? null, 'UPDATE_PRODUCT', 'Product', id, { changes: mapped }, req.ip);
+    return ok(res, serializeProduct(product as unknown as Record<string, unknown>));
+  } catch (err) { return handleError(res, err, 'updateProduct'); }
+}
+
+export async function deleteProduct(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const result = await inventoryService.deleteProduct(id);
+    void logAction(req.user?.id ?? null, 'DELETE_PRODUCT', 'Product', id, {}, req.ip);
+    return ok(res, { message: result.message || 'Producto eliminado correctamente' });
+  } catch (err) { return handleError(res, err, 'deleteProduct'); }
+}
+
+export async function adjustStock(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const input = patchStockSchema.parse(req.body);
+    const userId = req.user?.id;
+    const result = await inventoryService.adjustStock(id, input, userId);
+    void logAction(userId ?? null, 'ADJUST_STOCK', 'Product', id, { quantity: input.quantity, reason: input.reason, unitCost: input.unitCost, previousStock: result.previousStock, newStock: result.newStock, costPriceAvg: result.costPriceAvg }, req.ip);
+    return ok(res, result);
+  } catch (err) { return handleError(res, err, 'adjustStock'); }
+}
+
+export async function getProductMovements(req: Request, res: Response) {
+  try {
+    const id = extractId(req.params['id']!);
+    const limitRaw = req.query['limit'];
+    const limit = Math.min(parseInt(typeof limitRaw === 'string' ? limitRaw : '50', 10) || 50, 200);
+    const movements = await inventoryService.getMovementsByProduct(id, limit);
+    return ok(res, movements);
+  } catch (err) { return handleError(res, err, 'getProductMovements'); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ESTADÍSTICAS
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function getCategoriesStats(req: Request, res: Response) {
+  try {
+    const stats = await inventoryService.getCategoriesStats();
+    return ok(res, stats);
+  } catch (err) { return handleError(res, err, 'getCategoriesStats'); }
+}
+
+export async function getInventoryStats(req: Request, res: Response) {
+  try {
+    const stats = await inventoryService.getInventoryStats();
+    return ok(res, stats);
+  } catch (err) { return handleError(res, err, 'getInventoryStats'); }
+}
+
+/**
+ * POST /api/v1/inventory/categories/cleanup
+ * Desactiva categorías que no tienen productos activos.
+ */
+export async function cleanupCategories(req: Request, res: Response) {
+  try {
+    const count = await inventoryService.forceCleanupOrphanCategories();
+    void logAction(req.user?.id ?? null, 'CLEANUP_CATEGORIES', 'Category', null, { deactivated: count }, req.ip);
+    return ok(res, { message: `Se limpiaron ${count} categorías vacías.` });
+  } catch (err) {
+    return handleError(res, err, 'cleanupCategories');
+  }
+}
+
+/**
+ * POST /api/v1/inventory/import
+
+/**
+ * POST /api/v1/inventory/import
+ * Importar productos desde archivo Excel (.xlsx, .xls, .csv)
+ */
+export async function importFromExcel(req: Request, res: Response) {
+  try {
+    const file = req.file;
+    
+    if (!file) {
+      return fail(res, 'No se envió ningún archivo', 400);
+    }
+
+    const userId = req.user?.id;
+
+    // Validar tamaño
+    if (file.size > 5 * 1024 * 1024) {
+      return fail(res, 'El archivo no debe superar 5MB', 400);
+    }
+
+    // Aquí iría la lógica real de procesamiento del Excel
+    // Por ahora simulamos éxito
+    const result = {
+      success: true,
+      imported: 0,
+      errors: [],
+      message: 'Archivo recibido correctamente. Procesamiento pendiente.'
+    };
+
+    void logAction(userId ?? null, 'IMPORT_INVENTORY', 'Product', null, { 
+      filename: file.originalname, 
+      size: file.size,
+      mimetype: file.mimetype
+    }, req.ip);
+    
+    return ok(res, result);
+  } catch (err) {
+    logger.error('[importFromExcel] Error:', err);
+    return handleError(res, err, 'importFromExcel');
+  }
+}

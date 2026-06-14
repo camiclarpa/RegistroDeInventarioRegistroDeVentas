@@ -1,0 +1,382 @@
+import { PrismaClient } from '@prisma/client';
+import * as XLSX from 'xlsx';
+
+const prisma = new PrismaClient();
+
+// ============================================
+// ANÁLISIS HÍBRIDO 100% DINÁMICO
+// ============================================
+
+export function analyzeExcelPatterns(fileBuffer: Buffer) {
+  const workbook = XLSX.read(fileBuffer, { type: 'buffer' });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  const rawData = XLSX.utils.sheet_to_json(sheet);
+
+  const wordFrequency: Record<string, number> = {};
+  const wordPosition: Record<string, { first: number; middle: number; last: number }> = {};
+  const allProducts: any[] = [];
+
+  rawData.forEach((row: any) => {
+    const productName = String(row['PRODUCTO'] || '').toUpperCase().trim();
+    if (!productName || productName.includes('TOTAL')) return;
+
+    const words = productName.split(/[\s-]+/).filter(w => w.length > 2);
+    
+    allProducts.push({
+      name: row['PRODUCTO'],
+      description: row['DESCRIPCIÓN'] || '',
+      stock: row['CANTIDAD'] || '0',
+      salePrice: row['VALOR COMERCIAL'] || 0,
+      costPrice: row['VALOR SIN IVA'] || 0,
+      ivaIncluded: row['VALOR CON IVA INCLUIDO'] || 0
+    });
+
+    words.forEach((word, index) => {
+      wordFrequency[word] = (wordFrequency[word] || 0) + 1;
+      
+      if (!wordPosition[word]) {
+        wordPosition[word] = { first: 0, middle: 0, last: 0 };
+      }
+
+      if (index === 0) wordPosition[word].first++;
+      else if (index === words.length - 1) wordPosition[word].last++;
+      else wordPosition[word].middle++;
+    });
+  });
+
+  // DETECCIÓN AUTOMÁTICA DE MARCAS
+  const detectedBrands = Object.entries(wordPosition)
+    .filter(([word, pos]) => {
+      const total = pos.first + pos.middle + pos.last;
+      const atStart = pos.first / total;
+      return (
+        word.length >= 3 && 
+        word.length <= 12 && 
+        atStart > 0.3 &&
+        total > 2
+      );
+    })
+    .sort((a, b) => b[1].first - a[1].first)
+    .slice(0, 25)
+    .map(([word]) => word);
+
+  // DETECCIÓN AUTOMÁTICA DE CATEGORÍAS
+  const detectedCategories = Object.entries(wordFrequency)
+    .filter(([word, count]) => {
+      const pos = wordPosition[word];
+      const total = pos.first + pos.middle + pos.last;
+      const inMiddle = pos.middle / total;
+      
+      return (
+        word.length > 4 &&
+        count > 3 &&
+        inMiddle > 0.2
+      );
+    })
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 25)
+    .map(([word]) => word);
+
+  const sampleProducts = allProducts.slice(0, 10).map((product, index) => {
+    const words = product.name.toUpperCase().split(/[\s-]+/);
+    
+    let brand = words.find(w => detectedBrands.includes(w)) || words[0];
+    let category = words.find(w => detectedCategories.includes(w)) || words[1] || 'GENERAL';
+    
+    const costPrice = parsePrice(product.costPrice);
+    const ivaIncluded = parsePrice(product.ivaIncluded);
+    const iva = costPrice > 0 && ivaIncluded > 0 
+      ? Math.round(((ivaIncluded / costPrice) - 1) * 100) 
+      : 19;
+
+    const stock = String(product.stock).toUpperCase().includes('AGOTADO') 
+      ? 0 
+      : parseInt(product.stock) || 0;
+
+    return {
+      name: product.name,
+      detectedBrand: brand,
+      detectedCategory: category,
+      salePrice: parsePrice(product.salePrice),
+      iva: iva,
+      stock: stock
+    };
+  });
+
+  return {
+    totalRows: allProducts.length,
+    detectedBrands,
+    detectedCategories,
+    sampleProducts,
+    wordFrequency: Object.entries(wordFrequency)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 30)
+      .reduce((acc, [word, count]) => ({ ...acc, [word]: count }), {})
+  };
+}
+
+// ============================================
+// IMPORTACIÓN MASIVA
+// ============================================
+export async function executeImport(
+  fileBuffer: Buffer, 
+  confirmedBrands: string[], 
+  confirmedCategories: string[]
+) {
+  const workbook = XLSX.read(fileBuffer, { type: 'buffer' });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  const rawData = XLSX.utils.sheet_to_json(sheet);
+
+  const productsToInsert = [];
+  let counter = 1;
+
+  for (const row of rawData) {
+    const productName = String(row['PRODUCTO'] || '').trim();
+    const description = String(row['DESCRIPCIÓN'] || '').trim();
+    const quantityRaw = String(row['CANTIDAD'] || '0').toUpperCase();
+    const salePriceRaw = row['VALOR COMERCIAL'] || 0;
+
+    if (!productName || productName.toUpperCase().includes('TOTAL')) continue;
+
+    const words = productName.toUpperCase().split(/[\s-]+/);
+
+    // EXTRAER MARCA
+    let brand = 'GEN';
+    for (const b of confirmedBrands) {
+      if (words.some(w => w.includes(b.toUpperCase()) || b.toUpperCase().includes(w))) {
+        brand = b;
+        break;
+      }
+    }
+    if (brand === 'GEN' && words.length > 0) {
+      brand = words[0].substring(0, 10);
+    }
+
+    // EXTRAER CATEGORÍA
+    let category = 'General';
+    for (const c of confirmedCategories) {
+      if (words.some(w => w.includes(c.toUpperCase()) || c.toUpperCase().includes(w))) {
+        category = c;
+        break;
+      }
+    }
+
+    // GENERAR SKU
+    const brandCode = brand.substring(0, 3).toUpperCase().padEnd(3, 'X');
+    const catCode = category.substring(0, 3).toUpperCase().padEnd(3, 'X');
+    const seq = String(counter).padStart(4, '0');
+    const sku = `${brandCode}-${catCode}-${seq}`;
+
+    // GENERAR CÓDIGO DE BARRAS
+    const cleanSku = sku.replace(/-/g, '');
+    const barcode = `770000${cleanSku}`.substring(0, 13);
+
+    // PROCESAR STOCK
+    let stock = 0;
+    if (quantityRaw.includes('AGOTADO') || quantityRaw.includes('AGOTADA')) {
+      stock = 0;
+    } else {
+      stock = parseInt(quantityRaw) || 0;
+    }
+
+    productsToInsert.push({
+      name: productName,
+      description: description || null,
+      sku: sku,
+      barcode: barcode,
+      category: category,
+      brand: brand,
+      salePrice: parsePrice(salePriceRaw),
+      costPrice: 0,
+      stock: stock,
+      minStock: 5,
+      location: '',
+      ivaRate: 19
+    });
+
+    counter++;
+  }
+
+  if (productsToInsert.length > 0) {
+    await prisma.product.createMany({ 
+      data: productsToInsert, 
+      skipDuplicates: true 
+    });
+  }
+
+  return { count: productsToInsert.length };
+}
+
+function parsePrice(value: any): number {
+  if (!value) return 0;
+  const clean = String(value).replace(/[$,\s]/g, '').replace(',', '.');
+  return parseFloat(clean) || 0;
+}
+
+// ============================================
+// EXTENSIÓN STEP: Servicios de Enriquecimiento Empresarial
+// ============================================
+
+// Normalización de marcas conocidas
+const BRAND_CORRECTIONS: Record<string, string> = {
+  'BAJAB': 'BAJAJ', 'BAJAH': 'BAJAJ', 'HINDA': 'HONDA', 'HONADA': 'HONDA',
+  'CASROL': 'CASTROL', 'CASTRL': 'CASTROL', 'YAMABA': 'YAMAHA', 'SUSUKY': 'SUZUKI'
+};
+
+export function normalizeBrand(raw: string): string {
+  if (!raw) return 'Generic';
+  const up = raw.trim().toUpperCase();
+  return BRAND_CORRECTIONS[up] ?? up;
+}
+
+// Validación de checksum EAN-13
+export function validateEAN13(barcode: string): { valid: boolean; error?: string } {
+  if (!barcode) return { valid: true };
+  if (barcode.length !== 13) return { valid: false, error: 'Debe tener 13 dígitos' };
+  if (!/^\d+$/.test(barcode)) return { valid: false, error: 'Debe ser numérico' };
+  
+  let sum = 0;
+  for (let i = 0; i < 12; i++) {
+    const d = parseInt(barcode[i], 10);
+    sum += (i % 2 === 0) ? d : d * 3;
+  }
+  const check = (10 - (sum % 10)) % 10;
+  return check === parseInt(barcode[12], 10) 
+    ? { valid: true } 
+    : { valid: false, error: `Checksum inválido, debería terminar en ${check}` };
+}
+
+// Generación de SKU automático
+export function generateAutoSKU(brand: string, category: string, index: number): string {
+  const b = (brand || 'GEN').substring(0, 3).toUpperCase().padEnd(3, 'X');
+  const c = (category || 'GEN').substring(0, 3).toUpperCase().padEnd(3, 'X');
+  const num = String(index + 1).padStart(4, '0');
+  return `${b}-${c}-${num}`;
+}
+
+// Generación de Barcode EAN-13 con prefijo Colombia
+export function generateAutoBarcode(sku: string, prefix = '770'): string {
+  const clean = sku.replace(/[^0-9]/g, '').substring(0, 12 - prefix.length);
+  let code = prefix + clean.padEnd(12 - prefix.length, '0');
+  code = code.substring(0, 12);
+  
+  let sum = 0;
+  for (let i = 0; i < 12; i++) {
+    const d = parseInt(code[i], 10) || 0;
+    sum += (i % 2 === 0) ? d : d * 3;
+  }
+  const check = (10 - (sum % 10)) % 10;
+  return code + check.toString();
+}
+
+// Validación de coherencia de datos empresariales
+export function validateProductCoherence(product: any, rowIndex: number): { errors: string[]; warnings: string[] } {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  
+  if (product.salePrice < 0) errors.push(`Fila ${rowIndex}: Precio negativo`);
+  if (product.stock < 0) errors.push(`Fila ${rowIndex}: Stock negativo`);
+  if (!product.name || product.name.trim().length < 2) errors.push(`Fila ${rowIndex}: Nombre inválido`);
+  
+  if (product.costPrice > 0 && product.salePrice > 0 && product.salePrice < product.costPrice) {
+    warnings.push(`Fila ${rowIndex}: Precio venta < costo (pérdida de $${product.costPrice - product.salePrice})`);
+  }
+  
+  if (product.barcode && product.barcode.length === 13) {
+    const bc = validateEAN13(product.barcode);
+    if (!bc.valid) warnings.push(`Fila ${rowIndex}: ${bc.error}`);
+  }
+  
+  return { errors, warnings };
+}
+
+// ============================================
+// STEP: Confirmar Importación y Guardar en BD
+// ============================================
+
+export async function confirmImport(
+  enrichedProducts: any[],
+  userId?: string
+): Promise<{ savedCount: number; errorCount: number; errors: any[] }> {
+  
+  const savedIds: string[] = [];
+  const errors: any[] = [];
+
+  for (const [index, product] of enrichedProducts.entries()) {
+    try {
+      // Ignorar productos con errores críticos detectados en el preview
+      if (product.errors && product.errors.length > 0) {
+        errors.push({ row: index + 1, message: "Producto con errores críticos", details: product.errors });
+        continue;
+      }
+
+      // Verificar si ya existe por SKU o Barcode
+      const existingProduct = await prisma.product.findFirst({
+        where: {
+          OR: [
+            { skuInternal: product.skuInternal },
+            { barcodeExternal: product.barcodeExternal }
+          ]
+        }
+      });
+
+      const productData = {
+        skuInternal: product.skuInternal,
+        barcodeExternal: product.barcodeExternal,
+        partNumberOEM: product.skuInternal, // Fallback
+        nameCommercial: product.nameNormalized || product.name,
+        descriptionTech: product.description || null,
+        brandId: product.brandId || null,
+        categoryId: product.categoryId || null,
+        salePriceBase: product.salePrice || 0,
+        costPriceAvg: product.costPrice || 0,
+        taxRate: product.taxRate || 19,
+        stockQuantity: product.stock || 0,
+        minStockLevel: product.minStockLevel || 5,
+        locationBin: product.locationBin || 'A-01',
+        isActive: true
+      };
+
+      if (existingProduct) {
+        // ACTUALIZAR producto existente (Upsert)
+        await prisma.product.update({
+          where: { id: existingProduct.id },
+          data: {
+            ...productData,
+            // Sumar stock al existente o reemplazar (aquí sumamos)
+            stockQuantity: existingProduct.stockQuantity + (product.stock || 0),
+            updatedAt: new Date()
+          }
+        });
+        savedIds.push(existingProduct.id);
+      } else {
+        // CREAR nuevo producto
+        const newProduct = await prisma.product.create({
+          data: productData
+        });
+        savedIds.push(newProduct.id);
+      }
+
+    } catch (error: any) {
+      console.error(`Error al guardar producto fila ${index + 1}:`, error);
+      errors.push({ row: index + 1, message: error.message });
+    }
+  }
+
+  // Opcional: Registrar auditoría en import_batches si la tabla existe
+  try {
+    if (enrichedProducts.length > 0) {
+       // Ajusta según tu lógica de auditoría si es necesaria
+    }
+  } catch (e) { /* Ignorar errores de auditoría para no romper el flujo */ }
+
+  return {
+    savedCount: savedIds.length,
+    errorCount: errors.length,
+    errors: errors
+  };
+}
+
+// ============================================
+// STEP: Confirmar Importación y Guardar en BD
+// ============================================

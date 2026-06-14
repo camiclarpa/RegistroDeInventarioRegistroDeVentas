@@ -1,0 +1,216 @@
+import ExcelJS from 'exceljs'
+import { downloadBlob } from './helpers'
+import { formatCOP, formatDate } from './formatters'
+import type { Product, Invoice, PurchaseOrder, AbcProduct, ProfitabilityProductItem, ProductAuditLog } from '@/types'
+
+const BRAND_BLUE_HEX = '1E3A8A'
+const BRAND_ORANGE_HEX = 'F97316'
+
+const styleHeader = (ws: ExcelJS.Worksheet, row: ExcelJS.Row) => {
+  row.eachCell((cell) => {
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${BRAND_BLUE_HEX}` } }
+    cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 }
+    cell.alignment = { horizontal: 'center', vertical: 'middle' }
+    cell.border = {
+      bottom: { style: 'thin', color: { argb: `FF${BRAND_ORANGE_HEX}` } },
+    }
+  })
+  row.height = 22
+}
+
+export const exportProductsToExcel = async (products: Product[]): Promise<void> => {
+  const wb = new ExcelJS.Workbook()
+  wb.creator = 'SIGC-Motos'
+  wb.created = new Date()
+  const ws = wb.addWorksheet('Inventario')
+  ws.columns = [
+    { header: 'SKU', key: 'sku', width: 15 },
+    { header: 'Código Barras', key: 'barcode', width: 16 },
+    { header: 'Nombre', key: 'name', width: 40 },
+    { header: 'Categoría', key: 'category', width: 20 },
+    { header: 'Precio Costo', key: 'costPrice', width: 16 },
+    { header: 'Precio Venta', key: 'salePrice', width: 16 },
+    { header: 'IVA %', key: 'taxRate', width: 10 },
+    { header: 'Stock', key: 'stock', width: 10 },
+    { header: 'Stock Mín.', key: 'minStock', width: 12 },
+    { header: 'Ubicación', key: 'locationBin', width: 14 },
+  ]
+  styleHeader(ws, ws.getRow(1))
+  products.forEach((p) => {
+    const row = ws.addRow({
+      sku: p.sku,
+      barcode: p.barcode ?? '',
+      name: p.name,
+      category: p.category?.name ?? '',
+      costPrice: p.costPrice,
+      salePrice: p.salePrice,
+      taxRate: p.taxRate,
+      stock: p.stock,
+      minStock: p.minStock,
+      locationBin: p.locationBin ?? '',
+    })
+    if (p.stock <= (p.minStock ?? 5)) {
+      row.getCell('stock').fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEF3C7' } }
+    }
+  })
+  const buf = await wb.xlsx.writeBuffer()
+  downloadBlob(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), 'inventario.xlsx')
+}
+
+export const exportInvoicesToExcel = async (invoices: Invoice[]): Promise<void> => {
+  const wb = new ExcelJS.Workbook()
+  const ws = wb.addWorksheet('Facturas')
+  ws.columns = [
+    { header: 'Número', key: 'invoiceNumber', width: 18 },
+    { header: 'Fecha', key: 'date', width: 14 },
+    { header: 'Cliente', key: 'customer', width: 30 },
+    { header: 'Total', key: 'total', width: 16 },
+    { header: 'Estado', key: 'status', width: 14 },
+    { header: 'CUFE', key: 'cufe', width: 40 },
+  ]
+  styleHeader(ws, ws.getRow(1))
+  invoices.forEach((inv) => {
+    ws.addRow({
+      invoiceNumber: inv.invoiceNumber,
+      date: formatDate(inv.issuedAt),
+      customer: inv.customer?.name ?? 'Consumidor Final',
+      total: inv.total,
+      status: inv.status,
+      cufe: inv.cufe ?? '',
+    })
+  })
+  const buf = await wb.xlsx.writeBuffer()
+  downloadBlob(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), 'facturas.xlsx')
+}
+
+export const exportPurchaseOrdersToExcel = async (orders: PurchaseOrder[]): Promise<void> => {
+  const wb = new ExcelJS.Workbook()
+  const ws = wb.addWorksheet('Compras')
+  ws.columns = [
+    { header: 'Número', key: 'orderNumber', width: 18 },
+    { header: 'Proveedor', key: 'supplier', width: 30 },
+    { header: 'Total', key: 'total', width: 16 },
+    { header: 'Estado', key: 'status', width: 14 },
+    { header: 'Fecha Esperada', key: 'expectedDate', width: 16 },
+    { header: 'Notas', key: 'notes', width: 30 },
+  ]
+  styleHeader(ws, ws.getRow(1))
+  orders.forEach((o) => {
+    ws.addRow({
+      orderNumber: o.orderNumber,
+      supplier: o.supplier?.name ?? '',
+      total: o.total,
+      status: o.status,
+      expectedDate: o.expectedDate ? formatDate(o.expectedDate) : '',
+      notes: o.notes ?? '',
+    })
+  })
+  const buf = await wb.xlsx.writeBuffer()
+  downloadBlob(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), 'compras.xlsx')
+}
+
+export const exportAbcToExcel = async (items: AbcProduct[]): Promise<void> => {
+  const totalRevenue = items.reduce((s, i) => s + i.totalRevenue, 0)
+  const wb = new ExcelJS.Workbook()
+  const ws = wb.addWorksheet('Análisis ABC')
+  ws.columns = [
+    { header: 'Clase', key: 'class', width: 8 },
+    { header: 'Producto', key: 'name', width: 40 },
+    { header: 'SKU', key: 'sku', width: 15 },
+    { header: 'Categoría', key: 'category', width: 20 },
+    { header: 'Unidades Vendidas', key: 'qty', width: 18 },
+    { header: 'Ingresos Totales', key: 'revenue', width: 20 },
+    { header: '% del Total', key: 'pct', width: 14 },
+    { header: '% Acumulado', key: 'cumulPct', width: 14 },
+  ]
+  styleHeader(ws, ws.getRow(1))
+  items.forEach((item) => {
+    const pct = totalRevenue > 0 ? ((item.totalRevenue / totalRevenue) * 100).toFixed(2) + '%' : '0.00%'
+    const row = ws.addRow({
+      class: item.abcClass,
+      name: item.productName,
+      sku: item.sku,
+      category: item.category,
+      qty: item.quantitySold,
+      revenue: item.totalRevenue,
+      pct,
+      cumulPct: item.cumulativePercentage.toFixed(2) + '%',
+    })
+    const clsColors: Record<string, string> = { A: 'FFC6EFCE', B: 'FFFFEB9C', C: 'FFFFC7CE' }
+    const fill = clsColors[item.abcClass]
+    if (fill) row.getCell('class').fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: fill } }
+  })
+  const buf = await wb.xlsx.writeBuffer()
+  downloadBlob(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), 'analisis-abc.xlsx')
+}
+
+export const exportAuditLogsToExcel = async (
+  logs: ProductAuditLog[],
+  productName: string,
+  productSku: string,
+): Promise<void> => {
+  const wb = new ExcelJS.Workbook()
+  wb.creator = 'SIGC-Motos'
+  wb.created = new Date()
+  const ws = wb.addWorksheet('Historial de Movimientos')
+  ws.columns = [
+    { header: 'FECHA',    key: 'fecha',   width: 14 },
+    { header: 'HORA',     key: 'hora',    width: 14 },
+    { header: 'USUARIO',  key: 'usuario', width: 30 },
+    { header: 'SKU',      key: 'sku',     width: 20 },
+    { header: 'MOTIVO',   key: 'motivo',  width: 40 },
+  ]
+  styleHeader(ws, ws.getRow(1))
+  logs.forEach((log) => {
+    const dt = new Date(log.createdAt)
+    ws.addRow({
+      fecha:   dt.toLocaleDateString('es-CO', { timeZone: 'America/Bogota', day: '2-digit', month: '2-digit', year: 'numeric' }),
+      hora:    dt.toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit', hour12: true }),
+      usuario: log.userName,
+      sku:     productSku || '—',
+      motivo:  log.reason || '—',
+    })
+  })
+  // Alternate row shading
+  ws.eachRow((row, rowNumber) => {
+    if (rowNumber > 1 && rowNumber % 2 === 0) {
+      row.eachCell(cell => {
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF3F4F6' } }
+      })
+    }
+  })
+  const buf = await wb.xlsx.writeBuffer()
+  const safeName = productName.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30)
+  downloadBlob(
+    new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+    `historial_${safeName}.xlsx`,
+  )
+}
+
+export const exportProfitabilityToExcel = async (items: ProfitabilityProductItem[]): Promise<void> => {
+  const wb = new ExcelJS.Workbook()
+  const ws = wb.addWorksheet('Rentabilidad')
+  ws.columns = [
+    { header: 'Producto',         key: 'name',    width: 40 },
+    { header: 'SKU',              key: 'sku',     width: 16 },
+    { header: 'Ingresos Totales', key: 'revenue', width: 20 },
+    { header: 'Costo Total',      key: 'cost',    width: 18 },
+    { header: 'Ganancia Bruta',   key: 'profit',  width: 18 },
+    { header: 'Margen %',         key: 'pct',     width: 12 },
+    { header: 'Unidades Vendidas',key: 'sold',    width: 18 },
+  ]
+  styleHeader(ws, ws.getRow(1))
+  items.forEach((item) => {
+    ws.addRow({
+      name:    item.productName,
+      sku:     item.sku,
+      revenue: item.totalRevenue,
+      cost:    item.totalCost,
+      profit:  item.grossProfit,
+      pct:     item.profitMarginPercentage.toFixed(1) + '%',
+      sold:    item.unitsSold,
+    })
+  })
+  const buf = await wb.xlsx.writeBuffer()
+  downloadBlob(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), 'rentabilidad.xlsx')
+}

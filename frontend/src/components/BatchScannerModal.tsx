@@ -1,0 +1,992 @@
+import { useState, useRef, useEffect, useCallback } from 'react'
+import { X, Mic, MicOff, Volume2, CheckCircle, Edit3, MessageCircle, Activity, Heart, Frown, Angry, HelpCircle, Zap, Smile, SkipForward, SkipBack, Package, List, ScanBarcode, Plus, Save, Trash2 } from 'lucide-react'
+import { toast } from 'sonner'
+
+interface BatchScannerModalProps {
+  isOpen: boolean
+  onClose: () => void
+  onProductsAdded: (products: any[]) => void
+  scannedProducts?: ProductQueueItem[]
+}
+
+interface ProductData {
+  name: string | null
+  category: string | null
+  brand: string | null
+  sale_price: string | null
+  quantity: number | null
+}
+
+interface FieldUpdate {
+  customer_name: string | null
+  product_data: ProductData
+  current_field: string
+  state: 'collecting' | 'confirming' | 'complete'
+}
+
+interface TranscriptEntry {
+  id: number
+  speaker: 'user' | 'agent'
+  text: string
+  timestamp: Date
+}
+
+
+interface ProductQueueItem {
+  barcode: string
+  sku?: string
+  name?: string
+  category?: string
+  brand?: string
+  sale_price?: string
+  quantity?: number
+}
+
+interface ProgressInfo {
+  current_index: number
+  total: number
+  completed: number
+  current_product: {
+    barcode: string
+    sku: string
+    existing_name: string
+  }
+  state: string
+}
+
+type VoiceStatus = 'idle' | 'listening' | 'speaking' | 'error'
+
+export const BatchScannerModal: React.FC<BatchScannerModalProps> = ({ 
+  isOpen, 
+  onClose, 
+  onProductsAdded,
+  scannedProducts = []
+}) => {
+  const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>('idle')
+  const [fieldUpdate, setFieldUpdate] = useState<FieldUpdate | null>(null)
+  const [editingField, setEditingField] = useState<string | null>(null)
+  const [editValue, setEditValue] = useState('')
+  const [transcript, setTranscript] = useState<TranscriptEntry[]>([])
+  const [vadMetrics, setVadMetrics] = useState({ rms: 0, is_voice: false, threshold: 300 })
+  const [showTranscript, setShowTranscript] = useState(true)
+  const [currentEmotion, setCurrentEmotion] = useState<string>('neutral')
+  const [emotionHistory, setEmotionHistory] = useState<Array<{emotion: string, text: string, timestamp: Date}>>([])
+  const [hasActiveSession, setHasActiveSession] = useState(false)
+  // FASE MULTI-PRODUCTO
+  const [productQueue, setProductQueue] = useState<ProductQueueItem[]>([])
+  const [progress, setProgress] = useState<ProgressInfo | null>(null)
+  const [showProductList, setShowProductList] = useState(false)
+  
+  // PANEL DE ESCANEO
+  const [showScanPanel, setShowScanPanel] = useState(false)
+  const [barcodeInput, setBarcodeInput] = useState('')
+  const [scannedItems, setScannedItems] = useState<ProductQueueItem[]>([])
+  const barcodeInputRef = useRef<HTMLInputElement | null>(null)
+  
+  const wsRef = useRef<WebSocket | null>(null)
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const mediaStreamRef = useRef<MediaStream | null>(null)
+  const audioQueueRef = useRef<ArrayBuffer[]>([])
+  const isPlayingRef = useRef(false)
+  const transcriptEndRef = useRef<HTMLDivElement | null>(null)
+
+  const getWsUrl = () => {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    return `${protocol}//${window.location.host}/api/v1/voice/ws`
+  }
+
+  // Auto-scroll del transcript
+  useEffect(() => {
+    if (transcriptEndRef.current) {
+      transcriptEndRef.current.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [transcript])
+
+  // AUTO-APERTURA: Detectar cuando el agente dice "Escanea los productos"
+  useEffect(() => {
+    if (transcript.length > 0) {
+      const lastMessage = transcript[transcript.length - 1]
+      if (lastMessage.speaker === 'agent' && 
+          (lastMessage.text.toLowerCase().includes('escanea') || 
+           lastMessage.text.toLowerCase().includes('escanear'))) {
+        setShowScanPanel(true)
+        // Enfocar el input después de un breve delay
+        setTimeout(() => {
+          barcodeInputRef.current?.focus()
+        }, 300)
+      }
+    }
+  }, [transcript])
+
+  // FASE MULTI-PRODUCTO: Enviar cola de productos cuando esté lista
+  useEffect(() => {
+    if (scannedProducts.length > 0 && voiceStatus === 'listening' && wsRef.current?.readyState === WebSocket.OPEN) {
+      sendProductQueue(scannedProducts)
+    }
+  }, [scannedProducts, voiceStatus])
+
+
+
+  const playAudioChunk = useCallback(async (arrayBuffer: ArrayBuffer) => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioContext({ sampleRate: 22050 })
+    }
+
+    try {
+      const audioBuffer = await audioContextRef.current.decodeAudioData(arrayBuffer)
+      const source = audioContextRef.current.createBufferSource()
+      source.buffer = audioBuffer
+      source.connect(audioContextRef.current.destination)
+      
+      return new Promise<void>((resolve) => {
+        source.onended = () => resolve()
+        source.start()
+      })
+    } catch (err) {
+      console.error('Error reproduciendo audio:', err)
+    }
+  }, [])
+
+  const processAudioQueue = useCallback(async () => {
+    if (isPlayingRef.current) return
+    isPlayingRef.current = true
+
+    while (audioQueueRef.current.length > 0) {
+      const chunk = audioQueueRef.current.shift()!
+      await playAudioChunk(chunk)
+    }
+
+    isPlayingRef.current = false
+    setVoiceStatus('listening')
+  }, [playAudioChunk])
+
+  // BARGE-IN: Detectar voz del usuario mientras el agente habla
+  const detectBargeIn = useCallback((audioData: Float32Array) => {
+    if (voiceStatus !== 'speaking') return
+    
+    // Calcular RMS
+    let sum = 0
+    for (let i = 0; i < audioData.length; i++) {
+      sum += audioData[i] * audioData[i]
+    }
+    const rms = Math.sqrt(sum / audioData.length) * 32768
+    
+    // Si hay voz fuerte mientras el agente habla, interrumpir
+    if (rms > 1500 && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      console.log('BARGE-IN detectado! RMS:', rms)
+      wsRef.current.send(JSON.stringify({ type: 'barge_in' }))
+      isPlayingRef.current = false
+      audioQueueRef.current = []
+      setVoiceStatus('listening')
+      toast.info('Interrupcion detectada')
+    }
+  }, [voiceStatus])
+
+  const startVoiceAgent = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: { 
+          channelCount: 1,
+          sampleRate: 16000,
+          echoCancellation: true,
+          noiseSuppression: true
+        } 
+      })
+      mediaStreamRef.current = stream
+
+      const wsUrl = getWsUrl()
+      console.log('Conectando a:', wsUrl)
+      
+      const ws = new WebSocket(wsUrl)
+      wsRef.current = ws
+      ws.binaryType = 'arraybuffer'
+
+      ws.onopen = () => {
+        console.log('WebSocket conectado')
+        setVoiceStatus('listening')
+        setTranscript([])
+        toast.success('Asistente de voz activado')
+      }
+
+      ws.onmessage = async (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          audioQueueRef.current.push(event.data)
+          setVoiceStatus('speaking')
+          processAudioQueue()
+        } else {
+          try {
+            const msg = JSON.parse(event.data)
+            
+            if (msg.type === 'field_update') {
+              setFieldUpdate(msg.data)
+            } else if (msg.type === 'product_complete') {
+              toast.success(`Producto ${msg.data.index + 1} registrado!`)
+              onProductsAdded([msg.data])
+              // NO cerrar el modal - esperar a all_complete
+            } else if (msg.type === 'transcription') {
+              // Agregar al transcript
+              setTranscript(prev => [...prev, {
+                id: Date.now(),
+                speaker: msg.speaker,
+                text: msg.text,
+                timestamp: new Date()
+              }])
+            } else if (msg.type === 'vad_metrics') {
+              setVadMetrics(msg)
+            } else if (msg.type === 'validation_warning') {
+              toast.warning(msg.message, { duration: 5000 })
+            } else if (msg.type === 'barge_in_ack') {
+              console.log('Barge-in confirmado por servidor')
+            } else if (msg.type === 'progress_update') {
+              setProgress(msg.data)
+            } else if (msg.type === 'queue_set') {
+              toast.success(msg.message)
+            } else if (msg.type === 'product_advanced') {
+              if (msg.data.status === 'next') {
+                toast.info(`Producto registrado. Faltan ${msg.data.remaining}`)
+              } else if (msg.data.status === 'all_done') {
+                toast.success('Todos los productos han sido registrados!')
+                setTimeout(() => {
+                  stopVoiceAgent()
+                  onClose()
+                }, 3000)
+              }
+            } else if (msg.type === 'product_regressed') {
+              setProgress(msg.data)
+              toast.info('Regresando al producto anterior')
+            } else if (msg.type === 'all_products_complete') {
+              toast.success('Todos los productos completados!')
+              setTimeout(() => {
+                stopVoiceAgent()
+                onClose()
+              }, 3000)
+            } else if (msg.type === 'silence_warning') {
+              toast.warning('¿Sigues ahí? Te estamos esperando...')
+            } else if (msg.type === 'silence_timeout') {
+              toast.error('Sesión cerrada por inactividad')
+              stopVoiceAgent()
+            } else if (msg.type === 'stt_low_confidence') {
+              toast.warning('No entendimos bien, ¿puedes repetir?')
+            } else if (msg.type === 'product_suggestion') {
+              if (msg.data && msg.data.autocompleted) {
+                const cat = msg.data.autocompleted.category || ''
+                const brand = msg.data.autocompleted.brand || ''
+                if (cat || brand) {
+                  toast.info(`Autocompletado: ${cat} / ${brand}`, { duration: 4000 })
+                }
+              }
+            } else if (msg.type === 'session_resumed') {
+              toast.info('Sesión anterior recuperada. Continuamos donde lo dejamos.')
+            } else if (msg.type === 'emotion_detected') {
+              setCurrentEmotion(msg.emotion)
+              setEmotionHistory(prev => [...prev, {
+                emotion: msg.emotion,
+                text: msg.text,
+                timestamp: new Date()
+              }])
+            } else if (msg.type === 'text') {
+              console.log('Texto del agente:', msg.content)
+            }
+          } catch (err) {
+            console.error('Error parsing JSON:', err)
+          }
+        }
+      }
+
+      ws.onerror = (err) => {
+        // Reconexión automática después de 3 segundos
+        setTimeout(() => {
+          if (voiceStatus === 'error' || voiceStatus === 'idle') {
+            console.log('Intentando reconectar...')
+            startVoiceAgent()
+          }
+        }, 3000)
+        console.error('WebSocket error:', err)
+        setVoiceStatus('error')
+        toast.error('Error de conexion con el asistente de voz')
+      }
+
+      ws.onclose = () => {
+        console.log('WebSocket cerrado')
+        setVoiceStatus('idle')
+      }
+
+      // Captura de audio con deteccion de barge-in
+      const audioContext = new AudioContext({ sampleRate: 16000 })
+      const source = audioContext.createMediaStreamSource(stream)
+      const processor = audioContext.createScriptProcessor(4096, 1, 1)
+      
+      processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0)
+        
+        // BARGE-IN: Detectar si el usuario interrumpe
+        detectBargeIn(inputData)
+        
+        // Enviar audio al servidor
+        if (ws.readyState === WebSocket.OPEN) {
+          const pcm16 = new Int16Array(inputData.length)
+          for (let i = 0; i < inputData.length; i++) {
+            pcm16[i] = Math.max(-32768, Math.min(32767, Math.round(inputData[i] * 32768)))
+          }
+          ws.send(pcm16.buffer)
+        }
+      }
+
+      source.connect(processor)
+      processor.connect(audioContext.destination)
+
+    } catch (err) {
+      console.error('Error iniciando voz:', err)
+      setVoiceStatus('error')
+      toast.error('No se pudo acceder al microfono')
+    }
+  }
+
+  const stopVoiceAgent = () => {
+    if (wsRef.current) {
+      wsRef.current.close()
+      wsRef.current = null
+    }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(t => t.stop())
+      mediaStreamRef.current = null
+    }
+    setVoiceStatus('idle')
+    setFieldUpdate(null)
+  }
+
+
+  // Auto-inicio del agente cuando hay productos escaneados
+  useEffect(() => {
+    if (scannedProducts.length > 0 && voiceStatus === 'idle') {
+      console.log('Auto-iniciando agente de voz con', scannedProducts.length, 'productos')
+      startVoiceAgent()
+    }
+  }, [scannedProducts])
+
+  const sendProductQueue = (products: ProductQueueItem[]) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      setProductQueue(products)
+      wsRef.current.send(JSON.stringify({
+        type: 'start_with_products',
+        products: products
+      }))
+      toast.success(`${products.length} productos cargados para registro por voz`)
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // FUNCIONES DE ESCANEO
+  // ═══════════════════════════════════════════════════════════
+  const generateSKU = (): string => {
+    const timestamp = Date.now().toString().slice(-6)
+    const random = Math.random().toString(36).substring(2, 5).toUpperCase()
+    return `CMP${timestamp}${random}`
+  }
+
+  const generateBarcode = (): string => {
+    let barcode = ''
+    for (let i = 0; i < 13; i++) {
+      barcode += Math.floor(Math.random() * 10)
+    }
+    return barcode
+  }
+
+  const handleAddProduct = () => {
+    const barcode = barcodeInput.trim()
+    if (!barcode) {
+      toast.error('Escribe o escanea un código de barras')
+      return
+    }
+    
+    // Verificar si ya existe
+    if (scannedItems.some(item => item.barcode === barcode)) {
+      toast.warning('Este código ya fue escaneado')
+      setBarcodeInput('')
+      barcodeInputRef.current?.focus()
+      return
+    }
+    
+    const newItem: ProductQueueItem = {
+      barcode: barcode,
+      sku: generateSKU(),
+      name: null,
+      category: null,
+      brand: null,
+      sale_price: null,
+      quantity: null
+    }
+    
+    setScannedItems(prev => [...prev, newItem])
+    setBarcodeInput('')
+    toast.success(`Producto agregado (${scannedItems.length + 1})`)
+    barcodeInputRef.current?.focus()
+  }
+
+  const handleRemoveProduct = (barcode: string) => {
+    setScannedItems(prev => prev.filter(item => item.barcode !== barcode))
+    toast.info('Producto eliminado')
+  }
+
+    const handleSaveAllProducts = async () => {
+    if (scannedItems.length === 0) {
+      toast.error('No hay productos para guardar')
+      return
+    }
+
+    // Iniciar el agente de voz si no está activo
+    if (voiceStatus === 'idle' || voiceStatus === 'error') {
+      console.log('Iniciando agente de voz con', scannedItems.length, 'productos')
+      await startVoiceAgent()
+      
+      // Esperar a que WebSocket esté conectado (máximo 3 segundos)
+      let attempts = 0
+      while (attempts < 30 && (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN)) {
+        await new Promise(resolve => setTimeout(resolve, 100))
+        attempts++
+      }
+      
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        console.log('WebSocket conectado, enviando productos al backend')
+        // Enviar lista al backend
+        sendProductQueue(scannedItems)
+        
+        // Cerrar panel automáticamente
+        setShowScanPanel(false)
+        toast.success(`${scannedItems.length} productos guardados. El agente continuará.`)
+      } else {
+        toast.error('No se pudo conectar con el agente de voz')
+      }
+    } else {
+      // Agente ya está activo, solo enviar productos
+      sendProductQueue(scannedItems)
+      setShowScanPanel(false)
+      toast.success(`${scannedItems.length} productos enviados al agente.`)
+    }
+  }
+
+  const handleKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      handleAddProduct()
+    }
+  }
+
+  const goToNextProduct = () => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'next_product' }))
+    }
+  }
+
+  const goToPreviousProduct = () => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'previous_product' }))
+    }
+  }
+
+  const handleEditField = (field: string, currentValue: string | null) => {
+    setEditingField(field)
+    setEditValue(currentValue || '')
+  }
+
+  const handleSaveEdit = () => {
+    if (!editingField || !fieldUpdate) return
+    
+    const updatedData = { ...fieldUpdate }
+    if (editingField === 'customer_name') {
+      updatedData.customer_name = editValue
+    } else {
+      updatedData.product_data = {
+        ...updatedData.product_data,
+        [editingField]: editValue
+      }
+    }
+    setFieldUpdate(updatedData)
+    setEditingField(null)
+    setEditValue('')
+    
+    toast.success('Campo actualizado')
+  }
+
+  useEffect(() => {
+    return () => {
+      stopVoiceAgent()
+    }
+  }, [])
+
+  if (!isOpen) return null
+
+  const statusConfig = {
+    idle: { color: 'bg-gray-500', icon: Mic, text: 'Iniciar Asistente de Voz' },
+    listening: { color: 'bg-red-500 animate-pulse', icon: Mic, text: 'Escuchando...' },
+    speaking: { color: 'bg-blue-500', icon: Volume2, text: 'Agente hablando...' },
+    error: { color: 'bg-red-700', icon: MicOff, text: 'Error de conexion' },
+  }
+
+  const { color, icon: StatusIcon, text } = statusConfig[voiceStatus]
+
+  const fieldLabels: Record<string, string> = {
+    name: 'Nombre del Producto',
+    category: 'Categoria',
+    brand: 'Marca',
+    sale_price: 'Precio de Venta',
+    quantity: 'Cantidad'
+  }
+
+  const formatValue = (field: string, value: any): string => {
+    if (!value) return '-'
+    if (field === 'sale_price') return `$${Number(value).toLocaleString('es-CO')}`
+    return String(value)
+  }
+
+  // Calcular altura de la barra VAD
+  const vadBarHeight = Math.min(100, (vadMetrics.rms / vadMetrics.threshold) * 50)
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+      <div className="bg-white rounded-lg shadow-xl max-w-6xl w-full mx-4 max-h-[95vh] overflow-hidden flex flex-col">
+        {/* Header */}
+        <div className="flex items-center justify-between p-4 border-b bg-white flex-shrink-0">
+          <div>
+            <h2 className="text-xl font-bold text-gray-800">
+              Escanear Productos por Lotes
+            </h2>
+            <p className="text-sm text-gray-600 mt-1">
+              Registra productos hablando con el asistente de voz
+            </p>
+          </div>
+          <button
+            onClick={() => { stopVoiceAgent(); onClose() }}
+            className="text-gray-400 hover:text-gray-600 transition-colors"
+          >
+            <X className="w-6 h-6" />
+          </button>
+        </div>
+
+        {/* Contenido principal */}
+        <div className="flex-1 overflow-y-auto p-4">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            
+            {/* COLUMNA IZQUIERDA: Controles y Campos */}
+            <div className="space-y-4">
+
+              {/* FASE 3: Indicador de emoción detectada */}
+              {voiceStatus !== 'idle' && currentEmotion !== 'neutral' && (
+                <div className={`rounded-lg p-3 mb-3 border-2 ${
+                  currentEmotion === 'happy' ? 'bg-green-50 border-green-300' :
+                  currentEmotion === 'frustrated' ? 'bg-yellow-50 border-yellow-300' :
+                  currentEmotion === 'angry' ? 'bg-red-50 border-red-300' :
+                  currentEmotion === 'confused' ? 'bg-blue-50 border-blue-300' :
+                  currentEmotion === 'urgent' ? 'bg-orange-50 border-orange-300' :
+                  'bg-gray-50 border-gray-300'
+                }`}>
+                  <div className="flex items-center gap-2">
+                    {currentEmotion === 'happy' && <Smile className="w-5 h-5 text-green-600" />}
+                    {currentEmotion === 'frustrated' && <Frown className="w-5 h-5 text-yellow-600" />}
+                    {currentEmotion === 'angry' && <Angry className="w-5 h-5 text-red-600" />}
+                    {currentEmotion === 'confused' && <HelpCircle className="w-5 h-5 text-blue-600" />}
+                    {currentEmotion === 'urgent' && <Zap className="w-5 h-5 text-orange-600" />}
+                    <div>
+                      <p className="text-xs font-semibold text-gray-700">
+                        Emoción detectada: <span className="capitalize">{currentEmotion}</span>
+                      </p>
+                      <p className="text-xs text-gray-600">
+                        El agente adaptará su tono según tu estado
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* PANEL DE ESCANEO AUTOMÁTICO */}
+              {showScanPanel && (
+                <div className="bg-gradient-to-br from-indigo-50 to-purple-50 rounded-xl p-4 border-2 border-indigo-400 mb-3">
+                  <div className="flex items-center justify-between mb-3">
+                    <h3 className="text-sm font-bold text-indigo-800 flex items-center gap-2">
+                      <ScanBarcode className="w-5 h-5 text-indigo-600" />
+                      Escanear Productos
+                    </h3>
+                    <button
+                      onClick={() => setShowScanPanel(false)}
+                      className="text-gray-400 hover:text-gray-600"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+
+                  {/* Input para escanear */}
+                  <div className="flex gap-2 mb-3">
+                    <input
+                      ref={barcodeInputRef}
+                      type="text"
+                      value={barcodeInput}
+                      onChange={(e) => setBarcodeInput(e.target.value)}
+                      onKeyPress={handleKeyPress}
+                      placeholder="Escanea o escribe el código de barras..."
+                      className="flex-1 px-3 py-2 border-2 border-indigo-300 rounded-lg text-sm focus:border-indigo-500 focus:outline-none"
+                      autoFocus
+                    />
+                    <button
+                      onClick={handleAddProduct}
+                      className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium flex items-center gap-1"
+                    >
+                      <Plus className="w-4 h-4" />
+                      Agregar
+                    </button>
+                  </div>
+
+                  {/* Lista de productos escaneados */}
+                  {scannedItems.length > 0 ? (
+                    <div className="mb-3">
+                      <div className="max-h-48 overflow-y-auto bg-white rounded-lg border border-indigo-200">
+                        {scannedItems.map((item, idx) => (
+                          <div
+                            key={item.barcode}
+                            className="flex items-center justify-between p-2 border-b border-indigo-100 last:border-b-0 hover:bg-indigo-50"
+                          >
+                            <div className="flex-1">
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs font-bold text-indigo-600 bg-indigo-100 px-2 py-0.5 rounded">
+                                  #{idx + 1}
+                                </span>
+                                <span className="text-sm font-mono text-gray-800">
+                                  {item.barcode}
+                                </span>
+                              </div>
+                              <div className="text-xs text-gray-500 mt-0.5 ml-1">
+                                SKU: {item.sku}
+                              </div>
+                            </div>
+                            <button
+                              onClick={() => handleRemoveProduct(item.barcode)}
+                              className="text-red-500 hover:text-red-700 p-1"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-center py-4 text-gray-500 text-sm mb-3">
+                      <ScanBarcode className="w-8 h-8 mx-auto mb-1 opacity-50" />
+                      <p>No hay productos escaneados</p>
+                      <p className="text-xs mt-1">Usa el escáner o escribe el código arriba</p>
+                    </div>
+                  )}
+
+                  {/* Botón Guardar */}
+                  <button
+                    onClick={handleSaveAllProducts}
+                    disabled={scannedItems.length === 0}
+                    className="w-full py-3 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 disabled:from-gray-300 disabled:to-gray-400 disabled:cursor-not-allowed text-white rounded-lg font-semibold flex items-center justify-center gap-2 transition-all"
+                  >
+                    <Save className="w-5 h-5" />
+                    {scannedItems.length > 0
+                      ? `Guardar ${scannedItems.length} Producto${scannedItems.length > 1 ? 's' : ''}`
+                      : 'Sin productos para guardar'}
+                  </button>
+                </div>
+              )}
+
+              {/* Botón de Voz */}
+              <button
+                onClick={voiceStatus === 'idle' || voiceStatus === 'error' ? startVoiceAgent : stopVoiceAgent}
+                className={`w-full py-4 rounded-xl font-semibold text-white transition-all flex items-center justify-center gap-3 ${
+                  voiceStatus === 'idle' || voiceStatus === 'error'
+                    ? 'bg-gradient-to-r from-purple-600 to-blue-600 hover:from-purple-700 hover:to-blue-700'
+                    : 'bg-red-500 hover:bg-red-600'
+                }`}
+              >
+                <StatusIcon className={`w-6 h-6 ${voiceStatus === 'listening' ? 'animate-pulse' : ''}`} />
+                {text}
+              </button>
+              {/* FASE 3: Botón de reanudar sesión */}
+              {hasActiveSession && voiceStatus === 'idle' && (
+                <div className="bg-blue-50 border-2 border-blue-300 rounded-lg p-3 mb-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Activity className="w-5 h-5 text-blue-600" />
+                      <div>
+                        <p className="text-sm font-semibold text-blue-800">
+                          Sesión anterior disponible
+                        </p>
+                        <p className="text-xs text-blue-600">
+                          Continúa donde lo dejaste
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+
+              {/* Visualizador VAD */}
+              {voiceStatus !== 'idle' && (
+                <div className="bg-gray-50 rounded-lg p-3 border">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Activity className="w-4 h-4 text-blue-600" />
+                    <span className="text-xs font-semibold text-gray-700">
+                      Detector de Voz (VAD)
+                    </span>
+                    {vadMetrics.is_voice && (
+                      <span className="text-xs bg-green-500 text-white px-2 py-0.5 rounded-full animate-pulse">
+                        VOZ
+                      </span>
+                    )}
+                  </div>
+                  <div className="h-16 bg-white rounded border flex items-end overflow-hidden">
+                    <div 
+                      className={`w-full transition-all duration-100 ${
+                        vadMetrics.is_voice ? 'bg-green-500' : 'bg-gray-300'
+                      }`}
+                      style={{ height: `${vadBarHeight}%` }}
+                    />
+                  </div>
+                  <div className="flex justify-between text-xs text-gray-500 mt-1">
+                    <span>RMS: {vadMetrics.rms.toFixed(0)}</span>
+                    <span>Umbral: {vadMetrics.threshold}</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Campos en Tiempo Real */}
+              {fieldUpdate && (
+                <div className="bg-gradient-to-br from-blue-50 to-purple-50 rounded-xl p-4 border-2 border-blue-200">
+                  <h3 className="text-sm font-bold text-gray-800 mb-3 flex items-center gap-2">
+                    <CheckCircle className="w-4 h-4 text-green-600" />
+                    Datos del Producto
+                  </h3>
+
+                  {fieldUpdate.customer_name && (
+                    <div className="mb-3 pb-3 border-b border-blue-200">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="text-xs text-gray-500 uppercase">Cliente</p>
+                          <p className="text-base font-semibold text-gray-800">
+                            {fieldUpdate.customer_name}
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => handleEditField('customer_name', fieldUpdate.customer_name)}
+                          className="text-blue-600 hover:text-blue-800 p-1"
+                        >
+                          <Edit3 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 gap-2">
+                    {Object.entries(fieldUpdate.product_data).map(([field, value]) => {
+                      const isCurrent = fieldUpdate.current_field === field
+                      const hasValue = value !== null && value !== undefined
+                      
+                      return (
+                        <div
+                          key={field}
+                          className={`p-3 rounded-lg border-2 transition-all ${
+                            isCurrent 
+                              ? 'border-purple-500 bg-purple-50 shadow-md' 
+                              : hasValue 
+                                ? 'border-green-300 bg-green-50' 
+                                : 'border-gray-200 bg-white'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between mb-1">
+                            <p className="text-xs text-gray-500 uppercase font-medium">
+                              {fieldLabels[field]}
+                            </p>
+                            {isCurrent && (
+                              <span className="text-xs bg-purple-500 text-white px-2 py-0.5 rounded-full animate-pulse">
+                                Actual
+                              </span>
+                            )}
+                            {hasValue && !isCurrent && (
+                              <CheckCircle className="w-4 h-4 text-green-600" />
+                            )}
+                          </div>
+                          
+                          {editingField === field ? (
+                            <div className="flex gap-2">
+                              <input
+                                type={field === 'sale_price' || field === 'quantity' ? 'number' : 'text'}
+                                value={editValue}
+                                onChange={(e) => setEditValue(e.target.value)}
+                                className="flex-1 px-2 py-1 border border-gray-300 rounded text-sm"
+                                autoFocus
+                              />
+                              <button
+                                onClick={handleSaveEdit}
+                                className="px-2 py-1 bg-green-500 text-white rounded text-sm"
+                              >
+                                OK
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="flex items-center justify-between">
+                              <p className={`text-sm font-semibold ${
+                                hasValue ? 'text-gray-800' : 'text-gray-400 italic'
+                              }`}>
+                                {formatValue(field, value)}
+                              </p>
+                              {hasValue && (
+                                <button
+                                  onClick={() => handleEditField(field, value as string)}
+                                  className="text-blue-600 hover:text-blue-800 p-1"
+                                >
+                                  <Edit3 className="w-3 h-3" />
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+
+                  {fieldUpdate.state === 'confirming' && (
+                    <div className="mt-3 p-3 bg-yellow-50 border-2 border-yellow-300 rounded-lg">
+                      <p className="text-xs font-semibold text-yellow-800 flex items-center gap-2">
+                        <Volume2 className="w-3 h-3" />
+                        Esperando tu confirmacion. Responde "si" o "no".
+                      </p>
+                    </div>
+                  )}
+
+                  {fieldUpdate.state === 'complete' && (
+                    <div className="mt-3 p-3 bg-green-50 border-2 border-green-300 rounded-lg">
+                      <p className="text-xs font-semibold text-green-800 flex items-center gap-2">
+                        <CheckCircle className="w-3 h-3" />
+                        Producto registrado exitosamente!
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* COLUMNA DERECHA: Transcripción */}
+            <div className="flex flex-col">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-sm font-bold text-gray-800 flex items-center gap-2">
+                  <MessageCircle className="w-4 h-4 text-blue-600" />
+                  Conversacion en Vivo
+                </h3>
+                <button
+                  onClick={() => setShowTranscript(!showTranscript)}
+                  className="text-xs text-blue-600 hover:text-blue-800"
+                >
+                  {showTranscript ? 'Ocultar' : 'Mostrar'}
+                </button>
+              </div>
+
+
+              {/* FASE 3: Historial de emociones */}
+              {emotionHistory.length > 0 && (
+                <div className="bg-gray-50 rounded-lg p-3 mb-3 border">
+                  <p className="text-xs font-semibold text-gray-700 mb-2 flex items-center gap-1">
+                    <Heart className="w-3 h-3" />
+                    Historial de emociones ({emotionHistory.length})
+                  </p>
+                  <div className="flex flex-wrap gap-1">
+                    {emotionHistory.slice(-10).map((entry, idx) => (
+                      <span
+                        key={idx}
+                        className={`text-xs px-2 py-1 rounded-full ${
+                          entry.emotion === 'happy' ? 'bg-green-200 text-green-800' :
+                          entry.emotion === 'frustrated' ? 'bg-yellow-200 text-yellow-800' :
+                          entry.emotion === 'angry' ? 'bg-red-200 text-red-800' :
+                          entry.emotion === 'confused' ? 'bg-blue-200 text-blue-800' :
+                          entry.emotion === 'urgent' ? 'bg-orange-200 text-orange-800' :
+                          'bg-gray-200 text-gray-800'
+                        }`}
+                        title={entry.text}
+                      >
+                        {entry.emotion}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {showTranscript && (
+                <div className="flex-1 bg-gray-50 rounded-lg border p-3 overflow-y-auto max-h-[500px] min-h-[400px]">
+                  {transcript.length === 0 ? (
+                    <div className="flex items-center justify-center h-full text-gray-400 text-sm">
+                      <div className="text-center">
+                        <MessageCircle className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                        <p>La conversacion aparecera aqui</p>
+                        <p className="text-xs mt-1">Inicia el asistente para comenzar</p>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {transcript.map((entry) => (
+                        <div
+                          key={entry.id}
+                          className={`flex ${entry.speaker === 'user' ? 'justify-end' : 'justify-start'}`}
+                        >
+                          <div
+                            className={`max-w-[80%] rounded-lg px-3 py-2 ${
+                              entry.speaker === 'user'
+                                ? 'bg-blue-500 text-white'
+                                : 'bg-white border border-gray-200 text-gray-800'
+                            }`}
+                          >
+                            <div className="flex items-center gap-2 mb-1">
+                              <span className="text-xs font-semibold opacity-75">
+                                {entry.speaker === 'user' ? 'Tu' : 'Agente'}
+                              </span>
+                              <span className="text-xs opacity-50">
+                                {entry.timestamp.toLocaleTimeString('es-CO', { 
+                                  hour: '2-digit', 
+                                  minute: '2-digit',
+                                  second: '2-digit'
+                                })}
+                              </span>
+                            </div>
+                            <p className="text-sm">{entry.text}</p>
+                          </div>
+                        </div>
+                      ))}
+                      <div ref={transcriptEndRef} />
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Instrucciones */}
+              {voiceStatus === 'idle' && !fieldUpdate && (
+                <div className="mt-4 bg-gray-50 rounded-lg p-4">
+                  <h4 className="text-sm font-semibold text-gray-800 mb-2">
+                    Como funciona?
+                  </h4>
+                  <ol className="text-xs text-gray-600 space-y-1">
+                    <li>1. Haz clic en "Iniciar Asistente de Voz"</li>
+                    <li>2. Permite el acceso al microfono</li>
+                    <li>3. El agente te preguntara tu nombre</li>
+                    <li>4. Responde las preguntas sobre el producto</li>
+                    <li>5. Confirma los datos al final</li>
+                  </ol>
+                  <p className="text-xs text-gray-500 mt-2 italic">
+                    Puedes interrumpir al agente en cualquier momento hablando.
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="flex justify-end gap-3 p-4 border-t bg-gray-50 flex-shrink-0">
+          <button
+            onClick={() => { stopVoiceAgent(); onClose() }}
+            className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-100 transition-colors text-sm"
+          >
+            Cancelar
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}

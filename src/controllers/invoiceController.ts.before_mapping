@@ -1,0 +1,106 @@
+import { Request, Response } from 'express';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+function extractParam(param: any): string {
+  if (Array.isArray(param)) return param[0] || '';
+  return String(param || '');
+}
+
+export async function listInvoicesHandler(req: Request, res: Response) {
+  try {
+    const page = Math.max(1, parseInt(extractParam((req.query as any).page) || '1'));
+    const limit = Math.min(50, parseInt(extractParam((req.query as any).limit) || '20'));
+    const customerId = extractParam((req.query as any).customerId);
+
+    const where: any = {};
+    if (customerId) where.customerId = customerId;
+
+    const [invoices, total] = await Promise.all([
+      prisma.sale.findMany({
+        where, skip: (page - 1) * limit, take: limit, orderBy: { createdAt: 'desc' },
+        include: {
+          customer: { select: { id: true, name: true } },
+          items: { select: { id: true, quantity: true, unitPrice: true, lineTotal: true, productNameSnapshot: true } },
+        },
+      }),
+      prisma.sale.count({ where }),
+    ]);
+
+    const formatted = invoices.map((sale: any) => ({
+      id: sale.id, invoiceNumber: sale.saleNumber,
+      issuedAt: sale.createdAt?.toISOString?.() ?? sale.createdAt,
+      total: Number(sale.totalAmount),
+      status: sale.status === 'COMPLETED' ? 'EMITIDA' : sale.status === 'CANCELLED' ? 'ANULADA' : 'PENDIENTE',
+      customer: sale.customer ? { id: sale.customer.id, name: sale.customer.name } : null,
+      items: (sale.items || []).map((item: any) => ({
+        id: item.id, quantity: item.quantity, unitPrice: Number(item.unitPrice), lineTotal: Number(item.lineTotal)
+      })),
+      paymentMethod: sale.paymentMethod, notes: sale.notes,
+      createdAt: sale.createdAt?.toISOString?.() ?? sale.createdAt,
+      updatedAt: sale.updatedAt?.toISOString?.() ?? sale.updatedAt,
+    }));
+
+    return res.json({ invoices: formatted, total: Number(total), page, limit, totalPages: Math.ceil(Number(total) / limit) });
+  } catch (err: any) {
+    logger.error('[InvoiceController] listInvoices error:', err);
+    return res.status(500).json({ error: 'Error al listar facturas' });
+  }
+}
+
+export async function getInvoiceHandler(req: Request, res: Response) {
+  try {
+    const id = extractParam(req.params.id);
+    const sale = await prisma.sale.findUnique({
+      where: { id },
+      include: {
+        customer: { select: { id: true, name: true, phone: true, email: true } },
+        items: { select: { id: true, quantity: true, unitPrice: true, lineTotal: true, productNameSnapshot: true } },
+      },
+    });
+    if (!sale) return res.status(404).json({ error: 'Factura no encontrada' });
+    return res.json({
+      id: sale.id, invoiceNumber: sale.saleNumber, issuedAt: sale.createdAt?.toISOString?.() ?? sale.createdAt,
+      total: Number(sale.totalAmount), status: sale.status, customer: sale.customer,
+      items: (sale.items || []).map((item: any) => ({
+        id: item.id, quantity: item.quantity, unitPrice: Number(item.unitPrice), lineTotal: Number(item.lineTotal)
+      })),
+      paymentMethod: sale.paymentMethod, notes: sale.notes,
+    });
+  } catch (err: any) {
+    logger.error('[InvoiceController] getInvoice error:', err);
+    return res.status(500).json({ error: 'Error al obtener factura' });
+  }
+}
+
+export async function cancelInvoiceHandler(req: Request, res: Response) {
+  try {
+    const id = extractParam(req.params.id);
+    const sale = await prisma.sale.update({ where: { id }, data: { status: 'CANCELLED' } });
+    return res.json({ success: true, sale });
+  } catch (err: any) {
+    logger.error('[InvoiceController] cancelInvoice error:', err);
+    return res.status(500).json({ error: 'Error al anular factura' });
+  }
+}
+
+export async function getCompanyConfigHandler(req: Request, res: Response) {
+  try {
+    const config = await prisma.businessConfig.findUnique({ where: { id: 'main' } });
+    if (!config) return res.status(404).json({ error: 'Configuración no encontrada' });
+    return res.json(config);
+  } catch (err: any) {
+    logger.error('[InvoiceController] getConfig error:', err);
+    return res.status(500).json({ error: 'Error al obtener configuración' });
+  }
+}
+
+export async function updateCompanyConfigHandler(req: Request, res: Response) {
+  try {
+    const config = await prisma.businessConfig.update({ where: { id: 'main' }, data: req.body });
+    return res.json(config);
+  } catch (err: any) {
+    logger.error('[InvoiceController] updateConfig error:', err);
+    return res.status(500).json({ error: 'Error al actualizar configuración' });
+  }
+}

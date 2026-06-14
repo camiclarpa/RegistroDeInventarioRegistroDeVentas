@@ -1,0 +1,358 @@
+/**
+ * purchaseService.ts — Módulo 4: Recepción Física de Mercancía (Entradas)
+ */
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+import { generateSKU } from '../utils/skuGenerator';
+import type { RegisterEntryInput, ListEntriesQuery } from '../utils/validators';
+
+// ─── Tipos internos ───────────────────────────────────────────────────────────
+
+type EntryTx = any;
+
+interface MinProduct {
+  id: string;
+  name: string;
+  skuInternal: string;
+  costPriceAvg: number;
+  stockQuantity: number;
+}
+
+interface ResolvedItem {
+  quantity: number;
+  unitCost: number;
+  notes: string | undefined;
+  name: string | undefined;
+  brandId: string | undefined;
+  categoryId: string | undefined;
+  partNumberOEM: string | undefined;
+  barcodeExternal: string | undefined;
+  skuInternal: string | undefined;
+  existingProductId: string | null;
+  generatedSku: string | null;
+}
+
+export interface EntryResultItem {
+  productId: string;
+  skuInternal: string;
+  name: string;
+  quantity: number;
+  unitCost: number;
+  previousCost: number;
+  newWac: number;
+  previousStock: number;
+  newStock: number;
+  lineValue: number;
+  wasCreated: boolean;
+}
+
+export interface EntryResult {
+  entryNumber: string;
+  date: string;
+  itemsProcessed: number;
+  totalValue: number;
+  notes: string | null;
+  items: EntryResultItem[];
+}
+
+export interface EntryListRow {
+  entryNumber: string;
+  date: Date;
+  itemCount: number;
+  totalQty: number;
+  totalValue: number;
+  performedByUserId: string | null;
+}
+
+export interface EntryDetail {
+  entryNumber: string;
+  date: Date;
+  performedByUserId: string | null;
+  itemCount: number;
+  totalQty: number;
+  totalValue: number;
+  items: Array<{
+    movementId: string;
+    productId: string;
+    product: any;
+    quantity: number;
+    unitCost: number;
+    lineValue: number;
+    reason: string | null;
+  }>;
+}
+
+function _calcSalePrice(marginPercentage: number, costPrice: number): number {
+  const margin = marginPercentage / 100;
+  if (margin >= 1) return parseFloat((costPrice * 2).toFixed(2));
+  return parseFloat((costPrice / (1 - margin)).toFixed(2));
+}
+
+function calculateWeightedAverageCost(currentStock: number, currentCost: number, newQty: number, newCost: number): number {
+  if (currentStock + newQty === 0) return newCost;
+  return (currentStock * currentCost + newQty * newCost) / (currentStock + newQty);
+}
+
+async function generateEntryNumber(): Promise<string> {
+  const year = new Date().getFullYear();
+  const prefix = `ENT-${year}-`;
+  const last = await prisma.inventory_movements.findFirst({
+    where: { referenceDoc: { startsWith: prefix }, type: 'ENTRY' },
+    orderBy: { referenceDoc: 'desc' },
+    select: { referenceDoc: true },
+  });
+  const lastSeq = last?.referenceDoc
+    ? parseInt(last.referenceDoc.split('-').at(-1) ?? '0', 10) || 0
+    : 0;
+  return `${prefix}${String(lastSeq + 1).padStart(5, '0')}`;
+}
+
+async function preResolveItems(items: RegisterEntryInput['items']): Promise<ResolvedItem[]> {
+  return Promise.all(items.map(async (item) => {
+    let existingProductId: string | null = null;
+
+    if (item.productId) {
+      const p = await prisma.products.findUnique({ where: { id: item.productId }, select: { id: true } });
+      if (!p) throw new Error(`Producto con id "${item.productId}" no encontrado.`);
+      existingProductId = p.id;
+    } else if (item.skuInternal) {
+      const p = await prisma.products.findUnique({ where: { skuInternal: item.skuInternal }, select: { id: true } });
+      if (p) existingProductId = p.id;
+    } else if (item.barcodeExternal) {
+      const p = await prisma.products.findFirst({ where: { barcodeExternal: item.barcodeExternal }, select: { id: true } });
+      if (p) existingProductId = p.id;
+    }
+
+    let generatedSku: string | null = null;
+    if (!existingProductId) {
+      if (!item.nameCommercial || !item.brandId || !item.categoryId) {
+        throw new Error(`Producto no encontrado. Para crear uno nuevo proporcionar name, brandId y categoryId.`);
+      }
+      if (!item.skuInternal) {
+        generatedSku = await generateSKU(item.brandId, item.categoryId, prisma);
+      }
+    }
+
+    return {
+      quantity: item.quantity,
+      unitCost: item.unitCost,
+      notes: item.notes,
+      name: item.nameCommercial,
+      brandId: item.brandId,
+      categoryId: item.categoryId,
+      partNumberOEM: item.partNumberOEM,
+      barcodeExternal: item.barcodeExternal,
+      skuInternal: item.skuInternal,
+      existingProductId,
+      generatedSku,
+    };
+  }));
+}
+
+async function createProductInTx(tx: EntryTx, item: ResolvedItem): Promise<MinProduct> {
+  const skuToUse = item.skuInternal ?? item.generatedSku!;
+  const category = await tx.categories.findUnique({
+    where: { id: item.categoryId! },
+    select: { marginPercentage: true },
+  });
+  if (!category) throw new Error(`Categoría con id "${item.categoryId}" no existe.`);
+  const margin = Number(category.marginPercentage);
+  const salePriceBase = _calcSalePrice(margin, item.unitCost);
+
+  const product = await tx.products.create({
+    data: {
+      skuInternal: skuToUse,
+      barcodeExternal: item.barcodeExternal ?? null,
+      partNumberOEM: item.partNumberOEM ?? item.name!,
+      brandId: item.brandId!,
+      categoryId: item.categoryId!,
+      nameCommercial: item.name!,
+      costPriceAvg: item.unitCost,
+      salePriceBase: salePriceBase,
+      taxRate: 19,
+      stockQuantity: 0,
+      minStockLevel: 5,
+      locationBin: 'SIN-UBICACION',
+      isActive: true,
+    } as any,
+  });
+
+  return {
+    id: product.id,
+    name: product.nameCommercial,
+    skuInternal: product.skuInternal,
+    costPriceAvg: Number(product.costPriceAvg),
+    stockQuantity: product.stockQuantity,
+  };
+}
+
+export async function processEntryTransaction(data: RegisterEntryInput, userId: string): Promise<EntryResult> {
+  logger.info('[purchaseService] Starting entry transaction', { userId, itemCount: data.items.length });
+
+  const resolved = await preResolveItems(data.items);
+
+  const result = await prisma.$transaction(async (rawTx) => {
+    const tx = rawTx as EntryTx;
+    const entryNumber = await generateEntryNumber();
+
+    const items: EntryResultItem[] = [];
+    let totalValueCents = 0;
+
+    for (const item of resolved) {
+      let product: MinProduct;
+      let wasCreated = false;
+
+      if (item.existingProductId) {
+        const p = await tx.products.findUniqueOrThrow({
+          where: { id: item.existingProductId },
+          select: { id: true, nameCommercial: true, skuInternal: true, costPriceAvg: true, stockQuantity: true },
+        });
+        product = {
+          id: p.id,
+          name: p.nameCommercial,
+          skuInternal: p.skuInternal,
+          costPriceAvg: Number(p.costPriceAvg),
+          stockQuantity: p.stockQuantity,
+        };
+      } else {
+        product = await createProductInTx(tx, item);
+        wasCreated = true;
+      }
+
+      const prevStock = product.stockQuantity;
+      const prevCost = product.costPriceAvg;
+      const newWac = calculateWeightedAverageCost(prevStock, prevCost, item.quantity, item.unitCost);
+      const newStock = prevStock + item.quantity;
+
+      await tx.products.update({
+        where: { id: product.id },
+        data: { stockQuantity: newStock, costPriceAvg: newWac },
+      });
+
+      await tx.inventory_movements.create({
+        data: {
+          productId: product.id,
+          type: 'ENTRY',
+          quantity: item.quantity,
+          unitCostAtMoment: item.unitCost,
+          referenceDoc: entryNumber,
+          reason: item.notes ?? `ENTRADA-${entryNumber}`,
+          performedByUserId: userId,
+        } as any,
+      });
+
+      const lineCents = Math.round(item.quantity * item.unitCost * 100);
+      totalValueCents += lineCents;
+
+      items.push({
+        productId: product.id,
+        skuInternal: product.skuInternal,
+        name: product.name,
+        quantity: item.quantity,
+        unitCost: item.unitCost,
+        previousCost: prevCost,
+        newWac,
+        previousStock: prevStock,
+        newStock,
+        lineValue: Math.round(lineCents) / 100,
+        wasCreated,
+      });
+    }
+
+    const totalValue = Math.round(totalValueCents) / 100;
+
+    return {
+      entryNumber,
+      date: new Date().toISOString(),
+      itemsProcessed: items.length,
+      totalValue,
+      notes: data.notes ?? null,
+      items,
+    };
+  });
+
+  return result;
+}
+
+export async function getAllEntries(query: ListEntriesQuery): Promise<{
+  data: EntryListRow[];
+  meta: { total: number; page: number; limit: number; totalPages: number };
+}> {
+  const { page, limit, startDate, endDate } = query;
+  const skip = (page - 1) * limit;
+  const start = startDate ? new Date(startDate) : new Date('2000-01-01');
+  const end = endDate ? new Date(endDate) : new Date('2100-12-31');
+
+  const rows = await prisma.$queryRaw<any[]>`
+    SELECT
+      im."referenceDoc" AS "entryNumber",
+      MIN(im."timestamp") AS date,
+      COUNT(DISTINCT im."productId")::int AS "itemCount",
+      SUM(im."quantity")::int AS "totalQty",
+      ROUND(SUM(im."quantity" * im."unitCostAtMoment"), 2) AS "totalValue",
+      MAX(im."performedByUserId") AS "performedByUserId"
+    FROM inventory_movements im
+    WHERE im."referenceDoc" LIKE ${'ENT-%'}
+      AND im."type" = 'ENTRY'
+      AND im."timestamp" >= ${start}
+      AND im."timestamp" <= ${end}
+    GROUP BY im."referenceDoc"
+    ORDER BY MIN(im."timestamp") DESC
+    LIMIT ${limit} OFFSET ${skip}
+  `;
+
+  const countResult = await prisma.$queryRaw<any[]>`
+    SELECT COUNT(DISTINCT im."referenceDoc") AS count
+    FROM inventory_movements im
+    WHERE im."referenceDoc" LIKE ${'ENT-%'}
+      AND im."type" = 'ENTRY'
+      AND im."timestamp" >= ${start}
+      AND im."timestamp" <= ${end}
+  `;
+
+  const total = Number(countResult[0]?.count ?? 0);
+
+  return {
+    data: rows.map(r => ({
+      entryNumber: r.entryNumber,
+      date: r.date,
+      itemCount: Number(r.itemCount),
+      totalQty: Number(r.totalQty),
+      totalValue: Number(r.totalValue),
+      performedByUserId: r.performedByUserId,
+    })),
+    meta: { total, page, limit, totalPages: Math.ceil(total / limit) },
+  };
+}
+
+export async function getEntryById(entryNumber: string): Promise<EntryDetail | null> {
+  const movements = await prisma.inventory_movements.findMany({
+    where: { referenceDoc: entryNumber, type: 'ENTRY' },
+    include: { products: true },
+    orderBy: { timestamp: 'asc' },
+  });
+
+  if (!movements.length) return null;
+
+  const totalQty = movements.reduce((s, m) => s + m.quantity, 0);
+  const totalValue = Math.round(movements.reduce((s, m) => s + m.quantity * Number(m.unitCostAtMoment), 0) * 100) / 100;
+
+  return {
+    entryNumber,
+    date: movements[0].timestamp,
+    performedByUserId: movements[0].performedByUserId,
+    itemCount: movements.length,
+    totalQty,
+    totalValue,
+    items: movements.map(m => ({
+      movementId: m.id,
+      productId: m.productId,
+      product: m.products,
+      quantity: m.quantity,
+      unitCost: Number(m.unitCostAtMoment),
+      lineValue: Math.round(m.quantity * Number(m.unitCostAtMoment) * 100) / 100,
+      reason: m.reason ?? null,
+    })),
+  };
+}
+

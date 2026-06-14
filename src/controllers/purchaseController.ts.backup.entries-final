@@ -1,0 +1,400 @@
+import { Request, Response } from 'express';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+import { Prisma } from '@prisma/client';
+
+const ok = (res: Response, data: unknown, status = 200) =>
+  res.status(status).json({ success: true, data });
+
+const fail = (res: Response, error: string, status = 400) =>
+  res.status(status).json({ success: false, error });
+
+// ─── GET /api/v1/purchases/orders ────────────────────────────────────────
+export async function listPurchaseOrdersHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const { page = 1, limit = 20, status, supplierId } = req.query;
+    
+    const where: Prisma.PurchaseOrderWhereInput = {};
+    if (status && status !== '') where.status = status as any;
+    if (supplierId && supplierId !== '') where.supplierId = supplierId as string;
+
+    const [data, total] = await prisma.$transaction([
+      prisma.purchaseOrder.findMany({
+        where,
+        include: { supplier: { select: { id: true, name: true } }, items: { include: { product: { select: { id: true, name: true, skuInternal: true } } } } },
+        orderBy: { createdAt: 'desc' },
+        skip: (Number(page) - 1) * Number(limit),
+        take: Number(limit),
+      }),
+      prisma.purchaseOrder.count({ where }),
+    ]);
+
+    return ok(res, { data, total, totalPages: Math.ceil(total / Number(limit)) });
+  } catch (err) {
+    logger.error('[purchaseController] listPurchaseOrdersHandler', err);
+    return fail(res, 'Error al obtener órdenes de compra', 500);
+  }
+}
+
+// ─── GET /api/v1/purchases/orders/:id ────────────────────────────────────
+export async function getPurchaseOrderByIdHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const { id } = req.params;
+    const order = await prisma.purchaseOrder.findUnique({
+      where: { id },
+      include: { 
+        supplier: true, 
+        items: { include: { product: true } },
+        accountPayable: true 
+      }
+    });
+    if (!order) return fail(res, 'Orden de compra no encontrada', 404);
+    return ok(res, order);
+  } catch (err) {
+    logger.error('[purchaseController] getPurchaseOrderByIdHandler', err);
+    return fail(res, 'Error al obtener orden de compra', 500);
+  }
+}
+
+// ─── POST /api/v1/purchases/orders ───────────────────────────────────────
+export async function createPurchaseOrderHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const { supplierId, items, expectedDate, notes } = req.body;
+    const userId = (req.user as any)?.id;
+
+    if (!supplierId || !items?.length) {
+      return fail(res, 'Proveedor y al menos un ítem son requeridos', 400);
+    }
+
+    // Calcular totales
+    const subtotal = items.reduce((sum: number, item: any) => sum + (Number(item.quantity) * Number(item.unitCost)), 0);
+    const taxAmount = subtotal * 0.19; // IVA 19%
+    const totalAmount = subtotal + taxAmount;
+
+    // Generar orderNumber único
+    const lastOrder = await prisma.purchaseOrder.findFirst({ orderBy: { createdAt: 'desc' } });
+    const num = lastOrder ? parseInt(lastOrder.orderNumber.split('-').pop() || '0') + 1 : 1;
+    const orderNumber = `OC-${new Date().getFullYear()}-${String(num).padStart(5, '0')}`;
+
+    const order = await prisma.purchaseOrder.create({
+      data: {
+        orderNumber,
+        supplierId,
+        userId,
+        status: 'PENDING',
+        subtotal,
+        taxAmount,
+        totalAmount,
+        expectedDate: expectedDate ? new Date(expectedDate) : null,
+        notes,
+        items: {
+          create: items.map((item: any) => ({
+            productId: item.productId,
+            quantity: Number(item.quantity),
+            unitCost: Number(item.unitCost),
+            subtotal: Number(item.quantity) * Number(item.unitCost),
+          })),
+        },
+      },
+      include: { supplier: true, items: { include: { product: true } } }
+    });
+
+    return ok(res, order, 201);
+  } catch (err) {
+    logger.error('[purchaseController] createPurchaseOrderHandler', err);
+    return fail(res, 'Error al crear orden de compra', 500);
+  }
+}
+
+// ─── POST /api/v1/purchases/orders/:id/receive ───────────────────────────
+export async function receivePurchaseOrderHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const { id } = req.params;
+    const { items } = req.body; // [{ purchaseOrderItemId, quantityReceived }]
+
+    const order = await prisma.purchaseOrder.findUnique({
+      where: { id },
+      include: { items: true }
+    });
+    if (!order) return fail(res, 'Orden no encontrada', 404);
+    if (order.status !== 'PENDING') return fail(res, 'Solo órdenes pendientes pueden recibirse', 400);
+
+    // Actualizar stock de productos y marcar orden como recibida
+    await prisma.$transaction(async (tx) => {
+      for (const item of items) {
+        const orderItem = order.items.find(oi => oi.id === item.purchaseOrderItemId);
+        if (orderItem) {
+          await tx.product.update({
+            where: { id: orderItem.productId },
+            data: { stockQuantity: { increment: Number(item.quantityReceived || orderItem.quantity) } }
+          });
+        }
+      }
+      await tx.purchaseOrder.update({
+        where: { id },
+        data: { status: 'RECEIVED', receivedDate: new Date() }
+      });
+    });
+
+    const updated = await prisma.purchaseOrder.findUnique({
+      where: { id },
+      include: { supplier: true, items: { include: { product: true } } }
+    });
+
+    return ok(res, updated);
+  } catch (err) {
+    logger.error('[purchaseController] receivePurchaseOrderHandler', err);
+    return fail(res, 'Error al recibir orden de compra', 500);
+  }
+}
+
+// ─── POST /api/v1/purchases/orders/:id/cancel ────────────────────────────
+export async function cancelPurchaseOrderHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const { id } = req.params;
+    const order = await prisma.purchaseOrder.findUnique({ where: { id } });
+    if (!order) return fail(res, 'Orden no encontrada', 404);
+    if (order.status !== 'PENDING') return fail(res, 'Solo órdenes pendientes pueden cancelarse', 400);
+
+    const updated = await prisma.purchaseOrder.update({
+      where: { id },
+      data: { status: 'CANCELLED' },
+      include: { supplier: true, items: { include: { product: true } } }
+    });
+
+    return ok(res, updated);
+  } catch (err) {
+    logger.error('[purchaseController] cancelPurchaseOrderHandler', err);
+    return fail(res, 'Error al cancelar orden de compra', 500);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ENTRADAS DE MERCANCÍA (ENTRIES) - Módulo de Recepción Física
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/v1/purchases/entries
+ * Registra una entrada de mercancía al almacén.
+ * Actualiza stock, recalcula WAC, crea movimientos de inventario.
+ */
+export async function registerEntryHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const { purchaseOrderId, items, notes, entryDate } = req.body;
+    const userId = (req.user as any)?.id;
+
+    if (!purchaseOrderId || !items?.length) {
+      return fail(res, 'Orden de compra y al menos un ítem son requeridos', 400);
+    }
+
+    // Verificar orden de compra
+    const order = await prisma.purchaseOrder.findUnique({
+      where: { id: purchaseOrderId },
+      include: { items: { include: { product: true } }, supplier: true }
+    });
+    if (!order) return fail(res, 'Orden de compra no encontrada', 404);
+    if (order.status !== 'RECEIVED') {
+      return fail(res, 'Solo se pueden registrar entradas de órdenes recibidas', 400);
+    }
+
+    // Generar número de entrada: ENT-YYYY-NNNNN
+    const lastEntry = await prisma.inventoryMovement.findFirst({
+      where: { type: 'ENTRY' },
+      orderBy: { createdAt: 'desc' }
+    });
+    const num = lastEntry?.referenceNumber 
+      ? parseInt(lastEntry.referenceNumber.split('-').pop() || '0') + 1 
+      : 1;
+    const entryNumber = `ENT-${new Date(entryDate || Date.now()).getFullYear()}-${String(num).padStart(5, '0')}`;
+
+    // Procesar entrada en transacción atómica
+    const result = await prisma.$transaction(async (tx) => {
+      for (const item of items) {
+        const orderItem = order.items.find(oi => oi.id === item.purchaseOrderItemId);
+        if (!orderItem) continue;
+
+        const product = orderItem.product;
+        const quantity = Number(item.quantityReceived || orderItem.quantity);
+        const unitCost = Number(item.unitCost || orderItem.unitCost);
+
+        // Actualizar stock
+        await tx.product.update({
+          where: { id: product.id },
+          data: {
+            stockQuantity: { increment: quantity },
+            // Recalcular costo promedio ponderado (WAC)
+            costPriceAvg: ((product.costPriceAvg.toNumber() * product.stockQuantity) + (unitCost * quantity)) / (product.stockQuantity + quantity)
+          }
+        });
+
+        // Crear movimiento de inventario tipo ENTRY
+        await tx.inventoryMovement.create({
+          data: {
+            productId: product.id,
+            type: 'ENTRY',
+            quantity,
+            unitCost: unitCost,
+            totalCost: quantity * unitCost,
+            referenceNumber: entryNumber,
+            notes: notes || `Entrada desde orden ${order.orderNumber}`,
+            createdBy: userId,
+            relatedOrder: purchaseOrderId,
+          }
+        });
+      }
+
+      // Actualizar orden con fecha de entrada registrada
+      return await tx.purchaseOrder.update({
+        where: { id: purchaseOrderId },
+        data: { notes: notes ? `${order.notes || ''}\n[ENTRADA] ${notes}` : order.notes },
+        include: { supplier: true, items: { include: { product: true } } }
+      });
+    });
+
+    logger.info('[purchaseController] Entrada registrada', { 
+      entryNumber, 
+      purchaseOrderId, 
+      itemsCount: items.length,
+      userId 
+    });
+
+    return ok(res, { ...result, entryNumber }, 201);
+  } catch (err) {
+    logger.error('[purchaseController] registerEntryHandler', err);
+    return fail(res, err instanceof Error ? err.message : 'Error al registrar entrada', 500);
+  }
+}
+
+/**
+ * GET /api/v1/purchases/entries
+ * Lista el historial de entradas de mercancía con filtros.
+ */
+export async function getAllEntriesHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const { page = 1, limit = 20, startDate, endDate, supplierId } = req.query;
+    
+    const where: Prisma.InventoryMovementWhereInput = {
+      type: 'ENTRY'
+    };
+    
+    if (supplierId && supplierId !== '') {
+      // Filtrar por productos de un proveedor específico (vía orden de compra)
+      where.relatedOrder = {
+        purchaseOrder: { supplierId: supplierId as string }
+      };
+    }
+    
+    if (startDate || endDate) {
+      where.createdAt = {};
+      if (startDate) where.createdAt.gte = new Date(startDate as string);
+      if (endDate) where.createdAt.lte = new Date(endDate as string);
+    }
+
+    const [data, total] = await prisma.$transaction([
+      prisma.inventoryMovement.findMany({
+        where,
+        include: { 
+          product: { select: { id: true, nameCommercial: true, skuInternal: true } },
+          purchaseOrder: { select: { id: true, orderNumber: true, supplier: { select: { name: true } } } }
+        },
+        orderBy: { createdAt: 'desc' },
+        skip: (Number(page) - 1) * Number(limit),
+        take: Number(limit),
+      }),
+      prisma.inventoryMovement.count({ where }),
+    ]);
+
+    // Agrupar movimientos por referenceNumber para mostrar "entradas" completas
+    const grouped = data.reduce((acc: any, move: any) => {
+      const key = move.referenceNumber;
+      if (!acc[key]) {
+        acc[key] = {
+          id: key,
+          entryNumber: key,
+          date: move.createdAt,
+          supplier: move.purchaseOrder?.supplier?.name,
+          orderNumber: move.purchaseOrder?.orderNumber,
+          totalItems: 0,
+          totalValue: 0,
+          items: []
+        };
+      }
+      acc[key].totalItems += move.quantity;
+      acc[key].totalValue += move.totalCost.toNumber();
+      acc[key].items.push({
+        product: move.product,
+        quantity: move.quantity,
+        unitCost: move.unitCost.toNumber(),
+        totalCost: move.totalCost.toNumber()
+      });
+      return acc;
+    }, {});
+
+    const entries = Object.values(grouped);
+    const totalPages = Math.ceil(entries.length / Number(limit));
+    const paginated = entries.slice((Number(page) - 1) * Number(limit), Number(page) * Number(limit));
+
+    return ok(res, { data: paginated, total: entries.length, totalPages });
+  } catch (err) {
+    logger.error('[purchaseController] getAllEntriesHandler', err);
+    return fail(res, 'Error al obtener entradas de almacén', 500);
+  }
+}
+
+/**
+ * GET /api/v1/purchases/entries/:id
+ * Detalle completo de una entrada por número de documento (ENT-YYYY-NNNNN).
+ */
+export async function getEntryByIdHandler(req: Request, res: Response): Promise<Response> {
+  try {
+    const { id } = req.params; // id = entryNumber como "ENT-2026-00001"
+    
+    // Buscar movimientos con este referenceNumber
+    const movements = await prisma.inventoryMovement.findMany({
+      where: { referenceNumber: id, type: 'ENTRY' },
+      include: { 
+        product: true,
+        purchaseOrder: { 
+          include: { 
+            supplier: true,
+            items: { include: { product: true } }
+          } 
+        }
+      },
+      orderBy: { createdAt: 'asc' }
+    });
+
+    if (!movements.length) return fail(res, 'Entrada de almacén no encontrada', 404);
+
+    // Construir respuesta agrupada
+    const first = movements[0];
+    const entry = {
+      id: first.referenceNumber,
+      entryNumber: first.referenceNumber,
+      date: first.createdAt,
+      supplier: first.purchaseOrder?.supplier,
+      orderNumber: first.purchaseOrder?.orderNumber,
+      notes: first.notes,
+      totalItems: movements.reduce((sum, m) => sum + m.quantity, 0),
+      totalValue: movements.reduce((sum, m) => sum + m.totalCost.toNumber(), 0),
+      items: movements.map(m => ({
+        product: {
+          id: m.product.id,
+          name: m.product.nameCommercial,
+          sku: m.product.skuInternal,
+          barcode: m.product.barcodeExternal
+        },
+        quantity: m.quantity,
+        unitCost: m.unitCost.toNumber(),
+        totalCost: m.totalCost.toNumber(),
+        wacBefore: m.product.costPriceAvg.toNumber(),
+        stockAfter: m.product.stockQuantity
+      }))
+    };
+
+    return ok(res, entry);
+  } catch (err) {
+    logger.error('[purchaseController] getEntryByIdHandler', err);
+    return fail(res, 'Error al obtener entrada de almacén', 500);
+  }
+}

@@ -1,0 +1,534 @@
+import {
+  CashRegisterStatus,
+  PaymentMethod,
+  SaleStatus,
+  TransactionType,
+} from '@prisma/client';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+const SIGNIFICANT_DIFF_THRESHOLD = parseFloat(
+  process.env['TREASURY_DIFF_THRESHOLD'] ?? '10000',
+);
+
+export interface ExpenseInput {
+  amount: number;
+  description: string;
+  category: string;
+  paymentMethod: string;
+}
+
+export interface TheoreticalBalanceResult {
+  openingBalance: number;
+  totalCashSales: number;
+  totalCashExpenses: number;
+  theoreticalBalance: number;
+}
+
+export interface DailySummaryResult {
+  cashRegister: {
+    id: string;
+    openedAt: Date;
+    openingBalance: number;
+    openedBy: { id: string; name: string };
+    status: string;
+  };
+  sales: {
+    breakdown: Array<{ paymentMethod: string; total: number; count: number }>;
+    totalSales: number;
+    totalCashSales: number;
+    totalCardSales: number;
+    totalTransferSales: number;
+    count: number;
+  };
+  expenses: {
+    total: number;
+    cashExpenses: number;
+    count: number;
+    items: Array<{
+      id: string;
+      amount: number;
+      description: string;
+      category: string;
+      paymentMethod: string;
+      timestamp: Date;
+    }>;
+  };
+  theoreticalBalance: number;
+  formula: string;
+}
+
+export interface CloseShiftResult {
+  cashRegister: {
+    id: string;
+    openedAt: Date;
+    closedAt: Date;
+    openedBy: { id: string; name: string };
+    closedBy: { id: string; name: string };
+    openingBalance: number;
+    closingBalance: number;
+    expectedClosingBalance: number;
+    difference: number;
+    status: string;
+    notes: string | null;
+  };
+  arqueo: {
+    openingBalance: number;
+    totalCashSales: number;
+    totalCashExpenses: number;
+    theoreticalBalance: number;
+    physicalCount: number;
+    difference: number;
+    differenceAbs: number;
+    differenceStatus: 'CUADRADO' | 'SOBRANTE' | 'FALTANTE';
+    requiresAdminReview: boolean;
+  };
+}
+
+function toNumber(value: unknown): number {
+  return parseFloat(String(value ?? 0)) || 0;
+}
+
+function buildDayRange(date: string): { gte: Date; lte: Date } {
+  const d = new Date(date);
+  return {
+    gte: new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0),
+    lte: new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999),
+  };
+}
+
+function buildShiftRange(openedAt: Date, closedAt?: Date | null): { gte: Date; lte: Date } {
+  return { gte: openedAt, lte: closedAt ?? new Date() };
+}
+
+async function findRegister(userId: string, date?: string) {
+  if (date) {
+    const range = buildDayRange(date);
+    return prisma.cash_registers.findFirst({
+      where: { openedByUserId: userId, openedAt: range },
+      
+      orderBy: { openedAt: 'desc' },
+    });
+  }
+  return prisma.cash_registers.findFirst({
+    where: { openedByUserId: userId, status: 'OPEN' },
+    
+    orderBy: { openedAt: 'desc' },
+  });
+}
+
+export async function getActiveShiftForUser(userId: string) {
+  return prisma.cash_registers.findFirst({
+    where: { openedByUserId: userId, status: 'OPEN' },
+    
+    orderBy: { openedAt: 'desc' },
+  });
+}
+
+export async function openCashShift(userId: string, openingBalance: number, notes?: string) {
+  const existing = await prisma.cash_registers.findFirst({
+    where: { openedByUserId: userId, status: 'OPEN' },
+    select: { id: true, openedAt: true },
+  });
+
+  if (existing) {
+    throw new Error(`Ya tienes un turno abierto (ID: ${existing.id}). Ciérralo antes.`);
+  }
+
+  const register = await prisma.cash_registers.create({
+     data: {
+      openedByUserId: userId,
+      openingBalance: openingBalance.toFixed(2),
+      status: 'OPEN',
+      openedAt: new Date(),
+      notes,
+    },
+    
+  });
+
+  logger.info(`[treasuryService] Turno abierto: ${register.id}`);
+  return register;
+}
+
+export async function registerExpenseTransaction(userId: string, data: ExpenseInput) {
+  const register = await getActiveShiftForUser(userId);
+
+  if (!register) {
+    throw new Error('No tienes turno abierto.');
+  }
+
+  const tx = await prisma.financial_transactions.create({
+     data: {
+      cashRegisterId: register.id,
+      type: 'EXPENSE',
+      amount: data.amount,
+      description: data.description.trim(),
+      category: data.category.trim(),
+      paymentMethod: data.paymentMethod,
+      performedByUserId: userId,
+    },
+    include: { performedByUser: { select: { id: true, name: true } } },
+  });
+
+  return tx;
+}
+
+export async function calculateTheoreticalBalance(
+  userId: string,
+  cashRegisterId: string,
+  cachedRegister?: { openingBalance: unknown; openedAt: Date; closedAt?: Date | null },
+): Promise<TheoreticalBalanceResult> {
+  let openedAt: Date;
+  let closedAt: Date | null | undefined;
+  let rawOpeningBalance: unknown;
+
+  if (cachedRegister) {
+    openedAt = cachedRegister.openedAt;
+    closedAt = cachedRegister.closedAt;
+    rawOpeningBalance = cachedRegister.openingBalance;
+  } else {
+    const found = await prisma.cash_registers.findUnique({
+      where: { id: cashRegisterId },
+      select: { openingBalance: true, openedAt: true, closedAt: true },
+    });
+    if (!found) throw new Error('Caja no encontrada');
+    openedAt = found.openedAt;
+    closedAt = found.closedAt;
+    rawOpeningBalance = found.openingBalance;
+  }
+
+  const shiftRange = buildShiftRange(openedAt, closedAt);
+
+  const [cashSalesAgg, expensesAgg] = await Promise.all([
+    prisma.sales.aggregate({
+      where: {
+        userId,
+        paymentMethod: 'CASH',
+        status: string.COMPLETED,
+        createdAt: shiftRange,
+      },
+      _sum: { totalAmount: true },
+    }),
+    prisma.financial_transactions.aggregate({
+      where: {
+        cashRegisterId,
+        type: 'EXPENSE',
+        paymentMethod: 'CASH',
+      },
+      _sum: { amount: true },
+    }),
+  ]);
+
+  const openingBalance = toNumber(rawOpeningBalance);
+  const totalCashSales = toNumber(cashSalesAgg._sum.totalAmount);
+  const totalCashExpenses = toNumber(expensesAgg._sum.amount);
+  const theoreticalBalance = openingBalance + totalCashSales - totalCashExpenses;
+
+  return { openingBalance, totalCashSales, totalCashExpenses, theoreticalBalance };
+}
+
+export async function getDailyShiftSummary(userId: string, date?: string): Promise<DailySummaryResult> {
+  const register = await findRegister(userId, date);
+  if (!register) throw new Error('No se encontró turno.');
+
+  const shiftRange = buildShiftRange(register.openedAt, register.closedAt);
+
+  const [salesByMethod, expenseTxs, balanceData] = await Promise.all([
+    prisma.sales.groupBy({
+      by: ['paymentMethod'],
+      where: { userId, status: string.COMPLETED, createdAt: shiftRange },
+      _sum: { totalAmount: true },
+      _count: { id: true },
+    }),
+    prisma.financial_transactions.findMany({
+      where: { cashRegisterId: register.id, type: 'EXPENSE' },
+      select: {
+        id: true, amount: true, description: true,
+        category: true, paymentMethod: true, timestamp: true,
+      },
+      orderBy: { timestamp: 'desc' },
+    }),
+    calculateTheoreticalBalance(userId, register.id, register),
+  ]);
+
+  const { openingBalance, totalCashSales, totalCashExpenses, theoreticalBalance } = balanceData;
+
+  const totalSales = salesByMethod.reduce((a, s) => a + toNumber(s._sum.totalAmount), 0);
+  const totalCardSales = toNumber(salesByMethod.find(s => s.paymentMethod === PaymentMethod.CARD)?._sum.totalAmount);
+  const totalTransferSales = toNumber(salesByMethod.find(s => s.paymentMethod === PaymentMethod.TRANSFER)?._sum.totalAmount);
+  const totalExpenses = expenseTxs.reduce((a, e) => a + toNumber(e.amount), 0);
+  const cashExpenses = expenseTxs
+    .filter(e => e.paymentMethod === PaymentMethod.CASH)
+    .reduce((a, e) => a + toNumber(e.amount), 0);
+
+  return {
+    cashRegister: {
+      id: register.id,
+      openedAt: register.openedAt,
+      openingBalance: parseFloat(openingBalance.toFixed(2)),
+      openedBy: register.openedByUserId,
+      status: register.status,
+    },
+    sales: {
+      breakdown: salesByMethod.map(s => ({
+        paymentMethod: s.paymentMethod,
+        total: parseFloat(toNumber(s._sum.totalAmount).toFixed(2)),
+        count: s._count.id,
+      })),
+      totalSales: parseFloat(totalSales.toFixed(2)),
+      totalCashSales: parseFloat(totalCashSales.toFixed(2)),
+      totalCardSales: parseFloat(totalCardSales.toFixed(2)),
+      totalTransferSales: parseFloat(totalTransferSales.toFixed(2)),
+      count: salesByMethod.reduce((a, s) => a + s._count.id, 0),
+    },
+    expenses: {
+      total: parseFloat(totalExpenses.toFixed(2)),
+      cashExpenses: parseFloat(cashExpenses.toFixed(2)),
+      count: expenseTxs.length,
+      items: expenseTxs.map(e => ({
+        ...e,
+        amount: parseFloat(toNumber(e.amount).toFixed(2)),
+      })),
+    },
+    theoreticalBalance: parseFloat(theoreticalBalance.toFixed(2)),
+    formula: `$${openingBalance.toFixed(2)} + $${totalCashSales.toFixed(2)} - $${totalCashExpenses.toFixed(2)} = $${theoreticalBalance.toFixed(2)}`,
+  };
+}
+
+export async function closeCashShift(
+  userId: string,
+  physicalCount: number,
+  observations?: string,
+): Promise<CloseShiftResult> {
+  const register = await prisma.cash_registers.findFirst({
+    where: { openedByUserId: userId, status: 'OPEN' },
+    
+    orderBy: { openedAt: 'desc' },
+  });
+
+  if (!register) throw new Error('No tienes turno abierto.');
+
+  const { openingBalance, totalCashSales, totalCashExpenses, theoreticalBalance } =
+    await calculateTheoreticalBalance(userId, register.id, register);
+
+  const difference = physicalCount - theoreticalBalance;
+
+  const differenceStatus: 'CUADRADO' | 'SOBRANTE' | 'FALTANTE' =
+    Math.abs(difference) < 0.01 ? 'CUADRADO' : difference > 0 ? 'SOBRANTE' : 'FALTANTE';
+
+  const requiresAdminReview = Math.abs(difference) > SIGNIFICANT_DIFF_THRESHOLD;
+
+  const mergedNotes = observations
+    ? `${register.notes ? register.notes + ' | ' : ''}Cierre: ${observations}`
+    : register.notes ?? undefined;
+
+  const closed = await prisma.cash_registers.update({
+    where: { id: register.id },
+     data: {
+      closedByUserId: userId,
+      closingBalance: physicalCount.toFixed(2),
+      expectedClosingBalance: theoreticalBalance.toFixed(2),
+      difference: difference.toFixed(2),
+      status: 'CLOSED',
+      closedAt: new Date(),
+      notes: mergedNotes,
+    },
+    include: {
+      openedBy: { select: { id: true, name: true } },
+      closedBy: { select: { id: true, name: true } },
+    },
+  });
+
+  logger.info(`[treasuryService] Turno cerrado: ${register.id} — ${differenceStatus}`);
+
+  return {
+    cashRegister: {
+      id: closed.id,
+      openedAt: closed.openedAt,
+      closedAt: closed.closedAt!,
+      openedBy: closed.openedByUserId,
+      closedBy: closed.closedByUserId!,
+      openingBalance: parseFloat(toNumber(closed.openingBalance).toFixed(2)),
+      closingBalance: parseFloat(toNumber(closed.closingBalance).toFixed(2)),
+      expectedClosingBalance: parseFloat(toNumber(closed.expectedClosingBalance).toFixed(2)),
+      difference: parseFloat(toNumber(closed.difference).toFixed(2)),
+      status: closed.status,
+      notes: closed.notes,
+    },
+    arqueo: {
+      openingBalance: parseFloat(openingBalance.toFixed(2)),
+      totalCashSales: parseFloat(totalCashSales.toFixed(2)),
+      totalCashExpenses: parseFloat(totalCashExpenses.toFixed(2)),
+      theoreticalBalance: parseFloat(theoreticalBalance.toFixed(2)),
+      physicalCount: parseFloat(physicalCount.toFixed(2)),
+      difference: parseFloat(difference.toFixed(2)),
+      differenceAbs: parseFloat(Math.abs(difference).toFixed(2)),
+      differenceStatus,
+      requiresAdminReview,
+    },
+  };
+}
+
+export interface GlobalTreasurySummaryResult {
+  currentRegister: {
+    id: string;
+    openedAt: Date;
+    openingBalance: number;
+    status: string;
+    openedBy: { id: string; name: string };
+  } | null;
+  openingBalance: number;
+  totalIncome: number;
+  totalExpenses: number;
+  expectedBalance: number;
+  breakdown: { type: string; total: number; count: number; }[];
+}
+
+export interface CashMovement {
+  id: string;
+  type: 'INGRESO' | 'EGRESO';
+  concept: string;
+  amount: number;
+  paymentMethod: string;
+  timestamp: Date;
+  reference: string;
+}
+
+export async function getGlobalTreasurySummary(): Promise<GlobalTreasurySummaryResult> {
+  const todayStr = new Date().toISOString().split('T')[0]!;
+  const todayRange = buildDayRange(todayStr);
+
+  const openRegister = await prisma.cash_registers.findFirst({
+    where: { status: 'OPEN' },
+    
+    orderBy: { openedAt: 'desc' },
+  });
+
+  const register = openRegister ?? await prisma.cash_registers.findFirst({
+    where: { openedAt: todayRange },
+    
+    orderBy: { openedAt: 'desc' },
+  });
+
+  const [salesAgg, expenseAgg, breakdown] = await Promise.all([
+    prisma.sales.aggregate({
+      where: { status: string.COMPLETED, createdAt: todayRange },
+      _sum: { totalAmount: true },
+    }),
+    prisma.financial_transactions.aggregate({
+      where: {
+        type: { in: [TransactionType.EXPENSE.WITHDRAWAL.PAYMENT_MADE] },
+        timestamp: todayRange,
+      },
+      _sum: { amount: true },
+    }),
+    prisma.financial_transactions.groupBy({
+      by: ['type'],
+      where: { timestamp: todayRange },
+      _sum: { amount: true },
+      _count: { id: true },
+    }),
+  ]);
+
+  const openingBalance = toNumber(register?.openingBalance ?? 0);
+  const totalIncome = toNumber(salesAgg._sum.totalAmount);
+  const totalExpenses = toNumber(expenseAgg._sum.amount);
+  const expectedBalance = openingBalance + totalIncome - totalExpenses;
+
+  return {
+    currentRegister: register
+      ? { id: register.id, openedAt: register.openedAt, openingBalance: parseFloat(openingBalance.toFixed(2)), status: register.status, openedBy: register.openedByUserId }
+      : null,
+    openingBalance: parseFloat(openingBalance.toFixed(2)),
+    totalIncome: parseFloat(totalIncome.toFixed(2)),
+    totalExpenses: parseFloat(totalExpenses.toFixed(2)),
+    expectedBalance: parseFloat(expectedBalance.toFixed(2)),
+    breakdown: breakdown.map(b => ({ type: b.type, total: parseFloat(toNumber(b._sum.amount).toFixed(2)), count: b._count.id })),
+  };
+}
+
+export async function getCashMovements(date?: string): Promise<CashMovement[]> {
+  const targetDate = date ?? new Date().toISOString().split('T')[0]!;
+  const range = buildDayRange(targetDate);
+
+  const [sales, expenses] = await Promise.all([
+    prisma.sales.findMany({
+      where: { status: string.COMPLETED, createdAt: range },
+      select: { id: true, saleNumber: true, totalAmount: true, paymentMethod: true, createdAt: true, customer: { select: { name: true } } },
+      orderBy: { createdAt: 'desc' },
+    }),
+    prisma.financial_transactions.findMany({
+      where: { type: { in: [TransactionType.EXPENSE.WITHDRAWAL.PAYMENT_MADE] }, timestamp: range },
+      select: { id: true, description: true, category: true, amount: true, paymentMethod: true, timestamp: true, type: true },
+      orderBy: { timestamp: 'desc' },
+    }),
+  ]);
+
+  const movements: CashMovement[] = [
+    ...sales.map(s => ({
+      id: s.id,
+      type: 'INGRESO' as const,
+      concept: s.customer?.name ? `Venta — ${s.customer.name}` : `Venta ${s.saleNumber}`,
+      amount: parseFloat(toNumber(s.totalAmount).toFixed(2)),
+      paymentMethod: s.paymentMethod,
+      timestamp: s.createdAt,
+      reference: s.saleNumber,
+    })),
+    ...expenses.map(e => ({
+      id: e.id,
+      type: 'EGRESO' as const,
+      concept: e.description,
+      amount: parseFloat(toNumber(e.amount).toFixed(2)),
+      paymentMethod: e.paymentMethod,
+      timestamp: e.timestamp,
+      reference: e.category ?? e.type,
+    })),
+  ];
+
+  movements.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+  return movements;
+}
+
+export async function generateDailyReport(date: string) {
+  const range = buildDayRange(date);
+
+  const [registers, salesByMethod, expensesAgg] = await Promise.all([
+    prisma.cash_registers.findMany({
+      where: { openedAt: range },
+      include: { openedBy: { select: { id: true, name: true } }, closedBy: { select: { id: true, name: true } }, _count: { select: { transactions: true } } },
+      orderBy: { openedAt: 'asc' },
+    }),
+    prisma.sales.groupBy({
+      by: ['paymentMethod'],
+      where: { status: string.COMPLETED, createdAt: range },
+      _sum: { totalAmount: true },
+      _count: { id: true },
+    }),
+    prisma.financial_transactions.aggregate({ where: { type: 'EXPENSE', timestamp: range }, _sum: { amount: true } }),
+  ]);
+
+  const totalSales = salesByMethod.reduce((a, s) => a + toNumber(s._sum.totalAmount), 0);
+  const totalExpenses = toNumber(expensesAgg._sum.amount);
+
+  return {
+    date,
+    registers: registers.map(r => ({
+      id: r.id,
+      openedBy: r.openedByUserId,
+      closedBy: r.closedByUserId,
+      status: r.status,
+      openedAt: r.openedAt,
+      closedAt: r.closedAt,
+      openingBalance: parseFloat(toNumber(r.openingBalance).toFixed(2)),
+      closingBalance: r.closingBalance ? parseFloat(toNumber(r.closingBalance).toFixed(2)) : null,
+      difference: r.difference ? parseFloat(toNumber(r.difference).toFixed(2)) : null,
+      transactionCount: r._count.transactions,
+    })),
+    salesSummary: {
+      breakdown: salesByMethod.map(s => ({ paymentMethod: s.paymentMethod, total: parseFloat(toNumber(s._sum.totalAmount).toFixed(2)), count: s._count.id })),
+      totalSales: parseFloat(totalSales.toFixed(2)),
+    },
+    expensesSummary: { totalExpenses: parseFloat(totalExpenses.toFixed(2)) },
+    netCashFlow: parseFloat((totalSales - totalExpenses).toFixed(2)),
+  };
+}

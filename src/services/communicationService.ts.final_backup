@@ -1,0 +1,103 @@
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+export type CommunicationChannel = 'WHATSAPP' | 'EMAIL' | 'CALL' | 'IN_PERSON' | 'SMS';
+export type CommunicationDirection = 'INBOUND' | 'OUTBOUND';
+export type CommunicationStatus = 'SENT' | 'DELIVERED' | 'READ' | 'FAILED' | 'PENDING';
+
+export async function createCommunication(data: { 
+  customerId: string; 
+  channel: CommunicationChannel; 
+  message: string; 
+  direction?: CommunicationDirection; 
+  sentByUserId: string; 
+  metadata?: Record<string, unknown>; 
+}) {
+  const comm = await prisma.communications.create({
+    data: {
+      customerId: data.customerId,
+      channel: data.channel,
+      message: data.message,
+      direction: data.direction ?? 'OUTBOUND',
+      status: 'SENT',
+      isRead: false,
+      sentByUserId: data.sentByUserId,
+      metadata: data.metadata as any,
+    } as any,
+  });
+  await prisma.customers.update({ 
+    where: { id: data.customerId }, 
+    data: { lastCommunicationAt: new Date() } as any 
+  });
+  logger.info(`[communicationService] comm ${comm.id} → cliente ${data.customerId}`);
+  return comm;
+}
+
+export async function listCommunications(params: { 
+  customerId?: string; 
+  channel?: string; 
+  status?: string; 
+  page: number; 
+  limit: number; 
+}) {
+  const { customerId, channel, status, page, limit } = params;
+  const skip = (page - 1) * limit;
+  const where: any = { 
+    ...(customerId && { customerId }), 
+    ...(channel && { channel }), 
+    ...(status && { status }) 
+  };
+  const [items, total] = await prisma.$transaction([
+    prisma.communications.findMany({ 
+      where, 
+      skip, 
+      take: limit, 
+      orderBy: { createdAt: 'desc' }, 
+      include: { customers: { select: { id: true, name: true, phone: true } } } 
+    }),
+    prisma.communications.count({ where }),
+  ]);
+  return { data: items, meta: { total, page, limit, totalPages: Math.ceil(total / limit) } };
+}
+
+export async function markCommunicationRead(id: string) {
+  return prisma.communications.update({ 
+    where: { id }, 
+    data: { status: 'READ', isRead: true, readAt: new Date() } as any 
+  });
+}
+
+export async function getUnreadCount(customerId: string) {
+  return prisma.communications.count({ 
+    where: { customerId, status: { not: 'READ' }, direction: 'INBOUND' } 
+  });
+}
+
+export async function escalateOverdue() {
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const overdue = await prisma.communications.findMany({ 
+    where: { status: 'SENT', direction: 'INBOUND', createdAt: { lt: cutoff } }, 
+    select: { id: true, customerId: true } 
+  });
+  
+  for (const c of overdue) {
+    await prisma.communications.update({ 
+      where: { id: c.id }, 
+      data: { status: 'FAILED' } as any 
+    });
+    await prisma.tickets.create({ 
+      data: { 
+        customerId: c.customerId, 
+        subject: 'Comunicación sin respuesta >24h', 
+        description: `Mensaje sin respuesta automáticamente escalado. Comm ID: ${c.id}`, 
+        status: 'OPEN', 
+        priority: 'HIGH', 
+        assignedTo: null, 
+        sentByUserId: 'system' 
+      } as any 
+    });
+  }
+  if (overdue.length > 0) logger.info(`[communicationService] Escalados ${overdue.length} mensajes sin respuesta`);
+  return overdue.length;
+}
+

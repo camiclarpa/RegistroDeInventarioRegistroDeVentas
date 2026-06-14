@@ -1,0 +1,499 @@
+"""
+Voice Agent - Multi-Producto con Corrección Instantánea
+- Recibe lista de productos escaneados (con SKU)
+- Procesa uno por uno
+- Corrección instantánea de campos
+- Sin latencia
+"""
+import os
+import re
+import struct
+import time
+import tempfile
+import subprocess
+from typing import Dict, Optional, List, Tuple
+from groq import Groq
+from fastapi import WebSocket
+
+
+class VoiceAgent:
+    def __init__(self):
+        self.api_key = os.getenv("GROQ_API_KEY")
+        if not self.api_key:
+            print("ERROR: GROQ_API_KEY no configurada")
+            self.client = None
+        else:
+            self.client = Groq(api_key=self.api_key)
+            print("GROQ API configurada")
+
+        self.piper_model = "/app/models/es_ES-sharvard-medium.onnx"
+        self.sessions: Dict[str, Dict] = {}
+        
+        # Configuración optimizada
+        self.vad_threshold = 150.0
+        self.min_voice_duration_ms = 300
+        self.silence_frames_required = 3
+
+    def get_agents_list(self) -> List[str]:
+        return ["voice_agent"]
+
+    def get_active_sessions(self) -> List[str]:
+        """Retorna lista de sesiones activas"""
+        return list(self.sessions.keys())
+
+    # ═══════════════════════════════════════════════════════════
+    # VAD Y AUDIO
+    # ═══════════════════════════════════════════════════════════
+    def _calculate_rms(self, audio_data: bytes) -> float:
+        """Calcula RMS del audio PCM16"""
+        if len(audio_data) < 100:
+            return 0.0
+        try:
+            num_samples = len(audio_data) // 2
+            samples = struct.unpack(f'<{num_samples}h', audio_data[:num_samples * 2])
+            if not samples:
+                return 0.0
+            sum_squares = sum(s * s for s in samples)
+            return (sum_squares / len(samples)) ** 0.5
+        except:
+            return 0.0
+
+    def _is_voice_activity(self, audio_data: bytes) -> Tuple[bool, float]:
+        """Detecta si hay voz"""
+        rms = self._calculate_rms(audio_data)
+        return rms > self.vad_threshold, rms
+
+    def _add_wav_header(self, pcm_data: bytes, sample_rate: int = 16000) -> bytes:
+        """Agrega header WAV a PCM16 raw"""
+        data_size = len(pcm_data)
+        byte_rate = sample_rate * 2
+        header = struct.pack(
+            '<4sI4s4sIHHIIHH4sI',
+            b'RIFF', 36 + data_size, b'WAVE', b'fmt ',
+            16, 1, 1, sample_rate, byte_rate, 2, 16, b'data', data_size
+        )
+        return header + pcm_data
+
+    # ═══════════════════════════════════════════════════════════
+    # FLUJO PRINCIPAL
+    # ═══════════════════════════════════════════════════════════
+    async def handle_session(self, websocket: WebSocket):
+        """Maneja sesión de voz con multi-producto"""
+        await websocket.accept()
+        session_id = str(id(websocket))
+
+        # Inicializar sesión
+        self.sessions[session_id] = {
+            "product_queue": [],  # Lista de productos escaneados
+            "current_index": 0,   # Índice del producto actual
+            "product_data": {
+                "name": None,
+                "category": None,
+                "brand": None,
+                "quantity": None,
+                "sale_price": None,
+            },
+            "current_sku": None,  # SKU del producto actual
+            "current_field": "name",
+            "state": "waiting_products",  # waiting_products, collecting, confirming, correcting, complete
+            "audio_buffer": b"",
+            "silence_frames": 0,
+            "voice_frames": 0,
+            "correcting_field": None,  # Campo que se está corrigiendo
+        }
+
+        try:
+            # Saludo inicial
+            await self._send_audio(websocket, "Hola. Escanea los productos y dime cuando estés listo.", session_id)
+            await self._send_field_update(websocket, session_id)
+
+            while True:
+                try:
+                    message = await websocket.receive()
+                    
+                    if "bytes" in message:
+                        await self._handle_audio(message["bytes"], session_id, websocket)
+                    elif "text" in message:
+                        # Manejar comandos del frontend (lista de productos)
+                        await self._handle_command(message["text"], session_id, websocket)
+
+                    if self.sessions[session_id]["state"] == "complete":
+                        break
+
+                except Exception as e:
+                    print(f"Error: {e}")
+                    break
+
+        finally:
+            self.sessions.pop(session_id, None)
+
+    async def _handle_command(self, command_text: str, session_id: str, websocket: WebSocket):
+        """Maneja comandos del frontend (JSON)"""
+        import json
+        try:
+            command = json.loads(command_text)
+            
+            if command.get("type") == "start_with_products":
+                products = command.get("products", [])
+                await self._start_with_products(products, session_id, websocket)
+                
+        except Exception as e:
+            print(f"Error procesando comando: {e}")
+
+    async def _start_with_products(self, products: List[Dict], session_id: str, websocket: WebSocket):
+        """Inicia sesión con lista de productos escaneados"""
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+
+        session["product_queue"] = products
+        session["current_index"] = 0
+        session["state"] = "collecting"
+        
+        total = len(products)
+        await self._send_audio(websocket, f"Hay {total} productos registrados. Empezamos.", session_id)
+        
+        # Anunciar primer producto
+        await self._announce_current_product(session_id, websocket)
+
+    async def _announce_current_product(self, session_id: str, websocket: WebSocket):
+        """Anuncia el producto actual con su SKU"""
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+
+        idx = session["current_index"]
+        total = len(session["product_queue"])
+        
+        if idx >= total:
+            # Todos completados
+            session["state"] = "complete"
+            await self._send_audio(websocket, f"Listo. {total} productos registrados.", session_id)
+            await websocket.send_json({"type": "all_complete", "total": total})
+            return
+
+        product = session["product_queue"][idx]
+        sku = product.get("sku", f"Producto {idx + 1}")
+        session["current_sku"] = sku
+        
+        # Resetear campos
+        session["product_data"] = {
+            "name": None,
+            "category": None,
+            "brand": None,
+            "quantity": None,
+            "sale_price": None,
+        }
+        session["current_field"] = "name"
+        
+        msg = f"Producto {idx + 1} de {total}. SKU: {sku}. Nombre del producto?"
+        await self._send_audio(websocket, msg, session_id)
+        await self._send_field_update(websocket, session_id)
+
+    async def _handle_audio(self, audio_chunk: bytes, session_id: str, websocket: WebSocket):
+        """Maneja chunks de audio"""
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+
+        # VAD
+        is_voice, rms = self._is_voice_activity(audio_chunk)
+        
+        await websocket.send_json({
+            "type": "vad_metrics",
+            "rms": round(rms, 2),
+            "is_voice": is_voice,
+            "threshold": self.vad_threshold
+        })
+
+        if not is_voice:
+            session["silence_frames"] += 1
+            session["voice_frames"] = 0
+            
+            # Procesar después de 3 frames de silencio
+            if session["audio_buffer"] and session["silence_frames"] >= self.silence_frames_required:
+                await self._process_audio(session["audio_buffer"], session_id, websocket)
+                session["audio_buffer"] = b""
+                session["silence_frames"] = 0
+            return
+
+        # Hay voz: acumular
+        session["voice_frames"] += 1
+        session["silence_frames"] = 0
+        session["audio_buffer"] += audio_chunk
+
+    async def _process_audio(self, audio_data: bytes, session_id: str, websocket: WebSocket):
+        """Procesa audio completo"""
+        session = self.sessions.get(session_id)
+        if not session or not self.client:
+            return
+
+        # Verificar duración mínima
+        duration_ms = (len(audio_data) / 32000) * 1000
+        if duration_ms < self.min_voice_duration_ms:
+            return
+
+        # STT
+        user_text = await self._stt_transcribe(audio_data)
+        
+        # Validación
+        if not user_text or len(user_text.strip()) < 3:
+            print(f"STT vacío o muy corto: '{user_text}'")
+            return
+
+        print(f"Cliente: {user_text}")
+
+        # Enviar transcripción al frontend
+        await websocket.send_json({
+            "type": "transcription",
+            "speaker": "user",
+            "text": user_text
+        })
+
+        # Procesar según estado
+        state = session["state"]
+        
+        if state == "collecting":
+            await self._handle_collecting(user_text, session, websocket)
+        elif state == "confirming":
+            await self._handle_confirming(user_text, session, websocket)
+        elif state == "correcting":
+            await self._handle_correcting(user_text, session, websocket)
+
+        # Actualizar frontend
+        await self._send_field_update(websocket, session_id)
+
+    # ═══════════════════════════════════════════════════════════
+    # ESTADOS
+    # ═══════════════════════════════════════════════════════════
+    async def _handle_collecting(self, user_text: str, session: Dict, websocket: WebSocket):
+        """Maneja estado de recolección de datos"""
+        current_field = session["current_field"]
+        
+        # Extraer valor con LLM
+        value = await self._extract_value(user_text, current_field)
+        
+        if not value:
+            await self._send_audio(websocket, "No entendí. Repite por favor.", str(id(websocket)))
+            return
+
+        # Guardar valor
+        session["product_data"][current_field] = value
+        print(f"Campo {current_field}: {value}")
+
+        # Avanzar al siguiente campo
+        field_order = ["name", "category", "brand", "quantity", "sale_price"]
+        current_idx = field_order.index(current_field)
+        
+        if current_idx < len(field_order) - 1:
+            next_field = field_order[current_idx + 1]
+            session["current_field"] = next_field
+            
+            # Pregunta DIRECTA
+            questions = {
+                "category": "Categoría.",
+                "brand": "Marca.",
+                "quantity": "Cantidad.",
+                "sale_price": "Precio de venta."
+            }
+            
+            await self._send_audio(websocket, questions[next_field], str(id(websocket)))
+        else:
+            # Todos los campos completos → confirmación
+            session["state"] = "confirming"
+            await self._ask_confirmation(session, websocket)
+
+    async def _handle_confirming(self, user_text: str, session: Dict, websocket: WebSocket):
+        """Maneja estado de confirmación"""
+        user_text_lower = user_text.lower()
+        
+        # Detectar intención
+        if any(word in user_text_lower for word in ["sí", "si", "correcto", "bien", "ok", "perfecto"]):
+            # Confirmado → avanzar al siguiente producto
+            session["current_index"] += 1
+            
+            # Anunciar siguiente producto
+            await self._announce_current_product(str(id(websocket)), websocket)
+        
+        elif any(word in user_text_lower for word in ["no", "incorrecto", "mal", "cambiar", "corregir"]):
+            # No confirmado → preguntar qué campo corregir
+            await self._send_audio(websocket, "Qué campo corrijo? Nombre, categoría, marca, cantidad o precio?", str(id(websocket)))
+            session["state"] = "correcting"
+        
+        else:
+            # No entendió
+            await self._send_audio(websocket, "Responde sí o no.", str(id(websocket)))
+
+    async def _handle_correcting(self, user_text: str, session: Dict, websocket: WebSocket):
+        """Maneja estado de corrección"""
+        user_text_lower = user_text.lower()
+        
+        # Detectar qué campo quiere corregir
+        field_map = {
+            "nombre": "name",
+            "categoría": "category", "categoria": "category",
+            "marca": "brand",
+            "cantidad": "quantity",
+            "precio": "sale_price"
+        }
+        
+        detected_field = None
+        for keyword, field in field_map.items():
+            if keyword in user_text_lower:
+                detected_field = field
+                break
+        
+        if detected_field:
+            # Guardar campo a corregir
+            session["correcting_field"] = detected_field
+            session["current_field"] = detected_field
+            session["state"] = "collecting"
+            
+            field_names = {
+                "name": "nombre",
+                "category": "categoría",
+                "brand": "marca",
+                "quantity": "cantidad",
+                "sale_price": "precio"
+            }
+            
+            await self._send_audio(websocket, f"Ok. {field_names[detected_field].capitalize()}?", str(id(websocket)))
+        else:
+            # No entendió qué campo
+            await self._send_audio(websocket, "Dime qué campo: nombre, categoría, marca, cantidad o precio?", str(id(websocket)))
+
+    async def _extract_value(self, user_text: str, field: str) -> Optional[str]:
+        """Extrae valor del campo con LLM"""
+        if not self.client:
+            return None
+
+        # Prompt ULTRA DIRECTO
+        prompt = f"""Campo: {field}
+Usuario dice: "{user_text}"
+Extrae SOLO el valor. Responde SOLO con el valor, nada más."""
+
+        try:
+            completion = self.client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=20,
+                temperature=0.1,
+            )
+            
+            value = completion.choices[0].message.content.strip()
+            
+            # Limpiar valor
+            if field in ["quantity", "sale_price"]:
+                numbers = re.findall(r'\d+', value)
+                return numbers[0] if numbers else None
+            
+            return value if value and len(value) < 50 else None
+            
+        except Exception as e:
+            print(f"Error extrayendo valor: {e}")
+            return None
+
+    async def _ask_confirmation(self, session: Dict, websocket: WebSocket):
+        """Pregunta confirmación final"""
+        data = session["product_data"]
+        
+        msg = f"Nombre: {data['name']}. Categoría: {data['category']}. Marca: {data['brand']}. Cantidad: {data['quantity']}. Precio: {data['sale_price']}. Correcto?"
+        
+        await self._send_audio(websocket, msg, str(id(websocket)))
+
+    # ═══════════════════════════════════════════════════════════
+    # STT Y TTS
+    # ═══════════════════════════════════════════════════════════
+    async def _stt_transcribe(self, audio_data: bytes) -> str:
+        """Transcribe audio con Groq Whisper"""
+        wav_data = self._add_wav_header(audio_data)
+        
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(wav_data)
+            temp_path = f.name
+
+        try:
+            with open(temp_path, "rb") as audio_file:
+                transcription = self.client.audio.transcriptions.create(
+                    file=audio_file,
+                    model="whisper-large-v3-turbo",
+                    language="es",
+                    response_format="text",
+                )
+            return transcription.strip()
+        except Exception as e:
+            print(f"STT error: {e}")
+            return ""
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    async def _send_audio(self, websocket: WebSocket, text: str, session_id: str):
+        """Sintetiza y envía audio"""
+        print(f"Agente: {text}")
+        
+        # Enviar transcripción al frontend
+        await websocket.send_json({
+            "type": "transcription",
+            "speaker": "agent",
+            "text": text
+        })
+        
+        # Sintetizar con Piper
+        audio = await self.tts_synthesize(text)
+        if audio:
+            await websocket.send_bytes(audio)
+
+    async def tts_synthesize(self, text: str) -> bytes:
+        """Sintetiza texto con Piper TTS"""
+        if not os.path.exists(self.piper_model):
+            return b""
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            output_path = f.name
+
+        try:
+            cmd = [
+                "/usr/local/bin/piper/piper",
+                "-m", self.piper_model,
+                "-f", output_path
+            ]
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            stdout, stderr = process.communicate(input=text.encode("utf-8"), timeout=5)
+
+            if process.returncode != 0:
+                return b""
+
+            with open(output_path, "rb") as f:
+                return f.read()
+        except:
+            return b""
+        finally:
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+
+    # ═══════════════════════════════════════════════════════════
+    # FRONTEND
+    # ═══════════════════════════════════════════════════════════
+    async def _send_field_update(self, websocket: WebSocket, session_id: str):
+        """Envía actualización de campos al frontend"""
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+
+        await websocket.send_json({
+            "type": "field_update",
+            "data": {
+                "product_data": session["product_data"],
+                "current_field": session["current_field"],
+                "state": session["state"],
+                "current_sku": session.get("current_sku"),
+                "current_index": session.get("current_index", 0),
+                "total_products": len(session.get("product_queue", []))
+            }
+        })

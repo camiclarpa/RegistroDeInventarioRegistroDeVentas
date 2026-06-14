@@ -1,0 +1,298 @@
+import { Prisma } from '@prisma/client';
+import { prisma } from '../config/prisma';
+import { logger } from '../config/logger';
+
+const POINTS_PER_PESO = 1000;
+const TIER_SILVER = 5000;
+const TIER_GOLD = 15000;
+
+function toFloat(v: unknown): number {
+  return parseFloat(String(v ?? 0)) || 0;
+}
+
+function resolveTier(totalSpent: number): string {
+  if (totalSpent >= TIER_GOLD) return 'GOLD';
+  if (totalSpent >= TIER_SILVER) return 'SILVER';
+  return 'BRONZE';
+}
+
+export async function searchCustomersCRM(query: string) {
+  if (!query || query.trim().length < 2) return [];
+  const q = query.trim();
+
+  const [byPhone, byName, byDoc, byPlate] = await Promise.all([
+    prisma.customer.findMany({
+      where: { phone: q },
+      take: 3,
+      select: {
+        id: true, name: true, phone: true,
+        loyaltyTier: true, lastPurchaseAt: true,
+        motorcycles: { select: { plate: true }, take: 1 },
+      },
+    }),
+    prisma.customer.findMany({
+      where: { name: { contains: q, mode: 'insensitive' } },
+      take: 5,
+      select: {
+        id: true, name: true, phone: true,
+        loyaltyTier: true, lastPurchaseAt: true,
+        motorcycles: { select: { plate: true }, take: 1 },
+      },
+    }),
+    prisma.customer.findMany({
+      where: { identificationNumber: { contains: q, mode: 'insensitive' } },
+      take: 3,
+      select: {
+        id: true, name: true, phone: true,
+        loyaltyTier: true, lastPurchaseAt: true,
+        motorcycles: { select: { plate: true }, take: 1 },
+      },
+    }),
+    prisma.motorcycle.findMany({
+      where: { plate: { contains: q, mode: 'insensitive' } },
+      take: 3,
+      select: {
+        plate: true,
+        customer: {
+          select: {
+            id: true, name: true, phone: true,
+            loyaltyTier: true, lastPurchaseAt: true,
+          },
+        },
+      },
+    }),
+  ]);
+
+  const seen = new Set<string>();
+  const results: Array<{
+    id: string; name: string; phone: string | null;
+    plate: string | null; loyaltyTier: string; lastPurchaseAt: Date | null;
+  }> = [];
+
+  const push = (
+    c: { id: string; name: string; phone: string | null; loyaltyTier: string; lastPurchaseAt: Date | null },
+    plate?: string | null,
+    motos?: { plate: string }[],
+  ) => {
+    if (seen.has(c.id)) return;
+    seen.add(c.id);
+    results.push({
+      id: c.id,
+      name: c.name,
+      phone: c.phone,
+      plate: plate ?? motos?.[0]?.plate ?? null,
+      loyaltyTier: c.loyaltyTier,
+      lastPurchaseAt: c.lastPurchaseAt,
+    });
+  };
+
+  byPhone.forEach(c => push(c, null, c.motorcycles));
+  byName.forEach(c  => push(c, null, c.motorcycles));
+  byDoc.forEach(c   => push(c, null, c.motorcycles));
+  byPlate.forEach(m => push(m.customer, m.plate));
+
+  return results.slice(0, 5);
+}
+
+export async function updateCustomerMetrics(customerId: string, saleAmount: number) {
+  return prisma.customer.update({
+    where: { id: customerId },
+    data: {
+      purchaseCount:  { increment: 1 },
+      totalSpent:     { increment: saleAmount },
+      lastPurchaseAt: new Date(),
+    },
+  });
+}
+
+export async function calculateLoyalty(customerId: string, amount: number) {
+  const pointsEarned = Math.floor(amount / POINTS_PER_PESO);
+
+  const updated = await prisma.customer.update({
+    where: { id: customerId },
+    data: {
+      loyaltyPoints: { increment: pointsEarned },
+      totalSpent:    { increment: amount },
+    },
+    select: { loyaltyPoints: true, totalSpent: true, loyaltyTier: true },
+  });
+
+  const newTier = resolveTier(toFloat(updated.totalSpent));
+
+  if (newTier !== updated.loyaltyTier) {
+    await prisma.customer.update({
+      where: { id: customerId },
+      data: { loyaltyTier: newTier },
+    });
+    logger.info(`[crmService] Tier upgrade: cliente ${customerId} → ${newTier}`);
+  }
+
+  const newPoints = updated.loyaltyPoints + pointsEarned;
+  const nextTierPoints = newTier === 'BRONZE' ? TIER_SILVER : newTier === 'SILVER' ? TIER_GOLD : null;
+
+  logger.info(`[crmService] +${pointsEarned}pts — cliente ${customerId} — tier ${newTier}`);
+
+  return {
+    pointsEarned,
+    totalPoints: newPoints,
+    newTier,
+    previousTier: updated.loyaltyTier,
+    nextTierThreshold: nextTierPoints,
+    tierChanged: newTier !== updated.loyaltyTier,
+  };
+}
+
+export async function addCommunicationLog(
+  customerId: string,
+  type: string,
+  message: string,
+  userId: string,
+) {
+  return prisma.communicationLog.create({
+    data: { customerId, type, message, performedBy: userId },
+  });
+}
+
+export async function getCustomer360(id: string) {
+  const [customer, activeCredits, activeWarranties, recentSales] = await Promise.all([
+    prisma.customer.findUnique({
+      where: { id },
+      include: {
+        motorcycles: { orderBy: { createdAt: 'desc' } },
+        logs:        { orderBy: { createdAt: 'desc' }, take: 10 },
+        reminders:   { where: { isSent: false }, orderBy: { dueDate: 'asc' } },
+      },
+    }),
+    prisma.accountReceivable.findMany({
+      where: {
+        customerId: id,
+        status: { in: ['PENDING', 'PARTIALLY_PAID', 'OVERDUE'] },
+      },
+      orderBy: { dueDate: 'asc' },
+      select: {
+        id: true, totalDebt: true, paidAmount: true,
+        remainingBalance: true, status: true, dueDate: true,
+        sale: { select: { saleNumber: true, createdAt: true } },
+      },
+    }),
+    prisma.warranty.findMany({
+      where: { customerId: id, status: 'ACTIVE', expiresAt: { gt: new Date() } },
+      orderBy: { expiresAt: 'asc' },
+    }),
+    prisma.sale.findMany({
+      where: { customerId: id, status: 'COMPLETED' },
+      orderBy: { createdAt: 'desc' },
+      take: 5,
+      select: {
+        id: true, saleNumber: true, totalAmount: true,
+        paymentMethod: true, createdAt: true,
+        motorcycle: { select: { plate: true, brand: true, model: true } },
+      },
+    }),
+  ]);
+
+  if (!customer) return null;
+
+  const totalPendingDebt = activeCredits.reduce(
+    (sum, c) => sum + toFloat(c.remainingBalance), 0,
+  );
+
+  return {
+    ...customer,
+    totalSpent:      toFloat(customer.totalSpent),
+    creditLimit:     customer.creditLimit ? toFloat(customer.creditLimit) : null,
+    activeCredits,
+    totalPendingDebt,
+    activeWarranties,
+    recentSales,
+  };
+}
+
+export async function listCustomersCRM(filters: {
+  page:    number;
+  limit:   number;
+  tier?:   string;
+  search?: string;
+}) {
+  const { page, limit, tier, search } = filters;
+  const skip = (page - 1) * limit;
+
+  const where: Prisma.CustomerWhereInput = {
+    isActive: true,
+    ...(tier   && { loyaltyTier: tier.toUpperCase() }),
+    ...(search && {
+      OR: [
+        { name:                 { contains: search, mode: 'insensitive' } },
+        { phone:                { contains: search, mode: 'insensitive' } },
+        { identificationNumber: { contains: search, mode: 'insensitive' } },
+      ],
+    }),
+  };
+
+  const [customers, total] = await prisma.$transaction([
+    prisma.customer.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy: [{ lastPurchaseAt: 'desc' }, { name: 'asc' }],
+      select: {
+        id: true, name: true, phone: true, email: true,
+        loyaltyTier: true, loyaltyPoints: true,
+        totalSpent: true, lastPurchaseAt: true,
+        purchaseCount: true, creditLimit: true,
+        isActive: true, createdAt: true,
+        motorcycles: { select: { plate: true, brand: true, model: true }, take: 1 },
+      },
+    }),
+    prisma.customer.count({ where }),
+  ]);
+
+  return {
+    data: customers.map(c => ({
+      ...c,
+      totalSpent:  toFloat(c.totalSpent),
+      creditLimit: c.creditLimit ? toFloat(c.creditLimit) : null,
+    })),
+    meta: { total, page, limit, totalPages: Math.ceil(total / limit) },
+  };
+}
+
+export async function addMotorcycle(
+  customerId: string,
+  data: { plate: string; brand: string; model: string; year?: number; lastKm?: number },
+) {
+  return prisma.motorcycle.create({
+    data: { ...data, customerId },
+  });
+}
+
+export async function updateMotorcycle(
+  id: string,
+  data: Partial<{ brand: string; model: string; year: number; lastKm: number }>,
+) {
+  return prisma.motorcycle.update({ where: { id }, data });
+}
+
+export async function createReminder(
+  customerId: string,
+  type: string,
+  message: string,
+  dueDate: Date,
+) {
+  return prisma.reminder.create({
+    data: { customerId, type, message, dueDate },
+  });
+}
+
+export async function getPendingReminders(customerId?: string) {
+  const where = {
+    isSent: false,
+    dueDate: { lte: new Date() },
+    ...(customerId && { customerId }),
+  };
+  return prisma.reminder.findMany({
+    where,
+    include: { customer: { select: { id: true, name: true, phone: true } } },
+    orderBy: { dueDate: 'asc' },
+  });
+}

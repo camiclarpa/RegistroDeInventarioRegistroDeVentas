@@ -1,0 +1,36 @@
+# ═══════════════════════════════════════════════════════════════
+# docker-compose.voice.yml - VERSIÓN SNAP COMPATIBLE
+# ═══════════════════════════════════════════════════════════════
+
+networks:
+  sigh_motos_default:
+    external: true
+
+services:
+  # ── Voice Agent (servicio principal) ────────────────────────
+  sigc_voice:
+    build:
+      context: ./voice_service
+      dockerfile: Dockerfile
+    container_name: sigc_voice
+    restart: unless-stopped
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - REDIS_URL=redis://sigc_redis:6379
+      - DATABASE_URL=postgresql://postgres:postgres123@sigc_db:5432/sigc_motos?schema=public
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "8001:8000"
+    volumes:
+      # ✅ Usar ruta permitida por Snap Docker
+      - /var/snap/docker/common/voice_service:/app:ro
+      # Si necesitas modelos locales, también moverlos:
+      # - /var/snap/docker/common/voice_models:/app/models:ro
+    networks:
+      - sigh_motos_default
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

@@ -1,4 +1,4 @@
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, PaymentMethod as PrismaPaymentMethod, SaleStatus as PrismaSaleStatus } from '@prisma/client';
 import { Sale } from '../../../core/domain/entities/Sale';
 import { ISaleRepository } from '../../../core/domain/repositories/ISaleRepository';
 import { Money } from '../../../core/domain/value-objects/Money';
@@ -17,8 +17,8 @@ export class PrismaSaleRepository implements ISaleRepository {
         discountAmount: sale.discount.getValue(),
         taxAmount: sale.tax.getValue(),
         totalAmount: sale.total.getValue(),
-        paymentMethod: sale.paymentMethod,
-        status: sale.status,
+        paymentMethod: sale.paymentMethod as PrismaPaymentMethod,
+        status: sale.status as PrismaSaleStatus,
         notes: sale.notes,
         updatedAt: new Date()
       },
@@ -31,8 +31,8 @@ export class PrismaSaleRepository implements ISaleRepository {
         discountAmount: sale.discount.getValue(),
         taxAmount: sale.tax.getValue(),
         totalAmount: sale.total.getValue(),
-        paymentMethod: sale.paymentMethod,
-        status: sale.status,
+        paymentMethod: sale.paymentMethod as PrismaPaymentMethod,
+        status: sale.status as PrismaSaleStatus,
         notes: sale.notes,
         createdAt: sale.createdAt,
         updatedAt: sale.updatedAt
@@ -72,7 +72,7 @@ export class PrismaSaleRepository implements ISaleRepository {
   async updateStatus(id: string, status: string): Promise<void> {
     await this.prisma.sales.update({
       where: { id },
-      data: { status, updatedAt: new Date() }
+      data: { status: status as PrismaSaleStatus, updatedAt: new Date() }
     });
   }
 
@@ -110,12 +110,12 @@ export class PrismaSaleRepository implements ISaleRepository {
         unitPrice: Number(item.unitPrice),
         subtotal: Number(item.lineTotal)
       })) || [],
-      new Money(Number(record.subtotal), 'COP'),
-      new Money(Number(record.discountAmount || 0), 'COP'),
-      new Money(Number(record.taxAmount), 'COP'),
-      new Money(Number(record.totalAmount), 'COP'),
-      record.paymentMethod,
-      record.status,
+      Money.create(Number(record.subtotal), 'COP'),
+      Money.create(Number(record.discountAmount || 0), 'COP'),
+      Money.create(Number(record.taxAmount), 'COP'),
+      Money.create(Number(record.totalAmount), 'COP'),
+      record.paymentMethod as 'CASH' | 'CARD' | 'TRANSFER' | 'MIXED' | 'CREDIT',
+      record.status as 'COMPLETED' | 'CANCELLED' | 'REFUNDED',
       record.notes,
       record.createdAt,
       record.updatedAt

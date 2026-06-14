@@ -14,7 +14,7 @@ export interface CreateSaleParams {
   customerId?: string;
   userId: string;
   items: SaleItem[];
-  paymentMethod: string;
+  paymentMethod: 'CASH' | 'CARD' | 'TRANSFER' | 'MIXED' | 'CREDIT';
   notes?: string;
 }
 
@@ -29,8 +29,8 @@ export class Sale {
     public readonly discount: Money,
     public readonly tax: Money,
     public readonly total: Money,
-    public readonly paymentMethod: string,
-    public readonly status: string,
+    public readonly paymentMethod: 'CASH' | 'CARD' | 'TRANSFER' | 'MIXED' | 'CREDIT',
+    public readonly status: 'COMPLETED' | 'CANCELLED' | 'REFUNDED',
     public readonly notes: string | null,
     public readonly createdAt: Date,
     public readonly updatedAt: Date
@@ -48,10 +48,10 @@ export class Sale {
       params.customerId || null,
       params.userId,
       params.items,
-      new Money(subtotalAmount, 'COP'),
-      new Money(discountAmount, 'COP'),
-      new Money(taxAmount, 'COP'),
-      new Money(totalAmount, 'COP'),
+      Money.create(subtotalAmount, 'COP'),
+      Money.create(discountAmount, 'COP'),
+      Money.create(taxAmount, 'COP'),
+      Money.create(totalAmount, 'COP'),
       params.paymentMethod,
       'COMPLETED',
       params.notes || null,
@@ -76,6 +76,28 @@ export class Sale {
       this.total,
       this.paymentMethod,
       'CANCELLED',
+      this.notes,
+      this.createdAt,
+      new Date()
+    );
+  }
+
+  refund(): Sale {
+    if (this.status !== 'COMPLETED') {
+      throw new Error('Only completed sales can be refunded');
+    }
+    return new Sale(
+      this.id,
+      this.saleNumber,
+      this.customerId,
+      this.userId,
+      this.items,
+      this.subtotal,
+      this.discount,
+      this.tax,
+      this.total,
+      this.paymentMethod,
+      'REFUNDED',
       this.notes,
       this.createdAt,
       new Date()

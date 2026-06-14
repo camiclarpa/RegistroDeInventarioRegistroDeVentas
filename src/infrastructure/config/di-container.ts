@@ -57,3 +57,7 @@ container.register<IUserRepository>('IUserRepository', {
 container.register(UserService, { useClass: UserService }, { lifecycle: Lifecycle.Singleton });
 
 export { container };
+
+// Auth Service
+import { AuthService } from '../../core/application/services/AuthService';
+container.register(AuthService, { useClass: AuthService }, { lifecycle: Lifecycle.Singleton });

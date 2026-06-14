@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  # API Gateway
+  gateway:
+    image: traefik:v3.0
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "80:80"
+      - "8080:8080"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks:
+      - sigc-network
+
+  # Auth Service
+  auth-service:
+    build: ./apps/auth-service
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - DATABASE_URL=postgresql://postgres:postgres123@db:5432/sigc_motos_auth
+      - JWT_SECRET=${JWT_SECRET:-supersecretkey}
+      - JWT_EXPIRES_IN=8h
+    depends_on:
+      - db
+    networks:
+      - sigc-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.auth.rule=PathPrefix(/api/v1/auth)"
+      - "traefik.http.services.auth.loadbalancer.server.port=3001"
+
+  # Base de datos compartida (schemas separados)
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres123
+      - POSTGRES_DB=sigc_motos
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - sigc-network
+
+  # Redis para caché y eventos
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - sigc-network
+
+networks:
+  sigc-network:
+    driver: bridge
+
+volumes:
+  postgres_data:

@@ -21,7 +21,7 @@ export interface AuthResponse {
 
 export class AuthService {
   private readonly jwtSecret: string;
-  private readonly jwtExpiresIn: string;
+  private readonly jwtExpiresIn: string | number;
 
   constructor(private readonly userRepo: IUserRepository) {
     this.jwtSecret = process.env.JWT_SECRET || 'secret-dev';
@@ -34,7 +34,7 @@ export class AuthService {
       throw new Error('Credenciales inválidas');
     }
 
-    // Verificar contraseña (esto debería ir en el repositorio)
+    // Verificar contraseña
     const isValid = await bcrypt.compare(credentials.password, user.password);
     if (!isValid) {
       throw new Error('Credenciales inválidas');
@@ -47,12 +47,12 @@ export class AuthService {
         roleId: user.roleId
       },
       this.jwtSecret,
-      { expiresIn: this.jwtExpiresIn }
+      { expiresIn: this.jwtExpiresIn as jwt.SignOptions['expiresIn'] }
     );
 
     return {
       token,
-      expiresIn: this.jwtExpiresIn,
+      expiresIn: typeof this.jwtExpiresIn === 'number' ? `${this.jwtExpiresIn}s` : this.jwtExpiresIn,
       user: {
         id: user.id,
         email: user.email.getValue(),

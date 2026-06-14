@@ -6,14 +6,17 @@ import { PrismaClient } from '@prisma/client';
 import { IConfigRepository } from '../../core/domain/repositories/IConfigRepository';
 import { IProductRepository } from '../../core/domain/repositories/IProductRepository';
 import { ISaleRepository } from '../../core/domain/repositories/ISaleRepository';
+import { ICustomerRepository } from '../../core/domain/repositories/ICustomerRepository';
 import { PrismaConfigRepository } from '../prisma/repositories/PrismaConfigRepository';
 import { PrismaProductRepository } from '../prisma/repositories/PrismaProductRepository';
 import { PrismaSaleRepository } from '../prisma/repositories/PrismaSaleRepository';
+import { PrismaCustomerRepository } from '../prisma/repositories/PrismaCustomerRepository';
 
 // Services
 import { ConfigService } from '../../core/application/services/ConfigService';
 import { ProductService } from '../../core/application/services/ProductService';
 import { SaleService } from '../../core/application/services/SaleService';
+import { CustomerService } from '../../core/application/services/CustomerService';
 
 // Prisma Client singleton
 container.register<PrismaClient>(PrismaClient, {
@@ -37,5 +40,11 @@ container.register<ISaleRepository>('ISaleRepository', {
   useClass: PrismaSaleRepository
 }, { lifecycle: Lifecycle.Singleton });
 container.register(SaleService, { useClass: SaleService }, { lifecycle: Lifecycle.Singleton });
+
+// Customer
+container.register<ICustomerRepository>('ICustomerRepository', {
+  useClass: PrismaCustomerRepository
+}, { lifecycle: Lifecycle.Singleton });
+container.register(CustomerService, { useClass: CustomerService }, { lifecycle: Lifecycle.Singleton });
 
 export { container };

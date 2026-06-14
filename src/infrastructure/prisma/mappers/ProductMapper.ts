@@ -9,12 +9,12 @@ export class ProductMapper {
   static toDomain(prismaProduct: PrismaProduct): Product {
     return new Product(
       prismaProduct.id,
-      new SKU(prismaProduct.skuInternal),
+      SKU.create(prismaProduct.skuInternal),
       prismaProduct.nameCommercial,
       prismaProduct.brandId,
       prismaProduct.categoryId,
-      new Money(Number(prismaProduct.costPriceAvg), 'COP'),
-      new Money(Number(prismaProduct.salePriceBase), 'COP'),
+      Money.create(Number(prismaProduct.costPriceAvg), 'COP'),
+      Money.create(Number(prismaProduct.salePriceBase), 'COP'),
       prismaProduct.stockQuantity,
       prismaProduct.minStockLevel,
       prismaProduct.isActive,

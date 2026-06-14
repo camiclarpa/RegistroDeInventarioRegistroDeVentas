@@ -14,7 +14,7 @@ export interface CreateProductParams {
 }
 
 export class Product {
-  private constructor(
+  constructor(
     public readonly id: string,
     public readonly sku: SKU,
     public readonly name: string,
@@ -32,12 +32,12 @@ export class Product {
   static create(params: CreateProductParams): Product {
     return new Product(
       params.id || crypto.randomUUID(),
-      new SKU(params.skuInternal),
+      SKU.create(params.skuInternal),
       params.nameCommercial,
       params.brandId,
       params.categoryId,
-      new Money(params.costPriceAvg, 'COP'),
-      new Money(params.salePriceBase, 'COP'),
+      Money.create(params.costPriceAvg, 'COP'),
+      Money.create(params.salePriceBase, 'COP'),
       params.stockQuantity,
       params.minStockLevel,
       true,

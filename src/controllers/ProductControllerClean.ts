@@ -16,7 +16,8 @@ export const ProductController = {
 
   async getProductById(req: Request, res: Response): Promise<Response> {
     try {
-      const product = await productService.getProductById(req.params.id);
+      const id = req.params.id as string;
+      const product = await productService.getProductById(id);
       if (!product) {
         return res.status(404).json({ success: false, error: 'Product not found' });
       }
@@ -46,8 +47,9 @@ export const ProductController = {
 
   async updateStock(req: Request, res: Response): Promise<Response> {
     try {
+      const id = req.params.id as string;
       const { quantity } = req.body;
-      await productService.updateStock(req.params.id, quantity);
+      await productService.updateStock(id, quantity);
       return res.json({ success: true, message: 'Stock updated successfully' });
     } catch (error) {
       return res.status(400).json({ success: false, error: (error as Error).message });

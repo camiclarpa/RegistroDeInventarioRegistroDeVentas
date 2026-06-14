@@ -84,3 +84,56 @@ app.get('/api/v1/categories', async (_req, res) => {
 app.listen(PORT, () => {
   console.log(`📦 Inventory service running on port ${PORT}`);
 });
+
+// Importar eventos
+import { RedisEventPublisher } from '../../src/infrastructure/messaging/RedisEventPublisher';
+import { StockUpdatedEvent, StockLowEvent } from '../../src/core/domain/events/InventoryEvents';
+
+// Inicializar publisher
+const eventPublisher = new RedisEventPublisher(process.env.REDIS_URL);
+
+// Modificar updateStock para publicar evento
+app.patch('/api/v1/products/:id/stock', async (req, res) => {
+  try {
+    const product = await prisma.product.findUnique({ where: { id: req.params.id } });
+    if (!product) {
+      return res.status(404).json({ success: false, error: 'Product not found' });
+    }
+
+    const previousStock = product.stockQuantity;
+    const newStock = previousStock + req.body.quantity;
+    
+    await prisma.product.update({
+      where: { id: req.params.id },
+      data: { stockQuantity: newStock, updatedAt: new Date() }
+    });
+
+    // Publicar evento de stock actualizado
+    await eventPublisher.publish(new StockUpdatedEvent(
+      product.id,
+      {
+        previousStock,
+        newStock,
+        quantityChanged: req.body.quantity,
+        reason: req.body.reason || 'manual adjustment'
+      }
+    ));
+
+    // Verificar stock bajo
+    if (newStock <= product.minStockLevel) {
+      await eventPublisher.publish(new StockLowEvent(
+        product.id,
+        {
+          sku: product.skuInternal,
+          name: product.nameCommercial,
+          currentStock: newStock,
+          minStockLevel: product.minStockLevel
+        }
+      ));
+    }
+
+    res.json({ success: true, data: { previousStock, newStock } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});

@@ -1,0 +1,2 @@
+// Reemplazar el error handling
+// Cambiar catch (err: unknown) por catch (err) y usar type guards

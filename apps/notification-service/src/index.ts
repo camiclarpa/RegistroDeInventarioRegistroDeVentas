@@ -69,3 +69,9 @@ app.get('/api/v1/circuit-breaker/status', (_req, res) => {
     message: 'Circuit breaker integrado correctamente' 
   });
 });
+
+// Iniciar consumer de eventos
+require("./consumer");
+
+// Iniciar consumer de eventos
+require("./consumer");

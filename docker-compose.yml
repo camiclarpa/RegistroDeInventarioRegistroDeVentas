@@ -187,6 +187,40 @@ services:
       - "traefik.http.routers.dashboard.rule=PathPrefix(`/dashboard`)"
       - "traefik.http.routers.dashboard.service=api@internal"
 
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: sigc_prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus_data:/prometheus
+    networks:
+      - sigc-net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: sigc_grafana
+    restart: unless-stopped
+    ports:
+      - "3002:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - sigc-net
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: sigc_jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+    networks:
+      - sigc-net
+
 volumes:
   sigh_motos_pgdata:
   sigh_motos_redis_data:
@@ -195,43 +229,10 @@ volumes:
   nginx_conf:
   certbot_certs:
   certbot_www:
+  prometheus_data:
+  grafana_data:
 
 networks:
   sigc-net:
     driver: bridge
     name: sigh_motos_sigc-net
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: sigc_grafana
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_INSTALL_PLUGINS=grafana-piechart-panel
-    volumes:
-      - grafana_data:/var/lib/grafana
-    networks:
-      - sigc-net
-
-volumes:
-  grafana_data:
-
-  jaeger:
-    image: jaegertracing/all-in-one:latest
-    container_name: sigc_jaeger
-    restart: unless-stopped
-    ports:
-      - "5775:5775/udp"
-      - "6831:6831/udp"
-      - "6832:6832/udp"
-      - "5778:5778"
-      - "16686:16686"
-      - "14268:14268"
-      - "14250:14250"
-      - "9411:9411"
-    environment:
-      - COLLECTOR_OTLP_ENABLED=true
-    networks:
-      - sigc-net

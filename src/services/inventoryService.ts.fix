@@ -1,0 +1,2 @@
+// Reemplazar tipos unknown con tipos específicos
+// Cambiar: (filters: unknown) a (filters: { brandId?: string; categoryId?: string; isActive?: boolean; search?: string })

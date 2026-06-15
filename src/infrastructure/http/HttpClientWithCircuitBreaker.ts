@@ -12,18 +12,19 @@ export class HttpClientWithCircuitBreaker {
     }, serviceName);
   }
 
-  async get<T>(url: string): Promise<T> {
-    return this.circuitBreaker.execute(async () => {
+  async get<T = any>(url: string): Promise<T> {
+    const result = await this.circuitBreaker.execute(async () => {
       const response = await fetch(url);
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
-      return response.json();
+      return response.json() as Promise<T>;
     });
+    return result as T;
   }
 
-  async post<T>(url: string, body: any): Promise<T> {
-    return this.circuitBreaker.execute(async () => {
+  async post<T = any>(url: string, body: any): Promise<T> {
+    const result = await this.circuitBreaker.execute(async () => {
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -32,8 +33,9 @@ export class HttpClientWithCircuitBreaker {
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
-      return response.json();
+      return response.json() as Promise<T>;
     });
+    return result as T;
   }
 
   getState(): string {

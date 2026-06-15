@@ -37,3 +37,9 @@ app.get('/metrics', metricsEndpoint);
 
 // En el endpoint de KPIs, agregar:
 // kpiRequests.inc();
+
+// Iniciar consumer de eventos
+require("./consumer");
+
+// Iniciar consumer de eventos
+require("./consumer");

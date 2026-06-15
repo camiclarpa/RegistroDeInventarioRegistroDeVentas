@@ -1,33 +1,25 @@
 import Redis from 'ioredis';
+import { DomainEvent } from '../../core/domain/events/DomainEvent';
 
 export interface IEventPublisher {
-  publish(event: any): Promise<void>;
-  publishBatch(events: any[]): Promise<void>;
+  publish(event: DomainEvent): Promise<void>;
+  publishBatch(events: DomainEvent[]): Promise<void>;
 }
 
 export class RedisEventPublisher implements IEventPublisher {
   private readonly redis: Redis;
   private readonly streamKey: string = 'events';
+  private readonly consumerGroup: string = 'sigc-consumers';
 
-  constructor() {
-    const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
-    console.log(`🔌 Conectando a Redis: ${redisUrl}`);
-    this.redis = new Redis(redisUrl, {
-      maxRetriesPerRequest: 3,
-      retryStrategy: (times) => {
-        if (times > 3) {
-          console.error('❌ No se pudo conectar a Redis después de 3 intentos');
-          return null;
-        }
-        return Math.min(times * 100, 2000);
-      }
+  constructor(redisUrl?: string) {
+    this.redis = redisUrl ? new Redis(redisUrl) : new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: parseInt(process.env.REDIS_PORT || '6379'),
+      retryStrategy: (times) => Math.min(times * 50, 2000)
     });
-    
-    this.redis.on('connect', () => console.log('✅ Redis conectado'));
-    this.redis.on('error', (err) => console.error('❌ Redis error:', err.message));
   }
 
-  async publish(event: any): Promise<void> {
+  async publish(event: DomainEvent): Promise<void> {
     const message = JSON.stringify({
       id: event.id,
       type: event.type,
@@ -48,10 +40,10 @@ export class RedisEventPublisher implements IEventPublisher {
       event.aggregateId
     );
     
-    console.log(`📡 Evento publicado: ${event.type}`);
+    console.log(`📡 Evento publicado: ${event.type} (${event.aggregateId})`);
   }
 
-  async publishBatch(events: any[]): Promise<void> {
+  async publishBatch(events: DomainEvent[]): Promise<void> {
     const pipeline = this.redis.pipeline();
     
     for (const event of events) {
@@ -68,6 +60,15 @@ export class RedisEventPublisher implements IEventPublisher {
     
     await pipeline.exec();
     console.log(`📡 Batch publicado: ${events.length} eventos`);
+  }
+
+  async createConsumerGroup(): Promise<void> {
+    try {
+      await this.redis.xgroup('CREATE', this.streamKey, this.consumerGroup, '0', 'MKSTREAM');
+      console.log(`✅ Consumer group creado: ${this.consumerGroup}`);
+    } catch (error) {
+      // El grupo ya existe
+    }
   }
 
   async close(): Promise<void> {

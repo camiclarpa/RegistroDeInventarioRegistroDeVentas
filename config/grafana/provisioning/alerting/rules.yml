@@ -1,0 +1,69 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: sigc_alerts
+    folder: SIGC-Motos
+    interval: 60s
+    rules:
+      - uid: service_down
+        title: "Servicio caído"
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model: |
+              {
+                "expr": "up{job=\"sigc-microservices\"} == 0",
+                "refId": "A"
+              }
+        noDataState: Alerting
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "El servicio {{ $labels.instance }} está caído"
+        labels:
+          severity: critical
+      
+      - uid: high_error_rate
+        title: "Alta tasa de errores"
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model: |
+              {
+                "expr": "rate(http_requests_total{status=~\"5..\"}[5m]) > 0.1",
+                "refId": "A"
+              }
+        for: 2m
+        annotations:
+          summary: "Tasa de errores superior al 10%"
+        labels:
+          severity: warning
+      
+      - uid: high_latency
+        title: "Alta latencia"
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model: |
+              {
+                "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 1",
+                "refId": "A"
+              }
+        for: 5m
+        annotations:
+          summary: "Latencia p95 superior a 1 segundo"
+        labels:
+          severity: warning

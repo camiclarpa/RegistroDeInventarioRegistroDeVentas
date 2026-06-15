@@ -137,3 +137,42 @@ app.patch('/api/v1/products/:id/stock', async (req, res) => {
     res.status(500).json({ success: false, error: (error as Error).message });
   }
 });
+
+import { CircuitBreaker } from '../../src/infrastructure/resilience/CircuitBreaker';
+
+// Circuit breaker para base de datos
+const dbBreaker = new CircuitBreaker({
+  failureThreshold: 5,
+  timeout: 3000,
+  resetTimeout: 30000,
+  monitorInterval: 10000
+}, 'inventory-db');
+
+// Endpoint con circuit breaker
+app.get('/api/v1/products/resilient', async (req, res) => {
+  try {
+    const result = await dbBreaker.execute(async () => {
+      return await prisma.product.findMany({
+        take: 100,
+        orderBy: { createdAt: 'desc' }
+      });
+    });
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(503).json({ 
+      success: false, 
+      error: 'Service temporarily unavailable',
+      circuitBreaker: dbBreaker.getState()
+    });
+  }
+});
+
+// Endpoint de métricas del circuit breaker
+app.get('/api/v1/metrics/circuit-breaker', (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      inventory: dbBreaker.getMetrics()
+    }
+  });
+});

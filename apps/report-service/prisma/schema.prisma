@@ -8,21 +8,27 @@ datasource db {
 }
 
 model Sale {
-  id         String   @id @default(cuid())
-  saleNumber String   @unique
+  id          String   @id @default(cuid())
+  saleNumber  String   @unique
   totalAmount Float
-  createdAt  DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  @@map("sales")
 }
 
 model Product {
-  id       String @id @default(cuid())
-  sku      String @unique
-  name     String
-  stock    Int
+  id        String   @id @default(cuid())
+  sku       String   @unique
+  name      String
+  stock     Int
+
+  @@map("products")
 }
 
 model Customer {
   id    String @id @default(cuid())
   email String @unique
   name  String
+
+  @@map("customers")
 }

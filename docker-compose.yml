@@ -157,16 +157,35 @@ services:
       - "3003:3003"
     networks:
       - sigc-net
-        labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.inventory.rule=PathPrefix(`/api/v1/products`)"
-      - "traefik.http.services.inventory.loadbalancer.server.port=3003"
     healthcheck:
       test: ["CMD", "node", "-e", "require('http').get('http://localhost:3003/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
+
+  traefik:
+    image: traefik:v3.0
+    container_name: sigc_traefik
+    restart: unless-stopped
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=sigc-net"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "8081:80"
+      - "8082:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - sigc-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=PathPrefix(`/api`)"
+      - "traefik.http.routers.dashboard.rule=PathPrefix(`/dashboard`)"
+      - "traefik.http.routers.dashboard.service=api@internal"
 
 volumes:
   sigh_motos_pgdata:
@@ -181,22 +200,3 @@ networks:
   sigc-net:
     driver: bridge
     name: sigh_motos_sigc-net
-
-  traefik:
-    image: traefik:v3.0
-    container_name: sigc_traefik
-    restart: unless-stopped
-    command:
-      - "--configFile=/etc/traefik/traefik.yml"
-    ports:
-      - "80:80"
-      - "8080:8080"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./traefik.yml:/etc/traefik/traefik.yml:ro
-    networks:
-      - sigc-net
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.dashboard.rule=PathPrefix(`/dashboard`)"
-      - "traefik.http.routers.dashboard.service=api@internal"

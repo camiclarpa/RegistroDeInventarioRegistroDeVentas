@@ -34,11 +34,10 @@ export class ResilientEventSubscriber {
   async start(): Promise<void> {
     console.log(`🔄 Iniciando subscriber resiliente: ${this.consumerName}`);
     
-    // Crear consumer group si no existe
     try {
       await this.redis.xgroup('CREATE', this.streamKey, this.consumerGroup, '0', 'MKSTREAM');
     } catch (error) {
-      // Grupo ya existe
+      // Consumer group already exists
     }
 
     while (this.running) {
@@ -47,29 +46,32 @@ export class ResilientEventSubscriber {
           'GROUP',
           this.consumerGroup,
           this.consumerName,
-          'BLOCK',
-          1000,
           'COUNT',
           10,
+          'BLOCK',
+          1000,
           'STREAMS',
           this.streamKey,
           '>'
         );
 
-        if (results) {
-          for (const [stream, messages] of results) {
-            for (const [id, fields] of messages) {
+        if (results && Array.isArray(results)) {
+          for (const stream of results) {
+            const messages = stream[1];
+            for (const message of messages) {
+              const messageId = message[0];
+              const fields = message[1];
               const eventData = this.parseEvent(fields);
               if (eventData) {
                 const success = await this.processEventWithRetry(eventData);
                 if (success) {
-                  await this.redis.xack(this.streamKey, this.consumerGroup, id);
+                  await this.redis.xack(this.streamKey, this.consumerGroup, messageId);
                 } else {
-                  await this.sendToDLQ(eventData, id);
-                  await this.redis.xack(this.streamKey, this.consumerGroup, id);
+                  await this.sendToDLQ(eventData, messageId);
+                  await this.redis.xack(this.streamKey, this.consumerGroup, messageId);
                 }
               } else {
-                await this.redis.xack(this.streamKey, this.consumerGroup, id);
+                await this.redis.xack(this.streamKey, this.consumerGroup, messageId);
               }
             }
           }
@@ -87,7 +89,7 @@ export class ResilientEventSubscriber {
         await this.processEvent(event);
         return true;
       } catch (error) {
-        console.error(`Error procesando evento ${event.id} (intento ${attempt}/${retries}):`, error);
+        console.error(`Error procesando evento (intento ${attempt}/${retries}):`, error);
         if (attempt < retries) {
           await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
         }

@@ -1,8 +1,14 @@
 import { Product, CreateProductParams } from '../../domain/entities/Product';
-import { IProductRepository, ProductFilters, PaginatedResult } from '../../domain/repositories/IProductRepository';
+import { IProductRepository } from '../../domain/repositories/IProductRepository';
+import { RedisEventPublisher } from '../../../infrastructure/messaging/RedisEventPublisher';
+import { ProductCreatedEvent } from '../../domain/events/InventoryEvents';
 
 export class ProductService {
-  constructor(private readonly productRepo: IProductRepository) {}
+  private eventPublisher: RedisEventPublisher;
+
+  constructor(private readonly productRepo: IProductRepository) {
+    this.eventPublisher = new RedisEventPublisher();
+  }
 
   async createProduct(params: CreateProductParams): Promise<Product> {
     const exists = await this.productRepo.exists(params.skuInternal);
@@ -12,6 +18,17 @@ export class ProductService {
 
     const product = Product.create(params);
     await this.productRepo.save(product);
+    
+    // PUBLICAR EVENTO DE DOMINIO
+    const event = new ProductCreatedEvent(product.id, {
+      sku: product.sku.getValue(),
+      name: product.name,
+      price: product.salePrice.getValue(),
+      stock: product.stockQuantity
+    });
+    await this.eventPublisher.publish(event);
+    console.log(`📡 Evento publicado: ${event.type} - Producto ${product.name}`);
+    
     return product;
   }
 
@@ -23,7 +40,7 @@ export class ProductService {
     return this.productRepo.findBySKU(sku);
   }
 
-  async listProducts(filters: ProductFilters, page: number = 1, limit: number = 20): Promise<PaginatedResult<Product>> {
+  async listProducts(filters: any, page: number = 1, limit: number = 20): Promise<any> {
     return this.productRepo.findAll(filters, page, limit);
   }
 
@@ -32,7 +49,6 @@ export class ProductService {
     if (!product) {
       throw new Error(`Product ${productId} not found`);
     }
-
     product.updateStock(quantity);
     await this.productRepo.updateStock(productId, product.stockQuantity);
   }

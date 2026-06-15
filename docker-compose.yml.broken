@@ -1,0 +1,202 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: sigc_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres123
+      POSTGRES_DB: sigc_motos
+    volumes:
+      - sigh_motos_pgdata:/var/lib/postgresql/data
+    networks:
+      - sigc-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sigc_motos"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: sigc_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - sigh_motos_redis_data:/data
+    networks:
+      - sigc-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    container_name: sigc_app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres123@db:5432/sigc_motos?schema=public
+      NODE_ENV: production
+      PORT: 3000
+      JWT_SECRET: ${JWT_SECRET:-secret-change-in-production}
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "3001:3000"
+    volumes:
+      - sigh_motos_uploads:/app/uploads
+    networks:
+      - sigc-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  voice:
+    build: ./voice_service
+    container_name: sigc_voice
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://postgres:postgres123@db:5432/sigc_motos?schema=public
+    ports:
+      - "8001:8000"
+    networks:
+      - sigc-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: sigc_nginx
+    restart: unless-stopped
+    ports:
+      - "8888:80"
+    volumes:
+      - nginx_html:/usr/share/nginx/html:ro
+      - nginx_conf:/etc/nginx/conf.d:ro
+    networks:
+      - sigc-net
+
+  certbot:
+    image: certbot/certbot:latest
+    container_name: sigc_certbot
+    restart: unless-stopped
+    volumes:
+      - certbot_certs:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    entrypoint: ["sleep", "infinity"]
+    networks:
+      - sigc-net
+
+  notification-service:
+    build: ./apps/notification-service
+    container_name: sigc_notification_service
+    restart: unless-stopped
+    ports:
+      - "3004:3004"
+    networks:
+      - sigc-net
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3004/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  report-service:
+    build: ./apps/report-service
+    container_name: sigc_report_service
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres123@db:5432/sigc_motos
+      PORT: 3005
+      NODE_ENV: production
+    ports:
+      - "3005:3005"
+    networks:
+      - sigc-net
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3005/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  inventory-service:
+    build: ./apps/inventory-service
+    container_name: sigc_inventory_service
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres123@db:5432/sigc_motos
+      PORT: 3003
+      NODE_ENV: production
+    ports:
+      - "3003:3003"
+    networks:
+      - sigc-net
+        labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.inventory.rule=PathPrefix(`/api/v1/products`)"
+      - "traefik.http.services.inventory.loadbalancer.server.port=3003"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3003/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  sigh_motos_pgdata:
+  sigh_motos_redis_data:
+  sigh_motos_uploads:
+  nginx_html:
+  nginx_conf:
+  certbot_certs:
+  certbot_www:
+
+networks:
+  sigc-net:
+    driver: bridge
+    name: sigh_motos_sigc-net
+
+  traefik:
+    image: traefik:v3.0
+    container_name: sigc_traefik
+    restart: unless-stopped
+    command:
+      - "--configFile=/etc/traefik/traefik.yml"
+    ports:
+      - "80:80"
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+    networks:
+      - sigc-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=PathPrefix(`/dashboard`)"
+      - "traefik.http.routers.dashboard.service=api@internal"

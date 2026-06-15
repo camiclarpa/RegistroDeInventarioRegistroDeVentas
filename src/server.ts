@@ -18,3 +18,11 @@ process.on('SIGINT', async () => {
   await prisma.$disconnect();
   process.exit(0);
 });
+
+import { metricsMiddleware, metricsEndpoint } from './infrastructure/monitoring/prometheus';
+
+// Middleware de métricas
+app.use(metricsMiddleware);
+
+// Endpoint de métricas
+app.get('/metrics', metricsEndpoint);

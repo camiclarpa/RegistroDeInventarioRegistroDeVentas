@@ -30,3 +30,10 @@ app.get('/api/v1/reports/kpis', async (_req, res) => {
 app.listen(PORT, () => {
   console.log(`📊 Report service running on port ${PORT}`);
 });
+
+import { kpiRequests, metricsEndpoint } from './metrics';
+
+app.get('/metrics', metricsEndpoint);
+
+// En el endpoint de KPIs, agregar:
+// kpiRequests.inc();

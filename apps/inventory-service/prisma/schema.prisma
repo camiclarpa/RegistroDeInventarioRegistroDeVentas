@@ -10,13 +10,22 @@ datasource db {
 model Product {
   id            String   @id @default(cuid())
   skuInternal   String   @unique
-  nameCommercial String
+  barcodeExternal String?
+  partNumberOEM String
   brandId       String
   categoryId    String
+  nameCommercial String
+  descriptionTech String?
+  compatibleModels Json     @default("[]")
+  imageKey      String?
+  locationBin   String
   costPriceAvg  Float
   salePriceBase Float
+  taxRate       Float    @default(19)
   stockQuantity Int      @default(0)
   minStockLevel Int      @default(5)
+  maxStockLevel Int?
+  warrantyDays  Int      @default(0)
   isActive      Boolean  @default(true)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt

@@ -20,7 +20,14 @@ export class RedisEventPublisher implements IEventPublisher {
   }
 
   async publish(event: DomainEvent): Promise<void> {
-    const message = JSON.stringify(event.toJSON());
+    const message = JSON.stringify({
+      id: event.id,
+      type: event.type,
+      aggregateId: event.aggregateId,
+      occurredAt: event.occurredAt.toISOString(),
+      version: event.version,
+      payload: event.payload
+    });
     
     await this.redis.xadd(
       this.streamKey,
@@ -40,7 +47,14 @@ export class RedisEventPublisher implements IEventPublisher {
     const pipeline = this.redis.pipeline();
     
     for (const event of events) {
-      const message = JSON.stringify(event.toJSON());
+      const message = JSON.stringify({
+        id: event.id,
+        type: event.type,
+        aggregateId: event.aggregateId,
+        occurredAt: event.occurredAt.toISOString(),
+        version: event.version,
+        payload: event.payload
+      });
       pipeline.xadd(this.streamKey, '*', 'event', message, 'type', event.type, 'aggregateId', event.aggregateId);
     }
     

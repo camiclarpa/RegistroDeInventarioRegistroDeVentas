@@ -1,8 +1,12 @@
 import { Request, Response } from 'express';
-import { container } from '../infrastructure/config/di-container';
-import { AuthService } from '../core/application/services/AuthService';
+import { AuthService } from '../services/AuthService';
+import { PrismaUserRepository } from '../repositories/PrismaUserRepository';
+import { PrismaClient } from '@prisma/client';
 
-const authService = container.resolve(AuthService);
+// Inicializar dependencias
+const prisma = new PrismaClient();
+const userRepository = new PrismaUserRepository(prisma);
+const authService = new AuthService(userRepository);
 
 export const AuthController = {
   async login(req: Request, res: Response): Promise<Response> {

@@ -20,6 +20,8 @@ model Product {
   isActive      Boolean  @default(true)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+
+  @@map("products")
 }
 
 model Brand {
@@ -28,6 +30,8 @@ model Brand {
   isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@map("brands")
 }
 
 model Category {
@@ -36,4 +40,6 @@ model Category {
   isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@map("categories")
 }

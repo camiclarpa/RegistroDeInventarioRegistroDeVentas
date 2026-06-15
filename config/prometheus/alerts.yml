@@ -1,0 +1,39 @@
+groups:
+  - name: sigc_alerts
+    interval: 30s
+    rules:
+      - alert: ServiceDown
+        expr: up{job="sigc-microservices"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.instance }} is down"
+          description: "Service has been down for more than 1 minute"
+
+      - alert: HighErrorRate
+        expr: rate(errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate on {{ $labels.route }}"
+          description: "Error rate is above 10% for 2 minutes"
+
+      - alert: HighLatency
+        expr: http_request_duration_p95_seconds > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High latency detected"
+          description: "P95 latency is above 1 second for 5 minutes"
+
+      - alert: ServiceUnhealthy
+        expr: health_status == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service health check failed"
+          description: "Service is reporting unhealthy"

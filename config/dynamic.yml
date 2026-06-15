@@ -1,0 +1,78 @@
+# Configuración dinámica - Rutas de microservicios
+http:
+  routers:
+    # API Principal (Monolito)
+    api-monolith:
+      rule: "PathPrefix(`/api/v1/`)"
+      service: monolith-service
+      middlewares:
+        - stripprefix-regex
+      priority: 10
+
+    # Notification Service
+    api-notification:
+      rule: "PathPrefix(`/api/v1/notifications`)"
+      service: notification-service
+      priority: 20
+
+    # Report Service
+    api-report:
+      rule: "PathPrefix(`/api/v1/reports`)"
+      service: report-service
+      priority: 20
+
+    # Health checks agregados
+    health-monolith:
+      rule: "Path(`/health`)"
+      service: monolith-service
+      priority: 30
+
+    health-notification:
+      rule: "Path(`/health`) && Headers(`X-Service`, `notification`)"
+      service: notification-service
+      priority: 30
+
+    # Dashboard de Traefik
+    api-dashboard:
+      rule: "PathPrefix(`/dashboard`)"
+      service: api@internal
+      middlewares:
+        - auth-basic
+
+  services:
+    monolith-service:
+      loadBalancer:
+        servers:
+          - url: "http://sigc_app:3000"
+        healthCheck:
+          path: /health
+          interval: 30s
+          timeout: 3s
+
+    notification-service:
+      loadBalancer:
+        servers:
+          - url: "http://sigc_notification_service:3004"
+        healthCheck:
+          path: /health
+          interval: 30s
+          timeout: 3s
+
+    report-service:
+      loadBalancer:
+        servers:
+          - url: "http://sigc_report_service:3005"
+        healthCheck:
+          path: /health
+          interval: 30s
+          timeout: 3s
+
+  middlewares:
+    stripprefix-regex:
+      stripPrefixRegex:
+        regex:
+          - "/api/v1/[^/]+"
+    auth-basic:
+      basicAuth:
+        users:
+          - "admin:$2y$10$N9qo8uLOickgx2ZMRZoMy.Mr/.JwVY6qKZ9qV9gH8qZ9qV9gH8qZ"

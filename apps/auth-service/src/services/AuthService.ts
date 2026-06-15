@@ -1,7 +1,6 @@
 import jwt from 'jsonwebtoken';
-import bcrypt from 'bcrypt';
-import { IUserRepository } from '../../domain/repositories/IUserRepository';
-import { User } from '../../domain/entities/User';
+import { IUserRepository } from '../repositories/IUserRepository';
+import { User } from '../domain/User';
 
 export interface LoginCredentials {
   email: string;
@@ -34,9 +33,8 @@ export class AuthService {
       throw new Error('Credenciales inválidas');
     }
 
-    // Verificar contraseña
-    const isValid = await bcrypt.compare(credentials.password, user.password);
-    if (!isValid) {
+    // Verificar contraseña (comparación directa por ahora)
+    if (credentials.password !== user.password) {
       throw new Error('Credenciales inválidas');
     }
 

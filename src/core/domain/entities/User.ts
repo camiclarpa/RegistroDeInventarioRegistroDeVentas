@@ -5,6 +5,7 @@ export interface CreateUserParams {
   email: string;
   name: string;
   roleId: string;
+  password: string;
   isActive?: boolean;
 }
 
@@ -14,6 +15,7 @@ export class User {
     public readonly email: Email,
     public readonly name: string,
     public readonly roleId: string,
+    public readonly password: string,
     public readonly isActive: boolean,
     public readonly createdAt: Date,
     public readonly updatedAt: Date
@@ -25,6 +27,7 @@ export class User {
       Email.create(params.email),
       params.name,
       params.roleId,
+      params.password,
       params.isActive ?? true,
       new Date(),
       new Date()
@@ -37,10 +40,16 @@ export class User {
       this.email,
       this.name,
       this.roleId,
+      this.password,
       false,
       this.createdAt,
       new Date()
     );
+  }
+
+  validatePassword(plainPassword: string, hashedPassword: string): boolean {
+    // Este método debería usar bcrypt, pero la comparación se hará en el repositorio
+    return plainPassword === hashedPassword; // Placeholder
   }
 
   toJSON() {

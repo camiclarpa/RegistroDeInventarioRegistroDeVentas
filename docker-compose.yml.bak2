@@ -86,6 +86,9 @@ services:
     image: nginx:1.27-alpine
     container_name: sigc_nginx
     restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_started
     ports:
       - "8888:80"
     volumes:
@@ -105,68 +108,6 @@ services:
     networks:
       - sigc-net
 
-  notification-service:
-    build: ./apps/notification-service
-    container_name: sigc_notification_service
-    restart: unless-stopped
-    ports:
-      - "3004:3004"
-    networks:
-      - sigc-net
-    healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3004/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-
-  report-service:
-    build: ./apps/report-service
-    container_name: sigc_report_service
-    restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres123@db:5432/sigc_motos
-      PORT: 3005
-      NODE_ENV: production
-    ports:
-      - "3005:3005"
-    networks:
-      - sigc-net
-    healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3005/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-
-  inventory-service:
-    build: ./apps/inventory-service
-    container_name: sigc_inventory_service
-    restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres123@db:5432/sigc_motos
-      PORT: 3003
-      NODE_ENV: production
-    ports:
-      - "3003:3003"
-    networks:
-      - sigc-net
-        labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.inventory.rule=PathPrefix(`/api/v1/products`)"
-      - "traefik.http.services.inventory.loadbalancer.server.port=3003"
-    healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3003/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
 
 volumes:
   sigh_motos_pgdata:
@@ -180,23 +121,3 @@ volumes:
 networks:
   sigc-net:
     driver: bridge
-    name: sigh_motos_sigc-net
-
-  traefik:
-    image: traefik:v3.0
-    container_name: sigc_traefik
-    restart: unless-stopped
-    command:
-      - "--configFile=/etc/traefik/traefik.yml"
-    ports:
-      - "80:80"
-      - "8080:8080"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./traefik.yml:/etc/traefik/traefik.yml:ro
-    networks:
-      - sigc-net
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.dashboard.rule=PathPrefix(`/dashboard`)"
-      - "traefik.http.routers.dashboard.service=api@internal"

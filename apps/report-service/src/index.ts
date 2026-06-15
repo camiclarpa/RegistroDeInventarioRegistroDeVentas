@@ -20,16 +20,10 @@ app.get('/health', (_req, res) => {
 
 app.get('/api/v1/reports/kpis', async (_req, res) => {
   try {
-    const totalSales = await prisma.sale.count();
     const totalProducts = await prisma.product.count();
-    const totalCustomers = await prisma.customer.count();
-
-    res.json({
-      success: true,
-      data: { totalSales, totalProducts, totalCustomers, generatedAt: new Date().toISOString() }
-    });
+    res.json({ success: true, data: { totalProducts, generatedAt: new Date().toISOString() } });
   } catch (error) {
-    res.json({ success: true, data: { totalSales: 0, totalProducts: 0, totalCustomers: 0, generatedAt: new Date().toISOString() } });
+    res.json({ success: true, data: { totalProducts: 0, generatedAt: new Date().toISOString() } });
   }
 });
 

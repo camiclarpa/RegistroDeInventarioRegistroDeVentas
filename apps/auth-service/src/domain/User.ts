@@ -1,4 +1,4 @@
-import { Email } from '../value-objects/Email';
+import { Email } from './Email';
 
 export interface CreateUserParams {
   id?: string;
@@ -45,11 +45,6 @@ export class User {
       this.createdAt,
       new Date()
     );
-  }
-
-  validatePassword(plainPassword: string, hashedPassword: string): boolean {
-    // Este método debería usar bcrypt, pero la comparación se hará en el repositorio
-    return plainPassword === hashedPassword; // Placeholder
   }
 
   toJSON() {

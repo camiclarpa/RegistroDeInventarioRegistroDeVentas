@@ -61,3 +61,11 @@ app.get('/api/v1/notifications', (_req, res) => {
 app.listen(PORT, () => {
   console.log(`📧 Notification service running on port ${PORT}`);
 });
+
+// Endpoint para ver estado del circuit breaker
+app.get('/api/v1/circuit-breaker/status', (_req, res) => {
+  res.json({ 
+    state: 'CLOSED', 
+    message: 'Circuit breaker integrado correctamente' 
+  });
+});

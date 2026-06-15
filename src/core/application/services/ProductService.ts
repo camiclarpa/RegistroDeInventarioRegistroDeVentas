@@ -1,7 +1,8 @@
 import { Product, CreateProductParams } from '../../domain/entities/Product';
-import { IProductRepository } from '../../domain/repositories/IProductRepository';
+import { IProductRepository, ProductFilters, PaginatedResult } from '../../domain/repositories/IProductRepository';
 import { RedisEventPublisher } from '../../../infrastructure/messaging/RedisEventPublisher';
 import { ProductCreatedEvent } from '../../domain/events/InventoryEvents';
+import { CreateProductDTO, ProductResponseDTO } from '../dtos/ProductDTO';
 
 export class ProductService {
   private eventPublisher: RedisEventPublisher;
@@ -10,16 +11,26 @@ export class ProductService {
     this.eventPublisher = new RedisEventPublisher();
   }
 
-  async createProduct(params: CreateProductParams): Promise<Product> {
-    const exists = await this.productRepo.exists(params.skuInternal);
+  async createProduct(dto: CreateProductDTO): Promise<ProductResponseDTO> {
+    const exists = await this.productRepo.exists(dto.skuInternal);
     if (exists) {
-      throw new Error(`Product with SKU ${params.skuInternal} already exists`);
+      throw new Error(`Product with SKU ${dto.skuInternal} already exists`);
     }
+
+    const params: CreateProductParams = {
+      skuInternal: dto.skuInternal,
+      nameCommercial: dto.nameCommercial,
+      brandId: dto.brandId,
+      categoryId: dto.categoryId,
+      costPriceAvg: dto.costPriceAvg,
+      salePriceBase: dto.salePriceBase,
+      stockQuantity: dto.stockQuantity || 0,
+      minStockLevel: dto.minStockLevel || 5
+    };
 
     const product = Product.create(params);
     await this.productRepo.save(product);
     
-    // PUBLICAR EVENTO DE DOMINIO
     const event = new ProductCreatedEvent(product.id, {
       sku: product.sku.getValue(),
       name: product.name,
@@ -27,41 +38,39 @@ export class ProductService {
       stock: product.stockQuantity
     });
     await this.eventPublisher.publish(event);
-    console.log(`📡 Evento publicado: ${event.type} - Producto ${product.name}`);
     
-    return product;
+    return this.toResponseDTO(product);
   }
 
-  async getProductById(id: string): Promise<Product | null> {
-    return this.productRepo.findById(id);
-  }
-
-  async getProductBySKU(sku: string): Promise<Product | null> {
-    return this.productRepo.findBySKU(sku);
-  }
-
-  async listProducts(filters: any, page: number = 1, limit: number = 20): Promise<any> {
-    return this.productRepo.findAll(filters, page, limit);
-  }
-
-  async updateStock(productId: string, quantity: number): Promise<void> {
-    const product = await this.productRepo.findById(productId);
-    if (!product) {
-      throw new Error(`Product ${productId} not found`);
-    }
-    product.updateStock(quantity);
-    await this.productRepo.updateStock(productId, product.stockQuantity);
-  }
-
-  async getLowStock(): Promise<Product[]> {
-    return this.productRepo.findLowStock(5);
-  }
-
-  async deleteProduct(id: string): Promise<void> {
+  async getProductById(id: string): Promise<ProductResponseDTO | null> {
     const product = await this.productRepo.findById(id);
-    if (!product) {
-      throw new Error(`Product ${id} not found`);
-    }
-    await this.productRepo.delete(id);
+    return product ? this.toResponseDTO(product) : null;
+  }
+
+  async listProducts(filters: ProductFilters, page: number, limit: number): Promise<PaginatedResult<ProductResponseDTO>> {
+    const result = await this.productRepo.findAll(filters, page, limit);
+    return {
+      ...result,
+      items: result.items.map(p => this.toResponseDTO(p))
+    };
+  }
+
+  private toResponseDTO(product: Product): ProductResponseDTO {
+    return {
+      id: product.id,
+      skuInternal: product.sku.getValue(),
+      partNumberOEM: 'N/A',
+      nameCommercial: product.name,
+      brandId: product.brandId,
+      categoryId: product.categoryId,
+      locationBin: 'DEFAULT',
+      costPriceAvg: product.costPrice.getValue(),
+      salePriceBase: product.salePrice.getValue(),
+      stockQuantity: product.stockQuantity,
+      minStockLevel: product.minStockLevel,
+      isActive: product.isActive,
+      createdAt: product.createdAt,
+      updatedAt: product.updatedAt
+    };
   }
 }

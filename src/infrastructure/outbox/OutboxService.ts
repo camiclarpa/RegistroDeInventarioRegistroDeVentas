@@ -1,10 +1,9 @@
 import { PrismaClient } from '@prisma/client';
 import { RedisEventPublisher } from '../messaging/RedisEventPublisher';
-import { DomainEvent } from '../../core/domain/events/DomainEvent';
 
 export class OutboxService {
-  private readonly prisma: PrismaClient;
-  private readonly publisher: RedisEventPublisher;
+  private prisma: PrismaClient;
+  private publisher: RedisEventPublisher;
   private running: boolean = true;
 
   constructor() {
@@ -12,11 +11,10 @@ export class OutboxService {
     this.publisher = new RedisEventPublisher();
   }
 
-  async store(event: DomainEvent): Promise<void> {
-    // En producción, usar transacción con la operación de negocio
+  async store(eventType: string, aggregateId: string, payload: any): Promise<void> {
     await this.prisma.$executeRaw`
       INSERT INTO outbox_events (id, event_type, aggregate_id, payload, created_at)
-      VALUES (${event.id}, ${event.type}, ${event.aggregateId}, ${JSON.stringify(event.payload)}::jsonb, NOW())
+      VALUES (gen_random_uuid(), ${eventType}, ${aggregateId}, ${JSON.stringify(payload)}::jsonb, NOW())
     `;
   }
 
@@ -33,18 +31,14 @@ export class OutboxService {
 
         for (const event of events) {
           try {
-            // Reconstruir evento y publicar
-            const domainEvent = {
+            await this.publisher.publish({
               id: event.id,
               type: event.event_type,
               aggregateId: event.aggregate_id,
               payload: event.payload,
               occurredAt: event.created_at,
-              version: 1,
-              toJSON: () => ({})
-            } as DomainEvent;
-
-            await this.publisher.publish(domainEvent);
+              version: 1
+            } as any);
             
             await this.prisma.$executeRaw`
               UPDATE outbox_events 
